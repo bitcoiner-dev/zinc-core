@@ -8,7 +8,7 @@ Security fixes are provided for the latest published `0.1.x` release line.
 
 Please report suspected vulnerabilities privately.
 
-- Email: security@sentinel-bot.com
+- Email: bitcoiner.dev@gmail.com
 - Include: affected version, impact summary, reproduction steps, and a proposed fix (if known)
 
 Do not open public issues for unpatched vulnerabilities.

@@ -23,4 +23,4 @@ Project maintainers may remove, edit, or reject comments, commits, code, issues,
 
 ## Reporting
 
-Report incidents to: conduct@sentinel-bot.com
+Report incidents to: bitcoiner.dev@gmail.com
