@@ -1,0 +1,108 @@
+[package]
+name = "zinc-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+description = "Core Rust library for Zinc Bitcoin + Ordinals wallet"
+readme = "README.md"
+repository = "https://github.com/sentinel-bot/zinc"
+homepage = "https://github.com/sentinel-bot/zinc"
+documentation = "https://docs.rs/zinc-core"
+keywords = ["bitcoin", "ordinals", "wallet", "bdk", "wasm"]
+categories = ["cryptography::cryptocurrencies", "wasm"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "src/**",
+    "tests/**",
+    "examples/**",
+]
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+debug = []
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+
+# BDK & Bitcoin
+bdk_wallet = "2.3.0"
+bdk_chain = "0.23"
+bitcoin = { version = "0.32", default-features = false, features = ["secp-lowmemory", "secp-recovery", "std"] }
+
+# BIP-39 & Crypto
+bip39 = { version = "2.1", features = ["zeroize"] }
+argon2 = "0.5"
+aes-gcm = "0.10"
+getrandom = { version = "0.2", features = ["js"] }
+rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Encoding & WASM serialization
+base64 = "0.22"
+serde-wasm-bindgen = "0.6"
+
+# Debug support
+console_error_panic_hook = { version = "0.1" }
+wasm-bindgen-futures = "0.4.58"
+tracing = "0.1"
+tracing-wasm = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bdk_esplora = { version = "0.22.1", default-features = false, features = ["async-https-rustls"] }
+esplora-client = { version = "0.12.2", default-features = false, features = ["async-https-rustls"] }
+reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1.37", features = ["time", "sync", "macros"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bdk_esplora = { version = "0.22.1", default-features = false, features = ["async-https"] }
+esplora-client = { version = "0.12.2", default-features = false, features = ["async"] }
+reqwest = { version = "0.12.5", default-features = false, features = ["json"] }
+js-sys = "0.3"
+
+[target.wasm32-unknown-unknown.dependencies]
+gloo-timers = { version = "0.3.0", features = ["futures"] }
+
+[dev-dependencies]
+
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+mockito = "1.7.1"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+# NOTE: Do NOT use opt-level "z" here. It causes LLVM to miscompile Rc
+# reference-counting in WASM, triggering an `Rc::inc_strong` panic
+# ("unsafe precondition(s) violated: hint::assert_unchecked").
+# opt-level "s" still optimizes for size without the dangerous elisions.
+opt-level = "s"
+lto = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+todo = "deny"
+unimplemented = "deny"
