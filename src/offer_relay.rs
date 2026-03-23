@@ -3,7 +3,7 @@
 //! This module intentionally excludes PoW and relay auth for now. It focuses on
 //! baseline multi-relay fanout and discovery semantics.
 
-use crate::{NostrOfferEvent, OFFER_EVENT_KIND, ZincError};
+use crate::{NostrOfferEvent, ZincError, OFFER_EVENT_KIND};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -114,9 +114,9 @@ impl NostrRelayClient {
         timeout_ms: u64,
     ) -> Result<RelayPublishResult, ZincError> {
         event.verify()?;
-        let (mut socket, _) = connect_async(relay_url)
-            .await
-            .map_err(|e| ZincError::OfferError(format!("failed to connect relay {relay_url}: {e}")))?;
+        let (mut socket, _) = connect_async(relay_url).await.map_err(|e| {
+            ZincError::OfferError(format!("failed to connect relay {relay_url}: {e}"))
+        })?;
 
         let event_frame = Self::event_frame(event)?;
         socket
@@ -130,7 +130,8 @@ impl NostrRelayClient {
             while let Some(message) = socket.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
-                        if let Some((accepted, msg)) = Self::parse_ok_frame(text.as_ref(), &event_id)
+                        if let Some((accepted, msg)) =
+                            Self::parse_ok_frame(text.as_ref(), &event_id)
                         {
                             return Ok(RelayPublishResult {
                                 relay_url: relay_url_owned.clone(),
@@ -167,7 +168,9 @@ impl NostrRelayClient {
             )))
         })
         .await
-        .map_err(|_| ZincError::OfferError(format!("relay {relay_url} timed out waiting for OK")))?;
+        .map_err(|_| {
+            ZincError::OfferError(format!("relay {relay_url} timed out waiting for OK"))
+        })?;
 
         ack
     }
@@ -208,9 +211,9 @@ impl NostrRelayClient {
         relay_url: &str,
         options: RelayQueryOptions,
     ) -> Result<Vec<NostrOfferEvent>, ZincError> {
-        let (mut socket, _) = connect_async(relay_url)
-            .await
-            .map_err(|e| ZincError::OfferError(format!("failed to connect relay {relay_url}: {e}")))?;
+        let (mut socket, _) = connect_async(relay_url).await.map_err(|e| {
+            ZincError::OfferError(format!("failed to connect relay {relay_url}: {e}"))
+        })?;
 
         let subscription_id = format!(
             "zinc-offers-{}",

@@ -5,8 +5,8 @@
 
 use crate::ZincError;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
-use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
 use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
+use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
