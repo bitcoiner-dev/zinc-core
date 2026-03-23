@@ -37,6 +37,13 @@ struct OutputResponse {
     runes: serde_json::Value,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OffersResponse {
+    Wrapped { offers: Vec<String> },
+    Bare(Vec<String>),
+}
+
 impl OutputResponse {
     fn has_protected_assets(&self) -> bool {
         !self.inscriptions.is_empty() || value_has_entries(&self.runes)
@@ -66,6 +73,16 @@ fn value_has_entries(value: &serde_json::Value) -> bool {
         serde_json::Value::Bool(flag) => *flag,
         serde_json::Value::Number(_) => true,
     }
+}
+
+fn parse_offers_payload(body: &str) -> Result<Vec<String>, OrdError> {
+    let parsed: OffersResponse = serde_json::from_str(body)
+        .map_err(|e| OrdError::RequestFailed(format!("Failed to parse offers JSON: {e}")))?;
+
+    Ok(match parsed {
+        OffersResponse::Wrapped { offers } => offers,
+        OffersResponse::Bare(offers) => offers,
+    })
 }
 
 impl OrdClient {
@@ -242,11 +259,65 @@ impl OrdClient {
             .parse::<u32>()
             .map_err(|e| OrdError::RequestFailed(format!("Invalid blockheight: {}", e)))
     }
+
+    /// Submit an offer PSBT to an ord-compatible `/offer` endpoint.
+    pub async fn submit_offer_psbt(&self, psbt_base64: &str) -> Result<(), OrdError> {
+        if psbt_base64.trim().is_empty() {
+            return Err(OrdError::RequestFailed(
+                "Offer PSBT payload cannot be empty".to_string(),
+            ));
+        }
+
+        let url = format!("{}/offer", self.base_url);
+        let response = self
+            .http_client
+            .post(&url)
+            .body(psbt_base64.to_string())
+            .send()
+            .await
+            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_else(|_| "".to_string());
+            return Err(OrdError::RequestFailed(format!(
+                "Offer submission failed: {status} {text}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Fetch submitted offer PSBTs from an ord-compatible `/offers` endpoint.
+    pub async fn get_offer_psbts(&self) -> Result<Vec<String>, OrdError> {
+        let url = format!("{}/offers", self.base_url);
+        let response = self
+            .http_client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(OrdError::RequestFailed(format!(
+                "Offers API Error: {}",
+                response.status()
+            )));
+        }
+
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OrdError::RequestFailed(format!("Failed to read offers body: {e}")))?;
+
+        parse_offers_payload(&text)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::OutputResponse;
+    use super::{parse_offers_payload, OutputResponse};
 
     #[test]
     fn output_response_accepts_null_asset_fields() {
@@ -263,5 +334,27 @@ mod tests {
             serde_json::from_str(r#"{"inscriptions":[],"runes":["abc"]}"#).unwrap();
 
         assert!(output.has_protected_assets());
+    }
+
+    #[test]
+    fn offers_payload_supports_wrapped_object_shape() {
+        let offers = parse_offers_payload(r#"{"offers":["bG...==","aG...=="]}"#)
+            .expect("wrapped payload should parse");
+
+        assert_eq!(offers, vec!["bG...==".to_string(), "aG...==".to_string()]);
+    }
+
+    #[test]
+    fn offers_payload_supports_bare_array_shape() {
+        let offers =
+            parse_offers_payload(r#"["bG...==","aG...=="]"#).expect("bare payload should parse");
+
+        assert_eq!(offers, vec!["bG...==".to_string(), "aG...==".to_string()]);
+    }
+
+    #[test]
+    fn offers_payload_rejects_non_string_entries() {
+        let err = parse_offers_payload(r#"{"offers":["ok", 1]}"#).expect_err("must fail");
+        assert!(err.to_string().contains("Failed to parse offers JSON"));
     }
 }
