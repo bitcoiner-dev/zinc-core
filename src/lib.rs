@@ -34,6 +34,8 @@ pub mod error;
 /// Transaction history models and wallet history helpers.
 pub mod history;
 pub mod keys;
+/// Offer envelope models and deterministic offer hashing/signature helpers.
+pub mod offer;
 /// Ordinals data models, HTTP client, and protection analysis.
 pub mod ordinals;
 
@@ -46,6 +48,7 @@ pub use builder::{
 pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
+pub use offer::OfferEnvelopeV1;
 pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
 
