@@ -36,6 +36,8 @@ pub mod history;
 pub mod keys;
 /// Offer envelope models and deterministic offer hashing/signature helpers.
 pub mod offer;
+/// Nostr event models and signing/verification helpers for decentralized offers.
+pub mod offer_nostr;
 /// Ordinals data models, HTTP client, and protection analysis.
 pub mod ordinals;
 
@@ -49,6 +51,7 @@ pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use offer::OfferEnvelopeV1;
+pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
 pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
 
