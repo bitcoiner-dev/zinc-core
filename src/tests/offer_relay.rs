@@ -88,3 +88,8 @@ fn parse_event_frame_requires_matching_subscription() {
     assert!(NostrRelayClient::parse_event_frame(&frame, "sub-other").is_none());
     assert!(NostrRelayClient::parse_event_frame(&frame, "sub-expected").is_some());
 }
+
+#[test]
+fn wss_transport_compiles_with_tls_connect_api() {
+    let _ = tokio_tungstenite::connect_async_tls_with_config::<&str>;
+}
