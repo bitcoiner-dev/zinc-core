@@ -40,6 +40,10 @@ pub enum ZincError {
     /// Wrapped error from BDK primitives.
     #[error("BDK error: {0}")]
     BdkError(String),
+
+    /// Offer envelope creation/validation/signature failure.
+    #[error("Offer error: {0}")]
+    OfferError(String),
 }
 
 /// Convenience type alias for Results with `ZincError`.
