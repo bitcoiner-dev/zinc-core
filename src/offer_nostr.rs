@@ -2,8 +2,8 @@
 
 use crate::{OfferEnvelopeV1, ZincError};
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
-use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
 use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
+use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -66,7 +66,13 @@ impl NostrOfferEvent {
             ],
         ];
 
-        let id = compute_event_id_hex(&pubkey_hex, created_at_unix, OFFER_EVENT_KIND, &tags, &content)?;
+        let id = compute_event_id_hex(
+            &pubkey_hex,
+            created_at_unix,
+            OFFER_EVENT_KIND,
+            &tags,
+            &content,
+        )?;
         let sig = sign_event_id_hex(&id, &secret_key)?;
 
         Ok(Self {
@@ -166,8 +172,9 @@ fn compute_event_id_hex(
     content: &str,
 ) -> Result<String, ZincError> {
     let payload = serde_json::json!([0, pubkey_hex, created_at, kind, tags, content]);
-    let serialized = serde_json::to_vec(&payload)
-        .map_err(|e| ZincError::SerializationError(format!("failed to serialize nostr event payload: {e}")))?;
+    let serialized = serde_json::to_vec(&payload).map_err(|e| {
+        ZincError::SerializationError(format!("failed to serialize nostr event payload: {e}"))
+    })?;
     let digest = sha256::Hash::hash(&serialized);
     Ok(digest.to_string())
 }

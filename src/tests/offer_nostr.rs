@@ -44,14 +44,15 @@ fn nostr_offer_event_roundtrip_verifies_and_decodes() {
 
     assert_eq!(event.pubkey, seller_pubkey_hex);
     assert_eq!(event.kind, OFFER_EVENT_KIND);
-    assert!(
-        event
-            .tags
-            .iter()
-            .any(|tag| tag.len() == 2 && tag[0] == "z" && tag[1] == "zinc-offer-v1")
-    );
+    assert!(event
+        .tags
+        .iter()
+        .any(|tag| tag.len() == 2 && tag[0] == "z" && tag[1] == "zinc-offer-v1"));
     let expected_expiration = offer.expires_at_unix.to_string();
-    assert_eq!(event.tag_value("expiration"), Some(expected_expiration.as_str()));
+    assert_eq!(
+        event.tag_value("expiration"),
+        Some(expected_expiration.as_str())
+    );
 
     event.verify().expect("signature should verify");
     let decoded = event.decode_offer().expect("offer should decode");
@@ -79,10 +80,9 @@ fn nostr_offer_event_creation_rejects_secret_key_pubkey_mismatch() {
     let err = NostrOfferEvent::from_offer(&offer, wrong_secret, 1_710_000_100)
         .expect_err("mismatch should fail");
 
-    assert!(
-        err.to_string()
-            .contains("secret key does not match offer seller_pubkey_hex")
-    );
+    assert!(err
+        .to_string()
+        .contains("secret key does not match offer seller_pubkey_hex"));
 }
 
 #[test]
@@ -90,10 +90,10 @@ fn nostr_offer_event_id_and_sig_are_deterministic_for_same_payload() {
     let seller_pubkey_hex = pubkey_hex_from_secret(test_secret_hex());
     let offer = sample_offer(&seller_pubkey_hex);
 
-    let event_a = NostrOfferEvent::from_offer(&offer, test_secret_hex(), 1_710_000_100)
-        .expect("event A");
-    let event_b = NostrOfferEvent::from_offer(&offer, test_secret_hex(), 1_710_000_100)
-        .expect("event B");
+    let event_a =
+        NostrOfferEvent::from_offer(&offer, test_secret_hex(), 1_710_000_100).expect("event A");
+    let event_b =
+        NostrOfferEvent::from_offer(&offer, test_secret_hex(), 1_710_000_100).expect("event B");
 
     assert_eq!(event_a.id, event_b.id);
     assert_eq!(event_a.sig, event_b.sig);
@@ -113,10 +113,20 @@ fn nostr_offer_event_decode_rejects_expiration_tag_mismatch() {
         vec!["network".to_string(), offer.network.clone()],
         vec!["inscription".to_string(), offer.inscription_id.clone()],
         vec!["offer_id".to_string(), offer_id],
-        vec!["expiration".to_string(), (offer.expires_at_unix + 1).to_string()],
+        vec![
+            "expiration".to_string(),
+            (offer.expires_at_unix + 1).to_string(),
+        ],
         vec!["expires".to_string(), offer.expires_at_unix.to_string()],
     ];
-    let payload = serde_json::json!([0, seller_pubkey_hex, created_at, OFFER_EVENT_KIND, tags, content]);
+    let payload = serde_json::json!([
+        0,
+        seller_pubkey_hex,
+        created_at,
+        OFFER_EVENT_KIND,
+        tags,
+        content
+    ]);
     let event_id = sha256::Hash::hash(
         &serde_json::to_vec(&payload).expect("nostr event id payload serialization"),
     )
@@ -132,7 +142,9 @@ fn nostr_offer_event_decode_rejects_expiration_tag_mismatch() {
     let message = Message::from_digest(digest);
     let secp = Secp256k1::new();
     let keypair = Keypair::from_secret_key(&secp, &secret_key);
-    let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair).to_string();
+    let signature = secp
+        .sign_schnorr_no_aux_rand(&message, &keypair)
+        .to_string();
     let event = NostrOfferEvent {
         id: event_id,
         pubkey: seller_pubkey_hex,
@@ -154,9 +166,10 @@ fn nostr_offer_event_decode_rejects_expiration_tag_mismatch() {
         sig: signature,
     };
 
-    let err = event.decode_offer().expect_err("expiration mismatch should fail");
-    assert!(
-        err.to_string()
-            .contains("embedded offer expires_at_unix does not match event expiration tag")
-    );
+    let err = event
+        .decode_offer()
+        .expect_err("expiration mismatch should fail");
+    assert!(err
+        .to_string()
+        .contains("embedded offer expires_at_unix does not match event expiration tag"));
 }

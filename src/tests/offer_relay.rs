@@ -67,11 +67,8 @@ fn req_frame_targets_offer_kind_and_schema_tag() {
 
 #[test]
 fn parse_ok_frame_extracts_acceptance_and_message() {
-    let ok = NostrRelayClient::parse_ok_frame(
-        r#"["OK","abcd1234",true,"accepted"]"#,
-        "abcd1234",
-    )
-    .expect("valid ok frame");
+    let ok = NostrRelayClient::parse_ok_frame(r#"["OK","abcd1234",true,"accepted"]"#, "abcd1234")
+        .expect("valid ok frame");
 
     assert_eq!(ok.0, true);
     assert_eq!(ok.1, "accepted");
