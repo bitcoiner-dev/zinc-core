@@ -38,6 +38,9 @@ pub mod keys;
 pub mod offer;
 /// Nostr event models and signing/verification helpers for decentralized offers.
 pub mod offer_nostr;
+/// Native Nostr relay publish/discovery transport for offer events.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod offer_relay;
 /// Ordinals data models, HTTP client, and protection analysis.
 pub mod ordinals;
 
@@ -52,6 +55,8 @@ pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use offer::OfferEnvelopeV1;
 pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
+#[cfg(not(target_arch = "wasm32"))]
+pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
 
