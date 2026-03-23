@@ -10,6 +10,8 @@ use std::str::FromStr;
 /// Nostr kind used for Zinc offer announcements.
 pub const OFFER_EVENT_KIND: u64 = 8_756;
 const OFFER_SCHEMA_TAG_VALUE: &str = "zinc-offer-v1";
+const NIP40_EXPIRATION_TAG_KEY: &str = "expiration";
+const LEGACY_EXPIRES_TAG_KEY: &str = "expires";
 
 /// Nostr event carrying a canonical serialized [`OfferEnvelopeV1`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,7 +56,14 @@ impl NostrOfferEvent {
             vec!["network".to_string(), offer.network.clone()],
             vec!["inscription".to_string(), offer.inscription_id.clone()],
             vec!["offer_id".to_string(), offer_id],
-            vec!["expires".to_string(), offer.expires_at_unix.to_string()],
+            vec![
+                NIP40_EXPIRATION_TAG_KEY.to_string(),
+                offer.expires_at_unix.to_string(),
+            ],
+            vec![
+                LEGACY_EXPIRES_TAG_KEY.to_string(),
+                offer.expires_at_unix.to_string(),
+            ],
         ];
 
         let id = compute_event_id_hex(&pubkey_hex, created_at_unix, OFFER_EVENT_KIND, &tags, &content)?;
@@ -125,6 +134,9 @@ impl NostrOfferEvent {
             }
         }
 
+        validate_expiration_tag_matches_offer(self, &offer, NIP40_EXPIRATION_TAG_KEY)?;
+        validate_expiration_tag_matches_offer(self, &offer, LEGACY_EXPIRES_TAG_KEY)?;
+
         Ok(offer)
     }
 
@@ -185,4 +197,23 @@ fn hex_to_digest32(hex: &str) -> Result<[u8; 32], ZincError> {
             .map_err(|e| ZincError::OfferError(format!("invalid digest hex byte: {e}")))?;
     }
     Ok(bytes)
+}
+
+fn validate_expiration_tag_matches_offer(
+    event: &NostrOfferEvent,
+    offer: &OfferEnvelopeV1,
+    tag_key: &str,
+) -> Result<(), ZincError> {
+    let Some(raw) = event.tag_value(tag_key) else {
+        return Ok(());
+    };
+    let tag_unix = raw
+        .parse::<i64>()
+        .map_err(|e| ZincError::OfferError(format!("invalid {tag_key} tag value: {e}")))?;
+    if tag_unix != offer.expires_at_unix {
+        return Err(ZincError::OfferError(format!(
+            "embedded offer expires_at_unix does not match event {tag_key} tag"
+        )));
+    }
+    Ok(())
 }
