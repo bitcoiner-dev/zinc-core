@@ -577,67 +577,35 @@ impl ZincWasmWallet {
     pub fn get_accounts(&self, count: u32) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
 
-        // Optimize: parse mnemonic and derive seed only once
-        let mnemonic = crate::keys::ZincMnemonic::parse(&self.phrase)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let network = self.network;
-        let scheme = self.scheme;
+        let mut accounts_json = Vec::new();
 
-        let mut accounts = Vec::new();
-        for i in 0..count {
-            let mut builder = WalletBuilder::from_mnemonic(network, &mnemonic);
-            builder = builder.with_scheme(scheme).with_account_index(i);
+        // Optimize: Delegate to inner to avoid re-deriving master_xprv in a loop.
+        // This avoids instantiating `WalletBuilder` for every account index.
+        let accounts = match self.inner.try_borrow() {
+            Ok(inner) => inner.get_accounts(count),
+            Err(e) => {
+                return Err(JsValue::from_str(&format!(
+                    "Wallet busy (get_accounts): {}",
+                    e
+                )))
+            }
+        };
 
-            // Build temporary wallet (no persistence)
-            let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-
-            // Use peek_address for speed (no revealing/saving in memory)
-            let vault_addr = zwallet
-                .vault_wallet
-                .peek_address(KeychainKind::External, 0)
-                .address;
-
-            let vault_pubkey = zwallet
-                .get_taproot_public_key(0)
-                .unwrap_or_else(|_| "".to_string());
-
-            let (payment_addr, payment_pubkey) = if scheme == AddressScheme::Dual {
-                (
-                    Some(
-                        zwallet
-                            .payment_wallet
-                            .as_ref()
-                            .ok_or_else(|| {
-                                JsValue::from_str("Payment wallet missing in dual mode")
-                            })?
-                            .peek_address(KeychainKind::External, 0)
-                            .address
-                            .to_string(),
-                    ),
-                    Some(
-                        zwallet
-                            .get_payment_public_key(0)
-                            .unwrap_or_else(|_| "".to_string()),
-                    ),
-                )
-            } else {
-                (None, None)
-            };
-
-            accounts.push(serde_json::json!({
-                "index": i,
-                "label": format!("Account {}", i),
-                "taprootAddress": vault_addr.to_string(),
-                "taprootPublicKey": vault_pubkey,
-                "paymentAddress": payment_addr,
-                "paymentPublicKey": payment_pubkey,
+        for acc in accounts {
+            accounts_json.push(serde_json::json!({
+                "index": acc.index,
+                "label": acc.label,
+                "taprootAddress": acc.taproot_address,
+                "taprootPublicKey": acc.taproot_public_key,
+                "paymentAddress": acc.payment_address,
+                "paymentPublicKey": acc.payment_public_key,
                 // Backward-compatible aliases for older clients.
-                "vaultAddress": vault_addr.to_string(),
-                "vaultPublicKey": vault_pubkey,
+                "vaultAddress": acc.taproot_address,
+                "vaultPublicKey": acc.taproot_public_key,
             }));
         }
 
-        serde_wasm_bindgen::to_value(&accounts).map_err(|e| JsValue::from_str(&e.to_string()))
+        serde_wasm_bindgen::to_value(&accounts_json).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Return cached inscription list currently loaded in wallet state.
