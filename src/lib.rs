@@ -36,6 +36,8 @@ pub mod history;
 pub mod keys;
 /// Offer envelope models and deterministic offer hashing/signature helpers.
 pub mod offer;
+/// Offer acceptance safety checks and signing plan derivation.
+pub mod offer_accept;
 /// Nostr event models and signing/verification helpers for decentralized offers.
 pub mod offer_nostr;
 /// Native Nostr relay publish/discovery transport for offer events.
@@ -54,6 +56,7 @@ pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use offer::OfferEnvelopeV1;
+pub use offer_accept::{prepare_offer_acceptance, OfferAcceptancePlanV1};
 pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
 #[cfg(not(target_arch = "wasm32"))]
 pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
