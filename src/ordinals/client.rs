@@ -31,10 +31,31 @@ pub struct AddressAssetSnapshot {
 
 #[derive(Deserialize)]
 struct OutputResponse {
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    outpoint: Option<String>,
+    #[serde(default)]
+    value: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_string_vec_or_default")]
     inscriptions: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_json_value_or_default")]
     runes: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Full output details for ord-compatible `/output/<outpoint>` responses.
+pub struct OutputDetails {
+    /// Canonical outpoint string (`txid:vout`).
+    pub outpoint: String,
+    /// Encoded output address.
+    pub address: String,
+    /// Output value in satoshis.
+    pub value: u64,
+    /// Inscriptions currently attached to this output.
+    pub inscriptions: Vec<String>,
+    /// Runes payload as returned by ord.
+    pub runes: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +68,36 @@ enum OffersResponse {
 impl OutputResponse {
     fn has_protected_assets(&self) -> bool {
         !self.inscriptions.is_empty() || value_has_entries(&self.runes)
+    }
+
+    fn into_output_details(self, requested_outpoint: &str) -> Result<OutputDetails, OrdError> {
+        let address = self
+            .address
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                OrdError::RequestFailed(format!(
+                    "Output {} is missing required address field",
+                    requested_outpoint
+                ))
+            })?;
+        let value = self.value.ok_or_else(|| {
+            OrdError::RequestFailed(format!(
+                "Output {} is missing required value field",
+                requested_outpoint
+            ))
+        })?;
+        let outpoint = self
+            .outpoint
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| requested_outpoint.to_string());
+
+        Ok(OutputDetails {
+            outpoint,
+            address,
+            value,
+            inscriptions: self.inscriptions,
+            runes: self.runes,
+        })
     }
 }
 
@@ -192,34 +243,7 @@ impl OrdClient {
         let mut protected = HashSet::new();
 
         for outpoint_str in outputs {
-            let details_url = format!("{}/output/{}", self.base_url, outpoint_str);
-            let details_resp = self
-                .http_client
-                .get(&details_url)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|e| {
-                    OrdError::RequestFailed(format!(
-                        "Failed to fetch output details for {}: {}",
-                        outpoint_str, e
-                    ))
-                })?;
-
-            if !details_resp.status().is_success() {
-                return Err(OrdError::RequestFailed(format!(
-                    "API Error (Output {}): {}",
-                    outpoint_str,
-                    details_resp.status()
-                )));
-            }
-
-            let output: OutputResponse = details_resp.json().await.map_err(|e| {
-                OrdError::RequestFailed(format!(
-                    "Failed to parse Output JSON for {}: {}",
-                    outpoint_str, e
-                ))
-            })?;
+            let output = self.get_output_response(outpoint_str).await?;
 
             if !output.has_protected_assets() {
                 continue;
@@ -232,6 +256,13 @@ impl OrdClient {
         }
 
         Ok(protected)
+    }
+
+    /// Fetch full output metadata for one outpoint from `/output/<outpoint>`.
+    pub async fn get_output_details(&self, outpoint: &OutPoint) -> Result<OutputDetails, OrdError> {
+        let requested_outpoint = outpoint.to_string();
+        let response = self.get_output_response(&requested_outpoint).await?;
+        response.into_output_details(&requested_outpoint)
     }
 
     /// Query ord server indexing height via `/blockheight`.
@@ -313,6 +344,37 @@ impl OrdClient {
 
         parse_offers_payload(&text)
     }
+
+    async fn get_output_response(&self, outpoint: &str) -> Result<OutputResponse, OrdError> {
+        let details_url = format!("{}/output/{}", self.base_url, outpoint);
+        let details_resp = self
+            .http_client
+            .get(&details_url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                OrdError::RequestFailed(format!(
+                    "Failed to fetch output details for {}: {}",
+                    outpoint, e
+                ))
+            })?;
+
+        if !details_resp.status().is_success() {
+            return Err(OrdError::RequestFailed(format!(
+                "API Error (Output {}): {}",
+                outpoint,
+                details_resp.status()
+            )));
+        }
+
+        details_resp.json().await.map_err(|e| {
+            OrdError::RequestFailed(format!(
+                "Failed to parse Output JSON for {}: {}",
+                outpoint, e
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +418,47 @@ mod tests {
     fn offers_payload_rejects_non_string_entries() {
         let err = parse_offers_payload(r#"{"offers":["ok", 1]}"#).expect_err("must fail");
         assert!(err.to_string().contains("Failed to parse offers JSON"));
+    }
+
+    #[test]
+    fn output_response_maps_to_output_details() {
+        let output: OutputResponse = serde_json::from_str(
+            r#"{
+                "address":"bcrt1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq8m3djv",
+                "value":330,
+                "outpoint":"6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0",
+                "inscriptions":["abc123i0"],
+                "runes":{}
+            }"#,
+        )
+        .expect("valid output");
+
+        let details = output
+            .into_output_details(
+                "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0",
+            )
+            .expect("details");
+        assert_eq!(
+            details.outpoint,
+            "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0"
+        );
+        assert_eq!(details.value, 330);
+        assert_eq!(
+            details.address,
+            "bcrt1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq8m3djv"
+        );
+        assert_eq!(details.inscriptions, vec!["abc123i0".to_string()]);
+    }
+
+    #[test]
+    fn output_response_requires_address_and_value_for_details() {
+        let output: OutputResponse =
+            serde_json::from_str(r#"{"inscriptions":[],"runes":[]}"#).expect("parse response");
+        let err = output
+            .into_output_details(
+                "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0",
+            )
+            .expect_err("must fail");
+        assert!(err.to_string().contains("missing required address field"));
     }
 }
