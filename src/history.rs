@@ -94,15 +94,6 @@ impl ZincWallet {
                 };
             }
 
-            // Parent/child awareness:
-            // If A spends an output from B, A is the child and should appear first
-            // in reverse-chronological activity views (e.g. reveal above commit).
-            if a.parent_txids.iter().any(|parent| parent == &b.txid) {
-                return std::cmp::Ordering::Less;
-            }
-            if b.parent_txids.iter().any(|parent| parent == &a.txid) {
-                return std::cmp::Ordering::Greater;
-            }
 
             match (a.confirmation_time, b.confirmation_time) {
                 (Some(ta), Some(tb)) if ta != tb => tb.cmp(&ta), // Time descending
