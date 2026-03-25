@@ -7,6 +7,9 @@ use bdk_wallet::bitcoin::{
     absolute, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
 
+const ASK_SATS: u64 = 100_000;
+const SELLER_POSTAGE_SATS: u64 = 330;
+
 fn sample_seller_txid() -> Txid {
     Txid::from_slice(&[0x11; 32]).expect("valid txid")
 }
@@ -29,7 +32,7 @@ fn build_offer(
         inscription_id: "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799i0"
             .to_string(),
         seller_outpoint: seller_outpoint.to_string(),
-        ask_sats: 100_000,
+        ask_sats: ASK_SATS,
         fee_rate_sat_vb: 1,
         psbt_base64,
         created_at_unix: now_unix - 10,
@@ -75,12 +78,22 @@ fn psbt_base64(
         version: bdk_wallet::bitcoin::transaction::Version(2),
         lock_time: absolute::LockTime::ZERO,
         input: inputs,
-        output: vec![TxOut {
-            value: Amount::from_sat(1234),
-            script_pubkey: ScriptBuf::new(),
-        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(SELLER_POSTAGE_SATS),
+                script_pubkey: ScriptBuf::new(),
+            },
+            TxOut {
+                value: Amount::from_sat(ASK_SATS + SELLER_POSTAGE_SATS),
+                script_pubkey: ScriptBuf::new(),
+            },
+        ],
     };
     let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
+    psbt.inputs[0].witness_utxo = Some(TxOut {
+        value: Amount::from_sat(SELLER_POSTAGE_SATS),
+        script_pubkey: ScriptBuf::new(),
+    });
 
     if seller_signed {
         let stack = vec![b"seller-sig".to_vec()];
@@ -185,4 +198,57 @@ fn prepare_offer_acceptance_rejects_unsigned_buyer_input() {
     let err = prepare_offer_acceptance(&offer, now_unix).expect_err("unsigned buyer input");
     assert!(err.to_string().contains("buyer input"));
     assert!(err.to_string().contains("must be signed"));
+}
+
+#[test]
+fn prepare_offer_acceptance_rejects_seller_input_not_first() {
+    let now_unix = 1_800_000_000;
+    let seller_outpoint = OutPoint {
+        txid: sample_seller_txid(),
+        vout: 0,
+    };
+    let mut psbt = {
+        let encoded = psbt_base64(seller_outpoint, false, false, true);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("base64");
+        Psbt::deserialize(&bytes).expect("psbt")
+    };
+
+    psbt.unsigned_tx.input.swap(0, 1);
+    psbt.inputs.swap(0, 1);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
+
+    let err = prepare_offer_acceptance(&offer, now_unix).expect_err("seller input must be first");
+    assert!(err.to_string().contains("must be first input"));
+}
+
+#[test]
+fn prepare_offer_acceptance_rejects_non_ord_output_layout() {
+    let now_unix = 1_800_000_000;
+    let seller_outpoint = OutPoint {
+        txid: sample_seller_txid(),
+        vout: 0,
+    };
+    let mut psbt = {
+        let encoded = psbt_base64(seller_outpoint, false, false, true);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("base64");
+        Psbt::deserialize(&bytes).expect("psbt")
+    };
+
+    psbt.unsigned_tx.output.swap(0, 1);
+    psbt.outputs.swap(0, 1);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
+
+    let err =
+        prepare_offer_acceptance(&offer, now_unix).expect_err("must reject non-canonical outputs");
+    assert!(err
+        .to_string()
+        .contains("buyer postage output must be first"));
 }

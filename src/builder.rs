@@ -935,6 +935,14 @@ impl ZincWallet {
         Ok(Self::encode_psbt_base64(&psbt))
     }
 
+    /// Create an ord-compatible buyer offer PSBT and envelope.
+    pub fn create_offer(
+        &mut self,
+        request: &crate::offer_create::CreateOfferRequest,
+    ) -> Result<crate::offer_create::OfferCreateResultV1, ZincError> {
+        crate::offer_create::create_offer(self, request)
+    }
+
     /// Create an unsigned PSBT for sending BTC from transport-friendly inputs.
     ///
     /// This method is a migration wrapper for app-boundary callers. New native

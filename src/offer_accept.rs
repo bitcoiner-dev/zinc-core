@@ -65,6 +65,14 @@ pub fn prepare_offer_acceptance(
     }
 
     let seller_input_index = seller_indices[0];
+    if seller_input_index != 0 {
+        return Err(ZincError::OfferError(format!(
+            "seller input `{seller_outpoint}` must be first input (index 0), found index {seller_input_index}"
+        )));
+    }
+
+    validate_ord_layout(offer, &psbt, seller_input_index, seller_outpoint)?;
+
     if psbt
         .inputs
         .get(seller_input_index)
@@ -107,4 +115,68 @@ fn input_has_signature(input: &Input) -> bool {
         || !input.partial_sigs.is_empty()
         || input.tap_key_sig.is_some()
         || !input.tap_script_sigs.is_empty()
+}
+
+fn validate_ord_layout(
+    offer: &OfferEnvelopeV1,
+    psbt: &Psbt,
+    seller_input_index: usize,
+    seller_outpoint: OutPoint,
+) -> Result<(), ZincError> {
+    let seller_input = psbt
+        .inputs
+        .get(seller_input_index)
+        .ok_or_else(|| ZincError::OfferError("seller input metadata missing".to_string()))?;
+    let seller_txin = psbt
+        .unsigned_tx
+        .input
+        .get(seller_input_index)
+        .ok_or_else(|| ZincError::OfferError("seller tx input missing".to_string()))?;
+
+    let seller_postage_sats = seller_input
+        .witness_utxo
+        .as_ref()
+        .map(|txout| txout.value.to_sat())
+        .or_else(|| {
+            seller_input.non_witness_utxo.as_ref().and_then(|prev_tx| {
+                prev_tx
+                    .output
+                    .get(seller_txin.previous_output.vout as usize)
+                    .map(|txout| txout.value.to_sat())
+            })
+        })
+        .ok_or_else(|| {
+            ZincError::OfferError(format!(
+                "seller input `{seller_outpoint}` is missing prevout value metadata"
+            ))
+        })?;
+
+    if psbt.unsigned_tx.output.len() < 2 {
+        return Err(ZincError::OfferError(
+            "offer psbt must include buyer postage and seller payout outputs".to_string(),
+        ));
+    }
+
+    let buyer_postage_out = &psbt.unsigned_tx.output[0];
+    if buyer_postage_out.value.to_sat() != seller_postage_sats {
+        return Err(ZincError::OfferError(format!(
+            "buyer postage output must be first and equal seller postage {} sats; found {} sats",
+            seller_postage_sats,
+            buyer_postage_out.value.to_sat()
+        )));
+    }
+
+    let expected_seller_payout = seller_postage_sats
+        .checked_add(offer.ask_sats)
+        .ok_or_else(|| ZincError::OfferError("ask_sats + postage overflows u64".to_string()))?;
+    let seller_payout_out = &psbt.unsigned_tx.output[1];
+    if seller_payout_out.value.to_sat() != expected_seller_payout {
+        return Err(ZincError::OfferError(format!(
+            "seller payout output must be second and equal ask+postage {} sats; found {} sats",
+            expected_seller_payout,
+            seller_payout_out.value.to_sat()
+        )));
+    }
+
+    Ok(())
 }
