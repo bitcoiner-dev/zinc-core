@@ -58,6 +58,15 @@ pub struct OutputDetails {
     pub runes: serde_json::Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Raw inscription content payload fetched from `/content/<id>`.
+pub struct InscriptionContent {
+    /// Best-effort content type from HTTP response headers.
+    pub content_type: Option<String>,
+    /// Raw content bytes.
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum OffersResponse {
@@ -209,6 +218,42 @@ impl OrdClient {
 
         details_resp.json().await.map_err(|e| {
             OrdError::RequestFailed(format!("Failed to parse Details JSON for {}: {}", id, e))
+        })
+    }
+
+    /// Fetch raw inscription content bytes for one inscription id.
+    pub async fn get_inscription_content(&self, id: &str) -> Result<InscriptionContent, OrdError> {
+        let url = format!("{}/content/{}", self.base_url, id);
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| {
+                OrdError::RequestFailed(format!("Failed to fetch content for {}: {}", id, e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(OrdError::RequestFailed(format!(
+                "API Error (Content {}): {}",
+                id,
+                response.status()
+            )));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+
+        let bytes = response.bytes().await.map_err(|e| {
+            OrdError::RequestFailed(format!("Failed to read content body for {}: {}", id, e))
+        })?;
+
+        Ok(InscriptionContent {
+            content_type,
+            bytes: bytes.to_vec(),
         })
     }
 
@@ -379,7 +424,7 @@ impl OrdClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_offers_payload, OutputResponse};
+    use super::{parse_offers_payload, OrdClient, OutputResponse};
 
     #[test]
     fn output_response_accepts_null_asset_fields() {
@@ -460,5 +505,27 @@ mod tests {
             )
             .expect_err("must fail");
         assert!(err.to_string().contains("missing required address field"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn get_inscription_content_fetches_body_and_content_type() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/content/abc123i0")
+            .with_status(200)
+            .with_header("content-type", "image/png")
+            .with_body(vec![0u8, 1, 2, 3])
+            .create_async()
+            .await;
+
+        let client = OrdClient::new(server.url());
+        let content = client
+            .get_inscription_content("abc123i0")
+            .await
+            .expect("content");
+
+        assert_eq!(content.content_type.as_deref(), Some("image/png"));
+        assert_eq!(content.bytes, vec![0u8, 1, 2, 3]);
     }
 }
