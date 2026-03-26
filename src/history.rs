@@ -176,6 +176,12 @@ impl ZincWallet {
         let mut results = Vec::new();
         for (i, _) in tx.output.iter().enumerate() {
             let outpoint = bitcoin::OutPoint::new(txid, u32::try_from(i).unwrap());
+
+            // Fast skip if the outpoint is not in the set of inscribed utxos
+            if !self.inscribed_utxos.contains(&outpoint) {
+                continue;
+            }
+
             // Find the inscription that matches this outpoint in our cache
             if let Some(ins) = self
                 .inscriptions
