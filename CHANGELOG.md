@@ -8,8 +8,23 @@ All notable changes to this project will be documented in this file.
 
 ## [0.1.1] - 2026-03-26
 
-### Changed
-- Bumped crate version to `0.1.1` for release alignment.
+### Added
+- Offer envelope primitives for signed buyer offers.
+- Ord offer submit/list client support.
+- Nostr offer primitives:
+  - event signing and verification,
+  - relay publish and discovery client,
+  - rustls-backed `wss://` transport,
+  - NIP-40 expiration tags.
+- Offer acceptance validation primitives with tests.
+- Ord-compatible offer creation flow.
+- Inscription content fetch API.
+
+### Fixed
+- Removed unstable topological sorting in history transaction listing to improve deterministic behavior.
+
+### CI
+- Added GitHub Actions validation workflow.
 
 ## [0.1.0] - 2026-03-16
 
