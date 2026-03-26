@@ -1,0 +1,4 @@
+## 2024-05-18 - [Fix Potential DoS Panic on Large PSBT Output Counts]
+**Vulnerability:** Found a potential vulnerability where `.unwrap()` was used when casting `vout` (`usize`) to `u32` inside `analyze_psbt_with_scope` in `src/ordinals/shield.rs`. A malicious PSBT with more than `u32::MAX` outputs could crash the wallet.
+**Learning:** `try_from` casting failures should always be mapped to proper error types, particularly when processing potentially hostile external inputs like PSBTs. In WASM contexts, unhandled panics crash the entire host module.
+**Prevention:** Avoid `.unwrap()` on type conversions. Use safe fallbacks or `map_err` to return descriptive errors (e.g. `OrdError::RequestFailed`) so the caller can handle them gracefully.
