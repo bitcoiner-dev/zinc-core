@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 - No changes yet.
 
+## [0.1.1] - 2026-03-26
+
+### Changed
+- Bumped crate version to `0.1.1` for release alignment.
+
 ## [0.1.0] - 2026-03-16
 
 ### Added
