@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 - No changes yet.
 
+## [0.1.2] - 2026-03-27
+
+### Fixed
+- Improved deep account discovery reliability by scanning receive addresses beyond index 0, reducing false negatives during wallet restore.
+
+### Changed
+- `discoverAccounts` now accepts optional `address_scan_depth` and `timeout_ms` controls with safe defaults.
+- Added batched receive-scan coverage tests for account discovery behavior.
+
 ## [0.1.1] - 2026-03-26
 
 ### Changed
