@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod discovery_scan;
 pub mod offer;
 pub mod offer_accept;
 pub mod offer_create;

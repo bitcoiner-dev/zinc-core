@@ -22,6 +22,7 @@
 //! `wallet_setup`, `sync_and_balance`, and `psbt_sign_audit`.
 
 use serde::Serialize;
+use std::future::Future;
 use wasm_bindgen::prelude::*;
 
 #[macro_use]
@@ -155,6 +156,36 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 const LOG_TARGET_WASM: &str = "zinc_core::wasm";
+
+async fn account_is_active_from_receive_scan<F, Fut>(
+    address_scan_depth: u32,
+    mut has_activity_at: F,
+) -> bool
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let depth = address_scan_depth.max(1);
+    const ADDRESS_SCAN_BATCH_SIZE: u32 = 20;
+
+    let mut batch_start = 0;
+    while batch_start < depth {
+        let batch_end = (batch_start + ADDRESS_SCAN_BATCH_SIZE).min(depth);
+        let mut checks = Vec::with_capacity((batch_end - batch_start) as usize);
+        for address_index in batch_start..batch_end {
+            checks.push(has_activity_at(address_index));
+        }
+
+        let results = futures_util::future::join_all(checks).await;
+        if results.into_iter().any(|is_active| is_active) {
+            return true;
+        }
+
+        batch_start = batch_end;
+    }
+
+    false
+}
 
 /// Initialize WASM module (call once on load).
 #[wasm_bindgen(start)]
@@ -1018,7 +1049,9 @@ impl ZincWasmWallet {
     pub fn discover_accounts(
         &self,
         esplora_url: String,
-        gap_limit: u32,
+        account_gap_limit: u32,
+        address_scan_depth: Option<u32>,
+        timeout_ms: Option<u32>,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
 
@@ -1028,86 +1061,132 @@ impl ZincWasmWallet {
         let state = self.state_snapshot();
         let network = state.network;
         let scheme = state.scheme;
+        let account_gap_limit = account_gap_limit.max(1);
+        let address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
+        let timeout_ms = timeout_ms.unwrap_or(120_000).max(1);
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
                 target: LOG_TARGET_WASM,
-                "discover_accounts start ({})",
-                logging::redacted_field("esplora_url", &esplora_url)
+                "discover_accounts start ({}, account_gap_limit={}, address_scan_depth={}, timeout_ms={})",
+                logging::redacted_field("esplora_url", &esplora_url),
+                account_gap_limit,
+                address_scan_depth,
+                timeout_ms
             );
 
             let client = reqwest::Client::new();
             let mut max_active_index: i32 = -1;
             let mut current_gap = 0;
-            let mut i = 0;
+            let mut account_index: u32 = 0;
+            let start_ms = js_sys::Date::now();
+            let deadline_ms = start_ms + f64::from(timeout_ms);
 
             loop {
-                if current_gap >= gap_limit {
+                if js_sys::Date::now() >= deadline_ms {
+                    zinc_log_warn!(
+                        target: LOG_TARGET_WASM,
+                        "discover_accounts reached timeout budget after {}ms (best_so_far_max_active={})",
+                        timeout_ms,
+                        max_active_index
+                    );
+                    break;
+                }
+
+                if current_gap >= account_gap_limit {
                     break;
                 }
 
                 let mut builder = WalletBuilder::from_seed(network, seed);
-                builder = builder.with_scheme(scheme).with_account_index(i);
+                builder = builder
+                    .with_scheme(scheme)
+                    .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-
-                let vault_addr = zwallet
-                    .vault_wallet
-                    .peek_address(KeychainKind::External, 0)
-                    .address
-                    .to_string();
-
-                let payment_addr = if scheme == AddressScheme::Dual {
-                    Some(
-                        zwallet
-                            .payment_wallet
-                            .as_ref()
-                            .ok_or_else(|| {
-                                JsValue::from_str("Payment wallet missing in dual mode")
-                            })?
-                            .peek_address(KeychainKind::External, 0)
-                            .address
-                            .to_string(),
-                    )
-                } else {
-                    None
-                };
-
-                let mut has_activity = false;
+                let timed_out = std::cell::Cell::new(false);
+                const ADDRESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
 
                 let check_activity = |addr_str: String| {
                     let client = client.clone();
                     let url = format!("{}/address/{}", esplora_url, addr_str);
                     async move {
-                        if let Ok(resp) = client.get(&url).send().await {
-                            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                let chain_txs =
-                                    json["chain_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                let mempool_txs =
-                                    json["mempool_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                return chain_txs > 0 || mempool_txs > 0;
+                        let request = async {
+                            if let Ok(resp) = client.get(&url).send().await {
+                                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                    let chain_txs =
+                                        json["chain_stats"]["tx_count"].as_u64().unwrap_or(0);
+                                    let mempool_txs =
+                                        json["mempool_stats"]["tx_count"].as_u64().unwrap_or(0);
+                                    return chain_txs > 0 || mempool_txs > 0;
+                                }
                             }
+                            false
+                        };
+                        let timeout = gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
+                        futures_util::pin_mut!(request);
+                        futures_util::pin_mut!(timeout);
+
+                        match futures_util::future::select(request, timeout).await {
+                            futures_util::future::Either::Left((value, _)) => value,
+                            futures_util::future::Either::Right((_timed_out, _)) => false,
                         }
-                        false
                     }
                 };
 
-                if check_activity(vault_addr).await {
-                    has_activity = true;
-                } else if let Some(p_addr) = payment_addr {
-                    if check_activity(p_addr).await {
-                        has_activity = true;
-                    }
+                // Scan each account's receive chain deeply enough to catch funds parked
+                // on later derived addresses during recovery.
+                let has_activity =
+                    account_is_active_from_receive_scan(address_scan_depth, |address_index| {
+                        let vault_addr = zwallet
+                            .vault_wallet
+                            .peek_address(KeychainKind::External, address_index)
+                            .address
+                            .to_string();
+
+                        let payment_addr = if scheme == AddressScheme::Dual {
+                            zwallet.payment_wallet.as_ref().map(|wallet| {
+                                wallet
+                                    .peek_address(KeychainKind::External, address_index)
+                                    .address
+                                    .to_string()
+                            })
+                        } else {
+                            None
+                        };
+
+                        async {
+                            if js_sys::Date::now() >= deadline_ms {
+                                timed_out.set(true);
+                                return false;
+                            }
+                            if check_activity(vault_addr).await {
+                                return true;
+                            }
+                            if let Some(payment_addr) = payment_addr {
+                                return check_activity(payment_addr).await;
+                            }
+                            false
+                        }
+                    })
+                    .await;
+
+                if timed_out.get() {
+                    zinc_log_warn!(
+                        target: LOG_TARGET_WASM,
+                        "discover_accounts stopped mid-account scan due to timeout budget (account_index={})",
+                        account_index
+                    );
+                    break;
                 }
 
                 if has_activity {
-                    max_active_index = i as i32;
+                    max_active_index = account_index as i32;
                     current_gap = 0;
                 } else {
                     current_gap += 1;
                 }
 
-                i += 1;
+                account_index += 1;
             }
 
             let discovered_count = (max_active_index + 1) as u32;
@@ -1115,7 +1194,7 @@ impl ZincWasmWallet {
                 discovered_count
             } else {
                 1
-            }; // Always show at least 1
+            }; // Always show at least 1 (also on timeout)
 
             zinc_log_debug!(target: LOG_TARGET_WASM,
                 "discover_accounts finished. Found max active = {}, returning discovery count {}",
