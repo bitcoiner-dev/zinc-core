@@ -1,5 +1,6 @@
 #![cfg(target_arch = "wasm32")]
 
+use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 use zinc_core::ZincWasmWallet;
 
@@ -83,5 +84,93 @@ fn test_get_accounts_dual_returns_public_keys() {
         pay_hex.len(),
         66,
         "Payment pubkey should be 33 bytes hex (compressed)"
+    );
+}
+
+#[wasm_bindgen_test]
+fn test_shared_receiver_methods_do_not_alias_trap() {
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let wallet = ZincWasmWallet::new(
+        "regtest",
+        phrase,
+        Some("unified".to_string()),
+        None,
+        Some(0),
+    )
+    .expect("Failed to create wallet");
+
+    wallet
+        .set_scheme("dual")
+        .expect("set_scheme should work from shared receiver");
+    wallet
+        .set_active_account(1)
+        .expect("set_active_account should work from shared receiver");
+    wallet
+        .set_network("signet")
+        .expect("set_network should work from shared receiver");
+    wallet
+        .set_network("regtest")
+        .expect("set_network should switch back to regtest");
+
+    let sign_err = wallet
+        .sign_psbt("not-a-valid-psbt", JsValue::NULL)
+        .expect_err("invalid PSBT should error");
+    let err_text = sign_err.as_string().unwrap_or_default();
+    assert!(
+        !err_text.contains("recursive use of an object"),
+        "sign_psbt should not surface wasm aliasing trap"
+    );
+}
+
+#[wasm_bindgen_test]
+fn test_account_and_address_views_stay_coherent_after_switches() {
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let wallet = ZincWasmWallet::new(
+        "regtest",
+        phrase,
+        Some("unified".to_string()),
+        None,
+        Some(0),
+    )
+    .expect("Failed to create wallet");
+
+    wallet
+        .set_scheme("dual")
+        .expect("set_scheme should succeed");
+    wallet
+        .set_active_account(1)
+        .expect("set_active_account should succeed");
+    wallet
+        .set_network("signet")
+        .expect("set_network should succeed");
+    wallet
+        .set_network("regtest")
+        .expect("set_network should return to regtest");
+
+    let addrs_js = wallet.get_addresses().expect("get_addresses failed");
+    let addrs: serde_json::Value =
+        serde_wasm_bindgen::from_value(addrs_js).expect("address payload should deserialize");
+    assert_eq!(addrs["account_index"].as_u64(), Some(1));
+
+    let accounts_js = wallet.get_accounts(3).expect("get_accounts failed");
+    let accounts: Vec<serde_json::Value> =
+        serde_wasm_bindgen::from_value(accounts_js).expect("accounts should deserialize");
+    let active_account = accounts
+        .iter()
+        .find(|acc| acc.get("index").and_then(|v| v.as_u64()) == Some(1))
+        .expect("account index 1 should exist");
+
+    let account_taproot = active_account
+        .get("taprootAddress")
+        .and_then(|v| v.as_str())
+        .expect("account taprootAddress should be a string");
+    let current_taproot = addrs
+        .get("taproot")
+        .and_then(|v| v.as_str())
+        .expect("current taproot should be a string");
+
+    assert_eq!(
+        account_taproot, current_taproot,
+        "active account preview should match get_addresses output"
     );
 }

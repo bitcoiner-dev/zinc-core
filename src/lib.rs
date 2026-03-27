@@ -308,19 +308,29 @@ pub fn decrypt_wallet(encrypted_json: &str, password: &str) -> Result<JsValue, J
 // Stateful Wallet Interface
 // ============================================================================
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const VITALITY_MAGIC: u32 = 0x005a_11ad;
+#[cfg(target_arch = "wasm32")]
+const SYNC_STALE_ERROR: &str = "Wallet state changed during sync; stale result discarded";
+#[cfg(target_arch = "wasm32")]
+const ORD_SYNC_STALE_ERROR: &str =
+    "Wallet state changed during ordinals sync; stale result discarded";
+
+#[derive(Clone, Copy)]
+struct WalletState {
+    network: Network,
+    scheme: AddressScheme,
+    account_index: u32,
+}
 
 #[wasm_bindgen]
 /// WASM-safe stateful wallet handle wrapping the core `ZincWallet`.
 pub struct ZincWasmWallet {
     inner: Rc<RefCell<ZincWallet>>,
     phrase: String, // Stored for re-building inner wallet on scheme change
-    network: Network,
-    scheme: AddressScheme,
-    account_index: u32,
+    state: Cell<WalletState>,
     vitality: u32,
 }
 
@@ -423,9 +433,11 @@ impl ZincWasmWallet {
         Ok(ZincWasmWallet {
             inner: Rc::new(RefCell::new(wallet)),
             phrase: phrase.to_string(),
-            network,
-            scheme,
-            account_index: active_index,
+            state: Cell::new(WalletState {
+                network,
+                scheme,
+                account_index: active_index,
+            }),
             vitality: VITALITY_MAGIC,
         })
     }
@@ -443,6 +455,56 @@ impl ZincWasmWallet {
             ));
         }
         Ok(())
+    }
+
+    fn state_snapshot(&self) -> WalletState {
+        self.state.get()
+    }
+
+    fn replace_wallet(
+        &self,
+        mut next_wallet: ZincWallet,
+        next_state: WalletState,
+        busy_context: &str,
+    ) -> Result<(), JsValue> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                next_wallet.account_generation = inner.account_generation().wrapping_add(1);
+                *inner = next_wallet;
+                self.state.set(next_state);
+                Ok(())
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy ({}): {}",
+                busy_context, e
+            ))),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn generation_mismatch_error(
+        inner_rc: &Rc<RefCell<ZincWallet>>,
+        expected_generation: u64,
+        message: &str,
+    ) -> Option<JsValue> {
+        match inner_rc.try_borrow() {
+            Ok(inner) if inner.account_generation() != expected_generation => {
+                Some(JsValue::from_str(message))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn clear_syncing_if_generation_matches(
+        inner_rc: &Rc<RefCell<ZincWallet>>,
+        expected_generation: u64,
+    ) {
+        if let Ok(mut inner) = inner_rc.try_borrow_mut() {
+            if inner.account_generation() == expected_generation {
+                inner.is_syncing = false;
+            }
+        }
     }
 
     /// Export current in-memory wallet changesets as serialized JSON.
@@ -470,7 +532,7 @@ impl ZincWasmWallet {
 
     /// Change the address scheme (Unified <-> Dual) on the fly.
     /// This rebuilds the internal wallet using the stored phrase.
-    pub fn set_scheme(&mut self, scheme_str: &str) -> Result<(), JsValue> {
+    pub fn set_scheme(&self, scheme_str: &str) -> Result<(), JsValue> {
         self.check_vitality()?;
         let new_scheme = match scheme_str {
             "dual" => AddressScheme::Dual,
@@ -478,67 +540,61 @@ impl ZincWasmWallet {
             _ => return Err(JsValue::from_str("Invalid scheme")),
         };
 
-        if self.scheme == new_scheme {
+        let state = self.state_snapshot();
+        if state.scheme == new_scheme {
             return Ok(());
         }
 
         let mnemonic =
             ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        let mut builder = WalletBuilder::from_mnemonic(self.network, &mnemonic);
+        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
         builder = builder
             .with_scheme(new_scheme)
-            .with_account_index(self.account_index);
+            .with_account_index(state.account_index);
 
-        let wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-
-        match self.inner.try_borrow_mut() {
-            Ok(mut inner) => {
-                *inner = wallet;
-                self.scheme = new_scheme;
-                Ok(())
-            }
-            Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (set_scheme): {}",
-                e
-            ))),
-        }
+        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        self.replace_wallet(
+            next_wallet,
+            WalletState {
+                scheme: new_scheme,
+                ..state
+            },
+            "set_scheme",
+        )
     }
 
     /// Switch the active account index.
     /// This rebuilds the internal wallet logic for the new account.
     /// Note: Persistence is NOT carried over automatically for clear separation.
-    pub fn set_active_account(&mut self, account_index: u32) -> Result<(), JsValue> {
+    pub fn set_active_account(&self, account_index: u32) -> Result<(), JsValue> {
         self.check_vitality()?;
-        if self.account_index == account_index {
+        let state = self.state_snapshot();
+        if state.account_index == account_index {
             return Ok(());
         }
 
         let mnemonic =
             ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        let mut builder = WalletBuilder::from_mnemonic(self.network, &mnemonic);
+        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
         builder = builder
-            .with_scheme(self.scheme)
+            .with_scheme(state.scheme)
             .with_account_index(account_index);
 
-        let wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-
-        match self.inner.try_borrow_mut() {
-            Ok(mut inner) => {
-                *inner = wallet;
-                self.account_index = account_index;
-                Ok(())
-            }
-            Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (set_active_account): {}",
-                e
-            ))),
-        }
+        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        self.replace_wallet(
+            next_wallet,
+            WalletState {
+                account_index,
+                ..state
+            },
+            "set_active_account",
+        )
     }
 
     /// Change the network on the fly.
-    pub fn set_network(&mut self, network_str: &str) -> Result<(), JsValue> {
+    pub fn set_network(&self, network_str: &str) -> Result<(), JsValue> {
         self.check_vitality()?;
         let new_network = match network_str {
             "mainnet" => Network::Bitcoin,
@@ -548,7 +604,8 @@ impl ZincWasmWallet {
             _ => return Err(JsValue::from_str("Invalid network")),
         };
 
-        if self.network == new_network {
+        let state = self.state_snapshot();
+        if state.network == new_network {
             return Ok(());
         }
 
@@ -557,22 +614,18 @@ impl ZincWasmWallet {
 
         let mut builder = WalletBuilder::from_mnemonic(new_network, &mnemonic);
         builder = builder
-            .with_scheme(self.scheme)
-            .with_account_index(self.account_index);
+            .with_scheme(state.scheme)
+            .with_account_index(state.account_index);
 
-        let wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-
-        match self.inner.try_borrow_mut() {
-            Ok(mut inner) => {
-                *inner = wallet;
-                self.network = new_network;
-                Ok(())
-            }
-            Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (set_network): {}",
-                e
-            ))),
-        }
+        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        self.replace_wallet(
+            next_wallet,
+            WalletState {
+                network: new_network,
+                ..state
+            },
+            "set_network",
+        )
     }
 
     #[wasm_bindgen(js_name = get_accounts)]
@@ -583,8 +636,9 @@ impl ZincWasmWallet {
         // Optimize: parse mnemonic and derive seed only once
         let mnemonic = crate::keys::ZincMnemonic::parse(&self.phrase)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let network = self.network;
-        let scheme = self.scheme;
+        let state = self.state_snapshot();
+        let network = state.network;
+        let scheme = state.scheme;
 
         let mut accounts = Vec::new();
         for i in 0..count {
@@ -737,7 +791,7 @@ impl ZincWasmWallet {
                     vault_addr
                 );
 
-                // We use inner.is_unified() instead of self.scheme to avoid mutability issues on self
+                // We use inner.is_unified() so address behavior follows active inner wallet state.
                 let (payment_addr, payment_pubkey) = if inner.is_unified() {
                     (Some(vault_addr.to_string()), Some(vault_pubkey.clone()))
                 } else {
@@ -790,7 +844,7 @@ impl ZincWasmWallet {
             );
 
             // 1. Prepare Request (lock briefly)
-            let sync_req = {
+            let (sync_req, sync_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.is_syncing {
@@ -799,7 +853,7 @@ impl ZincWasmWallet {
                         }
                         inner.is_syncing = true;
                         zinc_log_debug!(target: LOG_TARGET_WASM, "borrow successful, preparing requests");
-                        inner.prepare_requests()
+                        (inner.prepare_requests(), inner.account_generation())
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: FAILED TO BORROW INNER: {:?}", e);
@@ -822,8 +876,13 @@ impl ZincWasmWallet {
                         "failed to create esplora client: {:?}",
                         e
                     );
-                    if let Ok(mut inner) = inner_rc.try_borrow_mut() {
-                        inner.is_syncing = false;
+                    ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
+                    if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
+                        &inner_rc,
+                        sync_generation,
+                        SYNC_STALE_ERROR,
+                    ) {
+                        return Err(stale);
                     }
                     return Err(JsValue::from(format!("{:?}", e)));
                 }
@@ -854,8 +913,13 @@ impl ZincWasmWallet {
             let vault_update = match vault_update_res {
                 Ok(u) => u,
                 Err(e) => {
-                    if let Ok(mut inner) = inner_rc.try_borrow_mut() {
-                        inner.is_syncing = false;
+                    ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
+                    if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
+                        &inner_rc,
+                        sync_generation,
+                        SYNC_STALE_ERROR,
+                    ) {
+                        return Err(stale);
                     }
                     return Err(e);
                 }
@@ -891,8 +955,16 @@ impl ZincWasmWallet {
                 match update_res {
                     Ok(u) => Some(u),
                     Err(e) => {
-                        if let Ok(mut inner) = inner_rc.try_borrow_mut() {
-                            inner.is_syncing = false;
+                        ZincWasmWallet::clear_syncing_if_generation_matches(
+                            &inner_rc,
+                            sync_generation,
+                        );
+                        if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
+                            &inner_rc,
+                            sync_generation,
+                            SYNC_STALE_ERROR,
+                        ) {
+                            return Err(stale);
                         }
                         return Err(e);
                     }
@@ -906,6 +978,9 @@ impl ZincWasmWallet {
             let events = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
+                        if inner.account_generation() != sync_generation {
+                            return Err(JsValue::from_str(SYNC_STALE_ERROR));
+                        }
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: applying updates");
                         let res = inner
                             .apply_sync(vault_update, payment_update)
@@ -950,8 +1025,9 @@ impl ZincWasmWallet {
         let mnemonic = crate::keys::ZincMnemonic::parse(&self.phrase)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let seed = crate::builder::Seed64::from_array(*mnemonic.to_seed(""));
-        let network = self.network;
-        let scheme = self.scheme;
+        let state = self.state_snapshot();
+        let network = state.network;
+        let scheme = state.scheme;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
@@ -1095,7 +1171,7 @@ impl ZincWasmWallet {
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
             // 1. Collect info needed for sync (Borrow Read)
-            let (addresses, wallet_height) = {
+            let (addresses, wallet_height, sync_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.is_syncing {
@@ -1116,7 +1192,7 @@ impl ZincWasmWallet {
                             );
                         }
                         let height = inner.vault_wallet.local_chain().tip().height();
-                        (addrs, height)
+                        (addrs, height, inner.account_generation())
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: FAILED TO BORROW INNER: {:?}", e);
@@ -1133,8 +1209,13 @@ impl ZincWasmWallet {
                 Ok(h) => h,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "Failed to get ord height: {:?}", e);
-                    if let Ok(mut inner) = inner_rc.try_borrow_mut() {
-                        inner.is_syncing = false;
+                    ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
+                    if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
+                        &inner_rc,
+                        sync_generation,
+                        ORD_SYNC_STALE_ERROR,
+                    ) {
+                        return Err(stale);
                     }
                     return Err(JsValue::from_str(&e.to_string()));
                 }
@@ -1145,6 +1226,9 @@ impl ZincWasmWallet {
                 zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: Ord lagging, setting verified=false");
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
+                        if inner.account_generation() != sync_generation {
+                            return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                        }
                         inner.ordinals_verified = false;
                         inner.is_syncing = false;
                     }
@@ -1177,8 +1261,16 @@ impl ZincWasmWallet {
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "Failed to fetch inscriptions for {}: {}", addr_str, e);
-                        if let Ok(mut inner) = inner_rc.try_borrow_mut() {
-                            inner.is_syncing = false;
+                        ZincWasmWallet::clear_syncing_if_generation_matches(
+                            &inner_rc,
+                            sync_generation,
+                        );
+                        if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
+                            &inner_rc,
+                            sync_generation,
+                            ORD_SYNC_STALE_ERROR,
+                        ) {
+                            return Err(stale);
                         }
                         return Err(JsValue::from_str(&format!(
                             "Failed to fetch for {}: {}",
@@ -1202,9 +1294,15 @@ impl ZincWasmWallet {
                             addr_str,
                             e
                         );
-                        if let Ok(mut inner) = inner_rc.try_borrow_mut() {
-                            inner.ordinals_verified = false;
-                            inner.is_syncing = false;
+                        match inner_rc.try_borrow_mut() {
+                            Ok(mut inner) => {
+                                if inner.account_generation() != sync_generation {
+                                    return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                                }
+                                inner.ordinals_verified = false;
+                                inner.is_syncing = false;
+                            }
+                            Err(_) => {}
                         }
                         return Err(JsValue::from_str(&format!(
                             "Failed to fetch protected outputs for {}: {}",
@@ -1223,6 +1321,9 @@ impl ZincWasmWallet {
             let count = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
+                        if inner.account_generation() != sync_generation {
+                            return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                        }
                         let c = inner
                             .apply_verified_ordinals_update(all_inscriptions, protected_outpoints);
                         inner.is_syncing = false; // FINISHED
@@ -1303,7 +1404,7 @@ impl ZincWasmWallet {
     /// Sign a PSBT using the wallet's internal keys.
     /// Returns the signed PSBT as a base64-encoded string.
     #[wasm_bindgen(js_name = signPsbt)]
-    pub fn sign_psbt(&mut self, psbt_base64: &str, options: JsValue) -> Result<String, JsValue> {
+    pub fn sign_psbt(&self, psbt_base64: &str, options: JsValue) -> Result<String, JsValue> {
         self.check_vitality()?;
 
         let sign_opts: Option<crate::builder::SignOptions> =
