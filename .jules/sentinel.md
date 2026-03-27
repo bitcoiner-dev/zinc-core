@@ -1,0 +1,4 @@
+## 2024-05-24 - DoS vulnerability via unhandled type conversions
+**Vulnerability:** Panics from `unwrap()` or `expect()` on integer type conversions (like `usize` to `u32`) when parsing untrusted external inputs such as PSBTs.
+**Learning:** In Rust/WASM environments, panics cause abrupt crashes which act as a Denial of Service (DoS) attack vector. External systems or users could supply maliciously large arrays or indices that overflow the target integer type and trigger the panic.
+**Prevention:** Always use safe conversion methods (like `TryFrom` with `let Ok(...) else {...}`) and map errors gracefully using result types (e.g., `OrdError::RequestFailed`) rather than panicking.
