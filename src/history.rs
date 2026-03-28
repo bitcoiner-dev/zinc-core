@@ -94,7 +94,6 @@ impl ZincWallet {
                 };
             }
 
-
             match (a.confirmation_time, b.confirmation_time) {
                 (Some(ta), Some(tb)) if ta != tb => tb.cmp(&ta), // Time descending
                 _ => {
@@ -165,8 +164,20 @@ impl ZincWallet {
         txid: bitcoin::Txid,
     ) -> Vec<InscriptionDetails> {
         let mut results = Vec::new();
+
+        if self.inscriptions.is_empty() {
+            return results;
+        }
+
         for (i, _) in tx.output.iter().enumerate() {
             let outpoint = bitcoin::OutPoint::new(txid, u32::try_from(i).unwrap());
+
+            // ⚡ Bolt Optimization: O(1) HashSet check avoids O(N) inscription vector scan
+            // Only search the full inscription list if we know this outpoint holds one
+            if !self.inscribed_utxos.contains(&outpoint) {
+                continue;
+            }
+
             // Find the inscription that matches this outpoint in our cache
             if let Some(ins) = self
                 .inscriptions

@@ -265,10 +265,11 @@ fn create_offer_supports_distinct_seller_input_and_payout_addresses() {
     let mut wallet = funded_unified_wallet(true);
 
     let seller_seed = [11u8; 64];
-    let mut seller_wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seller_seed))
-        .with_scheme(AddressScheme::Dual)
-        .build()
-        .expect("seller wallet build");
+    let mut seller_wallet =
+        WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seller_seed))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .expect("seller wallet build");
     let seller_input_address = seller_wallet
         .next_taproot_address()
         .expect("seller taproot address")
@@ -323,7 +324,10 @@ fn create_offer_supports_distinct_seller_input_and_payout_addresses() {
         .require_network(Network::Regtest)
         .expect("seller input address network")
         .script_pubkey();
-    assert_eq!(input_script, seller_input_script, "seller input metadata must use seller input address script");
+    assert_eq!(
+        input_script, seller_input_script,
+        "seller input metadata must use seller input address script"
+    );
 
     let payout_script = psbt.unsigned_tx.output[1].script_pubkey.clone();
     let seller_payout_script = request
@@ -333,7 +337,10 @@ fn create_offer_supports_distinct_seller_input_and_payout_addresses() {
         .require_network(Network::Regtest)
         .expect("seller payout address network")
         .script_pubkey();
-    assert_eq!(payout_script, seller_payout_script, "seller payout output must use seller payment address script");
+    assert_eq!(
+        payout_script, seller_payout_script,
+        "seller payout output must use seller payment address script"
+    );
 
     assert_eq!(created.seller_address, request.seller_payout_address);
 }

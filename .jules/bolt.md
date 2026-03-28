@@ -1,0 +1,3 @@
+## 2024-05-24 - [O(1) fast-path checks for inscribed UTXOs to bypass O(N) inscription linear search]
+**Learning:** Identifying and filtering out negative cases via an O(1) HashSet check (like `inscribed_utxos`) prior to executing an expensive O(N) linear search over a detailed metadata vector (like `inscriptions`) represents a significant algorithmic improvement. This is particularly critical in loops bound to transaction processing.
+**Action:** When performing searches over metadata collections during transaction or history analysis, first query any available fast-path index (like HashSets of flagged outpoints) to quickly skip items that definitively have no associated metadata.
