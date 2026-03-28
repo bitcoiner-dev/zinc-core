@@ -1,0 +1,4 @@
+## 2024-05-18 - [CRITICAL] Fix DoS panic in large PSBT parsing
+**Vulnerability:** A panic and Denial of Service (DoS) vulnerability existed in `src/ordinals/shield.rs` and `src/history.rs`. When processing externally supplied transactions or PSBTs, the code blindly assumed that the loop index over outputs could be safely converted to a `u32` (via `.unwrap()`).
+**Learning:** This codebase compiles to WASM, where uncaught panics are fatal to the host context. Using `.unwrap()` or `.expect()` when converting from `usize` to `u32` on user-supplied collections is a critical security anti-pattern.
+**Prevention:** Avoid `.unwrap()` entirely when processing data of unbounded lengths. Use safe conversions (like `try_from().map_err(...)`) to return proper errors (`OrdError::RequestFailed`) and gracefully fail.
