@@ -22,7 +22,6 @@
 //! `wallet_setup`, `sync_and_balance`, and `psbt_sign_audit`.
 
 use serde::Serialize;
-use std::future::Future;
 use wasm_bindgen::prelude::*;
 
 #[macro_use]
@@ -157,13 +156,14 @@ use std::sync::Once;
 static INIT: Once = Once::new();
 const LOG_TARGET_WASM: &str = "zinc_core::wasm";
 
+#[cfg(any(target_arch = "wasm32", test))]
 async fn account_is_active_from_receive_scan<F, Fut>(
     address_scan_depth: u32,
     mut has_activity_at: F,
 ) -> bool
 where
     F: FnMut(u32) -> Fut,
-    Fut: Future<Output = bool>,
+    Fut: std::future::Future<Output = bool>,
 {
     let depth = address_scan_depth.max(1);
     const ADDRESS_SCAN_BATCH_SIZE: u32 = 20;
