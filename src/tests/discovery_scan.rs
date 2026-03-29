@@ -43,4 +43,17 @@ mod tests {
 
         assert!(is_active, "zero depth should still check address index 0");
     }
+
+    #[test]
+    fn receive_scan_with_depth_one_checks_only_main_address() {
+        let is_active = run_async(crate::account_is_active_from_receive_scan(
+            1,
+            |index| async move { index == 1 },
+        ));
+
+        assert!(
+            !is_active,
+            "depth=1 must not scan derived addresses beyond index 0"
+        );
+    }
 }

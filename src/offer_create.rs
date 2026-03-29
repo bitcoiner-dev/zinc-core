@@ -80,6 +80,9 @@ pub fn create_offer(
     validate_request(wallet, request)?;
 
     let wallet_network = wallet.vault_wallet.network();
+    let expected_seller_payout_address = wallet
+        .peek_payment_address(0)
+        .ok_or_else(|| ZincError::WalletError("Payment wallet not initialized".to_string()))?;
     let seller_input_address = request
         .seller_input_address
         .parse::<Address<NetworkUnchecked>>()
@@ -96,10 +99,16 @@ pub fn create_offer(
         .map_err(|e| {
             ZincError::OfferError(format!("seller payout address network mismatch: {e}"))
         })?;
+    if seller_payout_address.script_pubkey() != expected_seller_payout_address.script_pubkey() {
+        return Err(ZincError::OfferError(format!(
+            "seller_payout_address must match wallet main payment address {}",
+            expected_seller_payout_address
+        )));
+    }
 
     let buyer_receive_address = wallet
         .vault_wallet
-        .peek_address(KeychainKind::Internal, 0)
+        .peek_address(KeychainKind::External, 0)
         .address;
     let seller_payout_sats = request
         .ask_sats
@@ -124,6 +133,9 @@ pub fn create_offer(
     } else {
         &mut wallet.vault_wallet
     };
+    let main_change_script = signing_wallet
+        .peek_address(KeychainKind::External, 0)
+        .script_pubkey();
 
     let mut builder = signing_wallet.build_tx();
     if !wallet.inscribed_utxos.is_empty() {
@@ -144,6 +156,7 @@ pub fn create_offer(
             seller_payout_address.script_pubkey(),
             Amount::from_sat(seller_payout_sats),
         )
+        .drain_to(main_change_script)
         .fee_rate(fee_rate)
         .only_witness_utxo()
         .add_foreign_utxo(
@@ -209,7 +222,7 @@ pub fn create_offer(
     let plan = prepare_offer_acceptance(&offer, request.created_at_unix)?;
     Ok(OfferCreateResultV1 {
         psbt: signed_psbt,
-        seller_address: request.seller_payout_address.clone(),
+        seller_address: seller_payout_address.to_string(),
         inscription: request.inscription_id.clone(),
         seller_outpoint: request.seller_outpoint.to_string(),
         postage_sats: request.seller_output_value_sats,

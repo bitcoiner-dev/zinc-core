@@ -491,20 +491,14 @@ impl ZincWallet {
     /// Build sync requests for taproot/payment wallets.
     pub fn prepare_requests(&self) -> ZincSyncRequest {
         let now = now_unix();
-        let use_full = self.needs_full_scan();
-
-        let vault = if use_full {
-            SyncRequestType::Full(self.vault_wallet.start_full_scan_at(now).build())
-        } else {
-            // TODO: BDK's start_sync_with_revealed_spks() triggers a panic on WASM (likely std::time usage).
-            // For now, we force a full scan from the current time. This is safe but less efficient than incremental.
-            // Future optimization: Fix incremental sync for WASM.
-            SyncRequestType::Full(self.vault_wallet.start_full_scan_at(now).build())
-        };
+        // Strict scan policy: only track main receive addresses (external/0).
+        // This intentionally avoids scanning non-main derived branches.
+        let vault =
+            SyncRequestType::Full(Self::main_only_full_scan_request(&self.vault_wallet, now));
 
         let payment = self.payment_wallet.as_ref().map(|w| {
-            // Same workaround for payment wallet
-            SyncRequestType::Full(w.start_full_scan_at(now).build())
+            // Same strict policy for payment wallet.
+            SyncRequestType::Full(Self::main_only_full_scan_request(w, now))
         });
 
         ZincSyncRequest {
@@ -595,11 +589,11 @@ impl ZincWallet {
             .map_err(|e| format!("{:?}", e))?;
 
         let now = now_unix();
-        let vault_req = self.vault_wallet.start_full_scan_at(now).build();
+        let vault_req = Self::main_only_full_scan_request(&self.vault_wallet, now);
         let payment_req = self
             .payment_wallet
             .as_ref()
-            .map(|w| w.start_full_scan_at(now).build());
+            .map(|w| Self::main_only_full_scan_request(w, now));
 
         // 1. Sync Vault
         let vault_update = client
@@ -622,39 +616,29 @@ impl ZincWallet {
         self.apply_sync(vault_update, payment_update)
     }
 
-    /// Collect all addresses (Vault + Payment) that currently hold UTXOs.
-    /// Used for syncing Ordinals.
+    /// Collect the wallet's main receive addresses for ordinals sync.
+    ///
+    /// Strict scan policy intentionally limits this to index `0` receive paths:
+    /// taproot external/0 and (when dual) payment external/0.
     pub fn collect_active_addresses(&self) -> Vec<String> {
-        let mut addresses = std::collections::HashSet::new();
+        let mut addresses = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
-        // Helper to collect addresses from a wallet
-        let collect_addresses = |wallet: &Wallet| {
-            let mut addrs = std::collections::HashSet::new();
-            for utxo in wallet.list_unspent() {
-                addrs.insert(utxo.txout.script_pubkey);
-            }
-            addrs
-        };
+        let taproot_main = self.peek_taproot_address(0).to_string();
+        if seen.insert(taproot_main.clone()) {
+            addresses.push(taproot_main);
+        }
 
-        // Collect from Vault
-        let vault_scripts = collect_addresses(&self.vault_wallet);
-        for script in vault_scripts {
-            if let Ok(addr) = Address::from_script(&script, self.vault_wallet.network()) {
-                addresses.insert(addr);
+        if let Some(payment_main) = self
+            .peek_payment_address(0)
+            .map(|address| address.to_string())
+        {
+            if seen.insert(payment_main.clone()) {
+                addresses.push(payment_main);
             }
         }
 
-        // Collect from Payment
-        if let Some(w) = &self.payment_wallet {
-            let payment_scripts = collect_addresses(w);
-            for script in payment_scripts {
-                if let Ok(addr) = Address::from_script(&script, w.network()) {
-                    addresses.insert(addr);
-                }
-            }
-        }
-
-        addresses.into_iter().map(|a| a.to_string()).collect()
+        addresses
     }
 
     /// Update the wallet's internal inscription state.
@@ -1764,7 +1748,7 @@ impl ZincWallet {
     pub async fn discover_accounts_with_context(
         context: DiscoveryContext,
         esplora_url: &str,
-        gap: u32,
+        _gap: u32,
     ) -> Result<Vec<Account>, String> {
         let client = esplora_client::Builder::new(esplora_url)
             .build_async_with_sleeper::<SyncSleeper>()
@@ -1781,29 +1765,13 @@ impl ZincWallet {
             .create_wallet_no_persist()
             .map_err(|e| e.to_string())?;
 
-            let mut has_activity = false;
-
-            for i in 0..gap {
-                let ext = vault_wallet.peek_address(KeychainKind::External, i).address;
-                let stats = client
-                    .get_address_stats(&ext)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0 {
-                    has_activity = true;
-                    break;
-                }
-
-                let change = vault_wallet.peek_address(KeychainKind::Internal, i).address;
-                let stats = client
-                    .get_address_stats(&change)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0 {
-                    has_activity = true;
-                    break;
-                }
-            }
+            let taproot_main = vault_wallet.peek_address(KeychainKind::External, 0).address;
+            let taproot_stats = client
+                .get_address_stats(&taproot_main)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut has_activity =
+                taproot_stats.chain_stats.tx_count > 0 || taproot_stats.mempool_stats.tx_count > 0;
 
             let mut payment_wallet: Option<Wallet> = None;
             if let (Some(pay_desc), Some(pay_change_desc)) = (
@@ -1816,30 +1784,17 @@ impl ZincWallet {
                         .create_wallet_no_persist()
                 {
                     if !has_activity {
-                        for i in 0..gap {
-                            let ext = created_wallet
-                                .peek_address(KeychainKind::External, i)
-                                .address;
-                            let stats = client
-                                .get_address_stats(&ext)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            if stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0 {
-                                has_activity = true;
-                                break;
-                            }
-
-                            let change = created_wallet
-                                .peek_address(KeychainKind::Internal, i)
-                                .address;
-                            let stats = client
-                                .get_address_stats(&change)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            if stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0 {
-                                has_activity = true;
-                                break;
-                            }
+                        let payment_main = created_wallet
+                            .peek_address(KeychainKind::External, 0)
+                            .address;
+                        let payment_stats = client
+                            .get_address_stats(&payment_main)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if payment_stats.chain_stats.tx_count > 0
+                            || payment_stats.mempool_stats.tx_count > 0
+                        {
+                            has_activity = true;
                         }
                     }
                     payment_wallet = Some(created_wallet);
@@ -1880,6 +1835,23 @@ impl ZincWallet {
         }
 
         Ok(active_accounts)
+    }
+
+    fn main_only_full_scan_request(
+        wallet: &Wallet,
+        start_time: u64,
+    ) -> FullScanRequest<KeychainKind> {
+        let main_receive_spk = wallet
+            .peek_address(KeychainKind::External, 0)
+            .script_pubkey();
+
+        FullScanRequest::builder_at(start_time)
+            .chain_tip(wallet.local_chain().tip())
+            .spks_for_keychain(
+                KeychainKind::External,
+                std::iter::once((0u32, main_receive_spk)),
+            )
+            .build()
     }
 
     /// Switch the active account and reset account-scoped runtime state.
@@ -2380,5 +2352,68 @@ mod tests {
         assert!(wallet.inscribed_utxos.is_empty());
         assert!(!wallet.ordinals_verified);
         assert!(wallet.ordinals_metadata_complete);
+    }
+
+    #[test]
+    fn test_collect_active_addresses_returns_only_main_addresses() {
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(*seed))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .unwrap();
+
+        let addresses = wallet.collect_active_addresses();
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0], wallet.peek_taproot_address(0).to_string());
+        assert_eq!(
+            addresses[1],
+            wallet
+                .peek_payment_address(0)
+                .expect("payment address")
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn test_prepare_requests_scans_only_external_index_zero() {
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(*seed))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .unwrap();
+
+        let expected_taproot_spk = wallet.peek_taproot_address(0).script_pubkey();
+        let expected_payment_spk = wallet
+            .peek_payment_address(0)
+            .expect("payment address")
+            .script_pubkey();
+
+        let requests = wallet.prepare_requests();
+        match requests.taproot {
+            SyncRequestType::Full(mut req) => {
+                let keychains = req.keychains();
+                assert_eq!(keychains, vec![KeychainKind::External]);
+                let spks: Vec<_> = req.iter_spks(KeychainKind::External).collect();
+                assert_eq!(spks.len(), 1);
+                assert_eq!(spks[0].0, 0);
+                assert_eq!(spks[0].1, expected_taproot_spk);
+            }
+            SyncRequestType::Incremental(_) => panic!("expected full scan request"),
+        }
+
+        match requests.payment {
+            Some(SyncRequestType::Full(mut req)) => {
+                let keychains = req.keychains();
+                assert_eq!(keychains, vec![KeychainKind::External]);
+                let spks: Vec<_> = req.iter_spks(KeychainKind::External).collect();
+                assert_eq!(spks.len(), 1);
+                assert_eq!(spks[0].0, 0);
+                assert_eq!(spks[0].1, expected_payment_spk);
+            }
+            Some(SyncRequestType::Incremental(_)) => panic!("expected full scan request"),
+            None => panic!("expected payment request in dual mode"),
+        }
     }
 }
