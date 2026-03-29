@@ -398,10 +398,20 @@ pub fn analyze_psbt_with_scope(
                 // Found destination!
                 let relative_offset = abs_offset - current_output_offset;
 
+                let vout_u32 = match u32::try_from(vout) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(OrdError::RequestFailed(format!(
+                            "Ordinal Shield Error: Output index {} exceeds u32 limit",
+                            vout
+                        )));
+                    }
+                };
+
                 inscription_destinations.insert(
                     key.clone(),
                     InscriptionDestination {
-                        vout: Some(u32::try_from(vout).unwrap()),
+                        vout: Some(vout_u32),
                         offset: relative_offset,
                     },
                 );
