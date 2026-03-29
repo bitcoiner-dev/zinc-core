@@ -224,14 +224,9 @@ impl OrdClient {
     /// Fetch raw inscription content bytes for one inscription id.
     pub async fn get_inscription_content(&self, id: &str) -> Result<InscriptionContent, OrdError> {
         let url = format!("{}/content/{}", self.base_url, id);
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| {
-                OrdError::RequestFailed(format!("Failed to fetch content for {}: {}", id, e))
-            })?;
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            OrdError::RequestFailed(format!("Failed to fetch content for {}: {}", id, e))
+        })?;
 
         if !response.status().is_success() {
             return Err(OrdError::RequestFailed(format!(

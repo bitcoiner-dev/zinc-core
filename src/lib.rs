@@ -22,6 +22,7 @@
 //! `wallet_setup`, `sync_and_balance`, and `psbt_sign_audit`.
 
 use serde::Serialize;
+#[cfg(any(target_arch = "wasm32", test))]
 use std::future::Future;
 use wasm_bindgen::prelude::*;
 
@@ -157,6 +158,7 @@ use std::sync::Once;
 static INIT: Once = Once::new();
 const LOG_TARGET_WASM: &str = "zinc_core::wasm";
 
+#[cfg(any(target_arch = "wasm32", test))]
 async fn account_is_active_from_receive_scan<F, Fut>(
     address_scan_depth: u32,
     mut has_activity_at: F,
@@ -1062,15 +1064,18 @@ impl ZincWasmWallet {
         let network = state.network;
         let scheme = state.scheme;
         let account_gap_limit = account_gap_limit.max(1);
-        let address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
+        let requested_address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
+        // Strict scan policy: account discovery checks only main receive addresses (external/0).
+        let address_scan_depth = 1;
         let timeout_ms = timeout_ms.unwrap_or(120_000).max(1);
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
                 target: LOG_TARGET_WASM,
-                "discover_accounts start ({}, account_gap_limit={}, address_scan_depth={}, timeout_ms={})",
+                "discover_accounts start ({}, account_gap_limit={}, requested_scan_depth={}, effective_scan_depth={}, timeout_ms={})",
                 logging::redacted_field("esplora_url", &esplora_url),
                 account_gap_limit,
+                requested_address_scan_depth,
                 address_scan_depth,
                 timeout_ms
             );
@@ -1122,7 +1127,8 @@ impl ZincWasmWallet {
                             }
                             false
                         };
-                        let timeout = gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
+                        let timeout =
+                            gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
                         futures_util::pin_mut!(request);
                         futures_util::pin_mut!(timeout);
 

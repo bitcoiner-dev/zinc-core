@@ -80,7 +80,7 @@ fn funded_unified_wallet(mark_ordinals_verified: bool) -> crate::ZincWallet {
     wallet
 }
 
-fn sample_request() -> CreateOfferRequest {
+fn sample_request(wallet: &crate::ZincWallet) -> CreateOfferRequest {
     let seller_seed = [9u8; 64];
     let mut seller_wallet =
         WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seller_seed))
@@ -100,7 +100,10 @@ fn sample_request() -> CreateOfferRequest {
             .to_string(),
         seller_outpoint: OutPoint::new(seller_txid, 0),
         seller_input_address: seller_input_address.clone(),
-        seller_payout_address: seller_input_address,
+        seller_payout_address: wallet
+            .peek_payment_address(0)
+            .expect("main payment address")
+            .to_string(),
         seller_output_value_sats: 330,
         ask_sats: 1_000,
         fee_rate_sat_vb: 1,
@@ -122,7 +125,7 @@ fn input_has_signature(input: &bdk_wallet::bitcoin::psbt::Input) -> bool {
 #[test]
 fn create_offer_builds_ord_compatible_psbt_and_offer_envelope() {
     let mut wallet = funded_unified_wallet(true);
-    let request = sample_request();
+    let request = sample_request(&wallet);
 
     let created = wallet.create_offer(&request).expect("offer create");
 
@@ -173,7 +176,7 @@ fn create_offer_builds_ord_compatible_psbt_and_offer_envelope() {
 #[test]
 fn create_offer_requires_verified_ordinals_state() {
     let mut wallet = funded_unified_wallet(false);
-    let request = sample_request();
+    let request = sample_request(&wallet);
 
     let err = wallet.create_offer(&request).expect_err("must fail");
     assert!(
@@ -185,7 +188,7 @@ fn create_offer_requires_verified_ordinals_state() {
 #[test]
 fn create_offer_rejects_non_increasing_expiration() {
     let mut wallet = funded_unified_wallet(true);
-    let mut request = sample_request();
+    let mut request = sample_request(&wallet);
     request.expires_at_unix = request.created_at_unix;
 
     let err = wallet.create_offer(&request).expect_err("must fail");
@@ -205,11 +208,16 @@ fn create_offer_preserves_ord_input_and_output_ordering() {
     // Build multiple offers to ensure ordering is stable and never randomized.
     for _ in 0..8 {
         let mut wallet = funded_unified_wallet(true);
-        let request = sample_request();
+        let request = sample_request(&wallet);
 
         let buyer_receive_script = wallet
             .vault_wallet
-            .peek_address(KeychainKind::Internal, 0)
+            .peek_address(KeychainKind::External, 0)
+            .address
+            .script_pubkey();
+        let expected_change_script = wallet
+            .vault_wallet
+            .peek_address(KeychainKind::External, 0)
             .address
             .script_pubkey();
         let seller_script = request
@@ -257,27 +265,38 @@ fn create_offer_preserves_ord_input_and_output_ordering() {
             psbt.unsigned_tx.output[1].script_pubkey, seller_script,
             "second output must be seller payout script"
         );
+        assert!(
+            psbt.unsigned_tx.output.len() > 2,
+            "offer should include change output routed to main address"
+        );
+        for output in psbt.unsigned_tx.output.iter().skip(2) {
+            assert_eq!(
+                output.script_pubkey, expected_change_script,
+                "change output must be routed to main external address"
+            );
+        }
     }
 }
 
 #[test]
-fn create_offer_supports_distinct_seller_input_and_payout_addresses() {
+fn create_offer_rejects_non_main_seller_payout_address() {
     let mut wallet = funded_unified_wallet(true);
 
     let seller_seed = [11u8; 64];
-    let mut seller_wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seller_seed))
-        .with_scheme(AddressScheme::Dual)
-        .build()
-        .expect("seller wallet build");
+    let mut seller_wallet =
+        WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seller_seed))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .expect("seller wallet build");
     let seller_input_address = seller_wallet
         .next_taproot_address()
         .expect("seller taproot address")
         .to_string();
-    let seller_payout_address = seller_wallet
+    let non_main_seller_payout_address = seller_wallet
         .get_payment_address()
         .expect("seller payment address")
         .to_string();
-    assert_ne!(seller_input_address, seller_payout_address);
+    assert_ne!(seller_input_address, non_main_seller_payout_address);
 
     let seller_txid =
         Txid::from_str("95fd55da0385b869a2a7f67eee798f64abcfc85929ae52407d4f8e5983c98757")
@@ -287,7 +306,7 @@ fn create_offer_supports_distinct_seller_input_and_payout_addresses() {
             .to_string(),
         seller_outpoint: OutPoint::new(seller_txid, 1),
         seller_input_address: seller_input_address.clone(),
-        seller_payout_address: seller_payout_address.clone(),
+        seller_payout_address: non_main_seller_payout_address.clone(),
         seller_output_value_sats: 330,
         ask_sats: 123_456,
         fee_rate_sat_vb: 1,
@@ -297,43 +316,10 @@ fn create_offer_supports_distinct_seller_input_and_payout_addresses() {
         publisher_pubkey_hex: None,
     };
 
-    let created = wallet.create_offer(&request).expect("offer create");
-    let psbt_bytes = base64::engine::general_purpose::STANDARD
-        .decode(created.psbt.as_bytes())
-        .expect("base64");
-    let psbt = Psbt::deserialize(&psbt_bytes).expect("psbt decode");
-
-    let seller_input_index = psbt
-        .unsigned_tx
-        .input
-        .iter()
-        .position(|txin| txin.previous_output == request.seller_outpoint)
-        .expect("seller input present");
-
-    let input_script = psbt.inputs[seller_input_index]
-        .witness_utxo
-        .as_ref()
-        .expect("witness utxo")
-        .script_pubkey
-        .clone();
-    let seller_input_script = request
-        .seller_input_address
-        .parse::<bdk_wallet::bitcoin::Address<bdk_wallet::bitcoin::address::NetworkUnchecked>>()
-        .expect("seller input address parse")
-        .require_network(Network::Regtest)
-        .expect("seller input address network")
-        .script_pubkey();
-    assert_eq!(input_script, seller_input_script, "seller input metadata must use seller input address script");
-
-    let payout_script = psbt.unsigned_tx.output[1].script_pubkey.clone();
-    let seller_payout_script = request
-        .seller_payout_address
-        .parse::<bdk_wallet::bitcoin::Address<bdk_wallet::bitcoin::address::NetworkUnchecked>>()
-        .expect("seller payout address parse")
-        .require_network(Network::Regtest)
-        .expect("seller payout address network")
-        .script_pubkey();
-    assert_eq!(payout_script, seller_payout_script, "seller payout output must use seller payment address script");
-
-    assert_eq!(created.seller_address, request.seller_payout_address);
+    let err = wallet.create_offer(&request).expect_err("must fail");
+    assert!(
+        err.to_string()
+            .contains("seller_payout_address must match wallet main payment address"),
+        "unexpected error: {err}"
+    );
 }

@@ -94,7 +94,6 @@ impl ZincWallet {
                 };
             }
 
-
             match (a.confirmation_time, b.confirmation_time) {
                 (Some(ta), Some(tb)) if ta != tb => tb.cmp(&ta), // Time descending
                 _ => {
