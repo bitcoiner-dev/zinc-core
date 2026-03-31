@@ -1340,11 +1340,16 @@ impl ZincWallet {
         let (purpose, chain) = if is_vault { (86, 0) } else { (84, 0) };
 
         let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
         ];
 
         let child_xprv = self
@@ -1361,7 +1366,7 @@ impl ZincWallet {
         let sig = secp.sign_ecdsa_recoverable(&msg, &priv_key);
         let (rec_id, sig_bytes_compact) = sig.serialize_compact();
 
-        let mut header = 27 + u8::try_from(rec_id.to_i32()).unwrap();
+        let mut header = 27 + u8::try_from(rec_id.to_i32()).map_err(|e| format!("Invalid recovery ID: {e}"))?;
         header += 4; // Always compressed
 
         let mut sig_bytes = Vec::with_capacity(65);
@@ -1416,11 +1421,16 @@ impl ZincWallet {
             1
         };
         let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(self.account_index).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0).unwrap(), // External chain
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0).unwrap(), // First key
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(86)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(self.account_index)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0)
+                .map_err(|e| format!("Invalid child index: {e}"))?, // External chain
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0)
+                .map_err(|e| format!("Invalid child index: {e}"))?, // First key
         ];
 
         let ordinals_xprv = self
@@ -1949,11 +1959,16 @@ impl ZincWallet {
         let chain = 0;
 
         let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index)
+                .map_err(|e| format!("Invalid child index: {e}"))?,
         ];
 
         let child_xprv = self
