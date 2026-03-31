@@ -70,11 +70,12 @@ pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
 pub use sign_intent::{
-    build_signed_pairing_ack, pubkey_hex_from_secret_key, verify_pairing_approval,
-    BuildBuyerOfferIntentV1, CapabilityPolicyV1, PairingAckDecisionV1, PairingAckV1,
-    PairingLinkApprovalV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
-    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1,
-    SignedPairingAckV1, SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
+    build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
+    pubkey_hex_from_secret_key, verify_pairing_approval, BuildBuyerOfferIntentV1,
+    CapabilityPolicyV1, PairingAckDecisionV1, PairingAckV1, PairingLinkApprovalV1,
+    PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1, SignIntentReceiptStatusV1,
+    SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1, SignedPairingAckV1,
+    SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
 };
 
 // Re-export bitcoin types we use
@@ -1696,6 +1697,7 @@ impl ZincWasmWallet {
         signed_request_json: &str,
         now_unix: i64,
         ack_ttl_secs: u32,
+        granted_capabilities_json: Option<String>,
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
         match self.inner.try_borrow() {
@@ -1707,12 +1709,25 @@ impl ZincWasmWallet {
                     serde_json::from_str(signed_request_json).map_err(|e| {
                         JsValue::from_str(&format!("invalid signed pairing request json: {e}"))
                     })?;
+                let granted_capabilities = match granted_capabilities_json {
+                    Some(raw_json) => {
+                        let policy: crate::sign_intent::CapabilityPolicyV1 =
+                            serde_json::from_str(&raw_json).map_err(|e| {
+                                JsValue::from_str(&format!(
+                                    "invalid granted capabilities json: {e}"
+                                ))
+                            })?;
+                        Some(policy)
+                    }
+                    None => None,
+                };
 
-                let signed_ack = crate::sign_intent::build_signed_pairing_ack(
+                let signed_ack = crate::sign_intent::build_signed_pairing_ack_with_granted(
                     &signed_request,
                     &wallet_secret_key_hex,
                     now_unix,
                     i64::from(ack_ttl_secs),
+                    granted_capabilities,
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
