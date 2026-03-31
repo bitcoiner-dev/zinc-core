@@ -17,8 +17,20 @@ use std::str::FromStr;
 const VERSION_V1: u8 = 1;
 const DOMAIN_PAIRING_REQUEST: &str = "zinc-pairing-request-v1";
 const DOMAIN_PAIRING_ACK: &str = "zinc-pairing-ack-v1";
+const DOMAIN_PAIRING_ACK_ENVELOPE: &str = "zinc-pairing-ack-envelope-v1";
+const DOMAIN_PAIRING_TAG_HASH: &str = "zinc-pairing-tag-hash-v1";
+const DOMAIN_PAIRING_COMPLETE_RECEIPT: &str = "zinc-pairing-complete-receipt-v1";
 const DOMAIN_SIGN_INTENT: &str = "zinc-sign-intent-v1";
 const DOMAIN_SIGN_INTENT_RECEIPT: &str = "zinc-sign-intent-receipt-v1";
+
+pub const NOSTR_SIGN_INTENT_APP_TAG_VALUE: &str = "zinc-sign-intent-v1";
+pub const NOSTR_PAIRING_ACK_TYPE_TAG_VALUE: &str = "pairing-ack-v1";
+pub const NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE: &str = "pairing-complete-receipt-v1";
+pub const PAIRING_TRANSPORT_EVENT_KIND: u64 = 31_978;
+pub const NOSTR_TAG_APP_KEY: &str = "z";
+pub const NOSTR_TAG_TYPE_KEY: &str = "t";
+pub const NOSTR_TAG_PAIRING_HASH_KEY: &str = "x";
+pub const NOSTR_TAG_RECIPIENT_PUBKEY_KEY: &str = "p";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -515,6 +527,299 @@ impl SignedPairingAckV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingAckEnvelopeV1 {
+    pub version: u8,
+    pub app_tag: String,
+    pub type_tag: String,
+    pub pairing_tag_hash_hex: String,
+    pub created_at_unix: i64,
+    pub signed_ack: SignedPairingAckV1,
+}
+
+impl PairingAckEnvelopeV1 {
+    pub fn new(signed_ack: SignedPairingAckV1, created_at_unix: i64) -> Result<Self, ZincError> {
+        signed_ack.verify()?;
+        let pairing_tag_hash_hex = pairing_tag_hash_hex(&signed_ack.ack.pairing_id)?;
+        let envelope = Self {
+            version: VERSION_V1,
+            app_tag: NOSTR_SIGN_INTENT_APP_TAG_VALUE.to_string(),
+            type_tag: NOSTR_PAIRING_ACK_TYPE_TAG_VALUE.to_string(),
+            pairing_tag_hash_hex,
+            created_at_unix,
+            signed_ack,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    fn validate(&self) -> Result<(), ZincError> {
+        validate_version(self.version)?;
+        if self.app_tag != NOSTR_SIGN_INTENT_APP_TAG_VALUE {
+            return Err(ZincError::OfferError(format!(
+                "pairing ack envelope app_tag must be `{NOSTR_SIGN_INTENT_APP_TAG_VALUE}`"
+            )));
+        }
+        if self.type_tag != NOSTR_PAIRING_ACK_TYPE_TAG_VALUE {
+            return Err(ZincError::OfferError(format!(
+                "pairing ack envelope type_tag must be `{NOSTR_PAIRING_ACK_TYPE_TAG_VALUE}`"
+            )));
+        }
+        validate_hex64(
+            "pairing ack envelope pairing_tag_hash_hex",
+            &self.pairing_tag_hash_hex,
+        )?;
+        self.signed_ack.verify()?;
+
+        let expected_hash = pairing_tag_hash_hex(&self.signed_ack.ack.pairing_id)?;
+        if self.pairing_tag_hash_hex != expected_hash {
+            return Err(ZincError::OfferError(
+                "pairing ack envelope pairing_tag_hash_hex does not match embedded pairing_id"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_json(&self) -> Result<Vec<u8>, ZincError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|e| ZincError::SerializationError(e.to_string()))
+    }
+
+    pub fn envelope_id_digest(&self) -> Result<[u8; 32], ZincError> {
+        domain_separated_digest(DOMAIN_PAIRING_ACK_ENVELOPE, &self.canonical_json()?)
+    }
+
+    pub fn envelope_id_hex(&self) -> Result<String, ZincError> {
+        Ok(digest_hex(&self.envelope_id_digest()?))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NostrTransportEventV1 {
+    pub id: String,
+    pub pubkey: String,
+    #[serde(rename = "created_at", alias = "createdAt")]
+    pub created_at: u64,
+    pub kind: u64,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+    pub sig: String,
+}
+
+impl NostrTransportEventV1 {
+    pub fn new(
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+        created_at_unix: u64,
+        secret_key_hex: &str,
+    ) -> Result<Self, ZincError> {
+        let secret_key = SecretKey::from_str(secret_key_hex)
+            .map_err(|e| ZincError::OfferError(format!("invalid secret key: {e}")))?;
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let (pubkey, _) = XOnlyPublicKey::from_keypair(&keypair);
+        let pubkey_hex = pubkey.to_string();
+
+        let id = compute_nostr_event_id_hex(&pubkey_hex, created_at_unix, kind, &tags, &content)?;
+        let sig = sign_nostr_event_id_hex(&id, &secret_key)?;
+
+        let event = Self {
+            id,
+            pubkey: pubkey_hex,
+            created_at: created_at_unix,
+            kind,
+            tags,
+            content,
+            sig,
+        };
+        event.verify()?;
+        Ok(event)
+    }
+
+    pub fn verify(&self) -> Result<(), ZincError> {
+        validate_hex64("nostr event id", &self.id)?;
+        validate_pubkey_hex("nostr event pubkey", &self.pubkey)?;
+        let expected_id = compute_nostr_event_id_hex(
+            &self.pubkey,
+            self.created_at,
+            self.kind,
+            &self.tags,
+            &self.content,
+        )?;
+        if expected_id != self.id {
+            return Err(ZincError::OfferError("nostr event id mismatch".to_string()));
+        }
+
+        let signature = Signature::from_str(&self.sig)
+            .map_err(|e| ZincError::OfferError(format!("invalid nostr event signature: {e}")))?;
+        let digest = hex_to_digest32(&self.id)?;
+        let message = Message::from_digest(digest);
+        let pubkey = XOnlyPublicKey::from_str(&self.pubkey)
+            .map_err(|e| ZincError::OfferError(format!("invalid nostr event pubkey: {e}")))?;
+        let secp = Secp256k1::verification_only();
+        secp.verify_schnorr(&signature, &message, &pubkey).map_err(|e| {
+            ZincError::OfferError(format!("nostr event signature verification failed: {e}"))
+        })
+    }
+
+    pub fn tag_value(&self, key: &str) -> Option<&str> {
+        self.tags.iter().find_map(|tag| {
+            if tag.len() >= 2 && tag[0] == key {
+                Some(tag[1].as_str())
+            } else {
+                None
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PairingCompleteReceiptStatusV1 {
+    Confirmed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingCompleteReceiptV1 {
+    pub version: u8,
+    pub pairing_id: String,
+    pub ack_id: String,
+    pub challenge_nonce: String,
+    pub agent_pubkey_hex: String,
+    pub wallet_pubkey_hex: String,
+    pub created_at_unix: i64,
+    pub status: PairingCompleteReceiptStatusV1,
+    pub error_message: Option<String>,
+}
+
+impl PairingCompleteReceiptV1 {
+    fn validate(&self) -> Result<(), ZincError> {
+        validate_version(self.version)?;
+        validate_hex64("pairing complete receipt pairing_id", &self.pairing_id)?;
+        validate_hex64("pairing complete receipt ack_id", &self.ack_id)?;
+        validate_nonce(
+            "pairing complete receipt challenge_nonce",
+            &self.challenge_nonce,
+        )?;
+        validate_pubkey_hex(
+            "pairing complete receipt agent_pubkey_hex",
+            &self.agent_pubkey_hex,
+        )?;
+        validate_pubkey_hex(
+            "pairing complete receipt wallet_pubkey_hex",
+            &self.wallet_pubkey_hex,
+        )?;
+        if let Some(message) = &self.error_message {
+            ensure_non_empty("pairing complete receipt error_message", message)?;
+        }
+
+        match self.status {
+            PairingCompleteReceiptStatusV1::Confirmed => {
+                if self.error_message.is_some() {
+                    return Err(ZincError::OfferError(
+                        "confirmed pairing complete receipt must not include error_message"
+                            .to_string(),
+                    ));
+                }
+            }
+            PairingCompleteReceiptStatusV1::Rejected => {
+                if self.error_message.is_none() {
+                    return Err(ZincError::OfferError(
+                        "rejected pairing complete receipt must include error_message".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn canonical_json(&self) -> Result<Vec<u8>, ZincError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|e| ZincError::SerializationError(e.to_string()))
+    }
+
+    pub fn receipt_id_digest(&self) -> Result<[u8; 32], ZincError> {
+        domain_separated_digest(DOMAIN_PAIRING_COMPLETE_RECEIPT, &self.canonical_json()?)
+    }
+
+    pub fn receipt_id_hex(&self) -> Result<String, ZincError> {
+        Ok(digest_hex(&self.receipt_id_digest()?))
+    }
+
+    pub fn sign_schnorr_hex(&self, secret_key_hex: &str) -> Result<String, ZincError> {
+        sign_payload_with_expected_pubkey(
+            secret_key_hex,
+            &self.agent_pubkey_hex,
+            DOMAIN_PAIRING_COMPLETE_RECEIPT,
+            &self.canonical_json()?,
+        )
+    }
+
+    pub fn verify_schnorr_hex(&self, signature_hex: &str) -> Result<(), ZincError> {
+        verify_payload_signature(
+            &self.agent_pubkey_hex,
+            signature_hex,
+            DOMAIN_PAIRING_COMPLETE_RECEIPT,
+            &self.canonical_json()?,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedPairingCompleteReceiptV1 {
+    pub receipt: PairingCompleteReceiptV1,
+    pub signature_hex: String,
+}
+
+impl SignedPairingCompleteReceiptV1 {
+    pub fn new(receipt: PairingCompleteReceiptV1, secret_key_hex: &str) -> Result<Self, ZincError> {
+        let signature_hex = receipt.sign_schnorr_hex(secret_key_hex)?;
+        Ok(Self {
+            receipt,
+            signature_hex,
+        })
+    }
+
+    pub fn verify(&self) -> Result<(), ZincError> {
+        self.receipt.verify_schnorr_hex(&self.signature_hex)
+    }
+
+    pub fn receipt_id_hex(&self) -> Result<String, ZincError> {
+        self.receipt.receipt_id_hex()
+    }
+}
+
+pub fn build_signed_pairing_complete_receipt(
+    signed_request: &SignedPairingRequestV1,
+    signed_ack: &SignedPairingAckV1,
+    agent_secret_key_hex: &str,
+    now_unix: i64,
+) -> Result<SignedPairingCompleteReceiptV1, ZincError> {
+    let approval = verify_pairing_approval(signed_request, signed_ack, now_unix)?;
+    let receipt = PairingCompleteReceiptV1 {
+        version: VERSION_V1,
+        pairing_id: approval.pairing_id,
+        ack_id: signed_ack.ack_id_hex()?,
+        challenge_nonce: signed_request.request.challenge_nonce.clone(),
+        agent_pubkey_hex: approval.agent_pubkey_hex,
+        wallet_pubkey_hex: approval.wallet_pubkey_hex,
+        created_at_unix: now_unix,
+        status: PairingCompleteReceiptStatusV1::Confirmed,
+        error_message: None,
+    };
+    let signed = SignedPairingCompleteReceiptV1::new(receipt, agent_secret_key_hex)?;
+    signed.verify()?;
+    Ok(signed)
+}
+
 pub fn build_signed_pairing_ack(
     signed_request: &SignedPairingRequestV1,
     wallet_secret_key_hex: &str,
@@ -740,6 +1045,96 @@ pub fn validate_signed_pairing_ack_json(payload_json: &str) -> Result<String, Zi
     signed.ack_id_hex()
 }
 
+pub fn validate_pairing_ack_envelope_json(payload_json: &str) -> Result<String, ZincError> {
+    let envelope: PairingAckEnvelopeV1 = serde_json::from_str(payload_json)
+        .map_err(|e| ZincError::SerializationError(format!("invalid pairing ack envelope json: {e}")))?;
+    envelope.validate()?;
+    envelope.envelope_id_hex()
+}
+
+pub fn validate_signed_pairing_complete_receipt_json(
+    payload_json: &str,
+) -> Result<String, ZincError> {
+    let signed: SignedPairingCompleteReceiptV1 = serde_json::from_str(payload_json).map_err(
+        |e| ZincError::SerializationError(format!("invalid signed pairing complete receipt json: {e}")),
+    )?;
+    signed.verify()?;
+    signed.receipt_id_hex()
+}
+
+pub fn pairing_transport_tags(
+    type_tag: &str,
+    pairing_id: &str,
+    recipient_pubkey_hex: &str,
+) -> Result<Vec<Vec<String>>, ZincError> {
+    if type_tag != NOSTR_PAIRING_ACK_TYPE_TAG_VALUE
+        && type_tag != NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE
+    {
+        return Err(ZincError::OfferError(format!(
+            "unsupported pairing transport type tag `{type_tag}`"
+        )));
+    }
+    validate_hex64("pairing id", pairing_id)?;
+    validate_pubkey_hex("recipient pubkey", recipient_pubkey_hex)?;
+    let pairing_hash = pairing_tag_hash_hex(pairing_id)?;
+    Ok(vec![
+        vec![NOSTR_TAG_APP_KEY.to_string(), NOSTR_SIGN_INTENT_APP_TAG_VALUE.to_string()],
+        vec![NOSTR_TAG_TYPE_KEY.to_string(), type_tag.to_string()],
+        vec![NOSTR_TAG_PAIRING_HASH_KEY.to_string(), pairing_hash],
+        vec![
+            NOSTR_TAG_RECIPIENT_PUBKEY_KEY.to_string(),
+            recipient_pubkey_hex.to_string(),
+        ],
+    ])
+}
+
+pub fn validate_nostr_transport_event_json(payload_json: &str) -> Result<String, ZincError> {
+    let event: NostrTransportEventV1 = serde_json::from_str(payload_json)
+        .map_err(|e| ZincError::SerializationError(format!("invalid nostr transport event json: {e}")))?;
+    event.verify()?;
+    Ok(event.id)
+}
+
+pub fn decode_pairing_ack_envelope_event(
+    event: &NostrTransportEventV1,
+) -> Result<PairingAckEnvelopeV1, ZincError> {
+    event.verify()?;
+    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
+        return Err(ZincError::OfferError(format!(
+            "unexpected nostr event kind {}, expected {}",
+            event.kind, PAIRING_TRANSPORT_EVENT_KIND
+        )));
+    }
+    ensure_event_tags_match(event, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE)?;
+    let envelope: PairingAckEnvelopeV1 = serde_json::from_str(&event.content).map_err(|e| {
+        ZincError::SerializationError(format!("invalid pairing ack envelope json: {e}"))
+    })?;
+    envelope.validate()?;
+    ensure_event_pairing_hash_matches(event, &envelope.signed_ack.ack.pairing_id)?;
+    Ok(envelope)
+}
+
+pub fn decode_signed_pairing_complete_receipt_event(
+    event: &NostrTransportEventV1,
+) -> Result<SignedPairingCompleteReceiptV1, ZincError> {
+    event.verify()?;
+    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
+        return Err(ZincError::OfferError(format!(
+            "unexpected nostr event kind {}, expected {}",
+            event.kind, PAIRING_TRANSPORT_EVENT_KIND
+        )));
+    }
+    ensure_event_tags_match(event, NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE)?;
+    let signed: SignedPairingCompleteReceiptV1 = serde_json::from_str(&event.content).map_err(
+        |e| ZincError::SerializationError(format!(
+            "invalid signed pairing complete receipt json: {e}"
+        )),
+    )?;
+    signed.verify()?;
+    ensure_event_pairing_hash_matches(event, &signed.receipt.pairing_id)?;
+    Ok(signed)
+}
+
 pub fn validate_signed_sign_intent_json(payload_json: &str) -> Result<String, ZincError> {
     let signed: SignedSignIntentV1 = serde_json::from_str(payload_json).map_err(|e| {
         ZincError::SerializationError(format!("invalid signed sign intent json: {e}"))
@@ -760,6 +1155,98 @@ pub fn pubkey_hex_from_secret_key(secret_key_hex: &str) -> Result<String, ZincEr
     let secret_key = SecretKey::from_str(secret_key_hex)
         .map_err(|e| ZincError::OfferError(format!("invalid secret key: {e}")))?;
     Ok(pubkey_hex_from_secret(&secret_key))
+}
+
+pub fn pairing_tag_hash_hex(pairing_id: &str) -> Result<String, ZincError> {
+    validate_hex64("pairing id", pairing_id)?;
+    let digest = domain_separated_digest(DOMAIN_PAIRING_TAG_HASH, pairing_id.as_bytes())?;
+    Ok(digest_hex(&digest))
+}
+
+fn ensure_event_tags_match(event: &NostrTransportEventV1, expected_type_tag: &str) -> Result<(), ZincError> {
+    let app_tag = event.tag_value(NOSTR_TAG_APP_KEY).ok_or_else(|| {
+        ZincError::OfferError(format!("nostr transport event missing `{NOSTR_TAG_APP_KEY}` tag"))
+    })?;
+    if app_tag != NOSTR_SIGN_INTENT_APP_TAG_VALUE {
+        return Err(ZincError::OfferError(format!(
+            "nostr transport app tag must be `{NOSTR_SIGN_INTENT_APP_TAG_VALUE}`"
+        )));
+    }
+
+    let type_tag = event.tag_value(NOSTR_TAG_TYPE_KEY).ok_or_else(|| {
+        ZincError::OfferError(format!("nostr transport event missing `{NOSTR_TAG_TYPE_KEY}` tag"))
+    })?;
+    if type_tag != expected_type_tag {
+        return Err(ZincError::OfferError(format!(
+            "nostr transport type tag mismatch (expected `{expected_type_tag}`, got `{type_tag}`)"
+        )));
+    }
+
+    let pairing_hash = event
+        .tag_value(NOSTR_TAG_PAIRING_HASH_KEY)
+        .ok_or_else(|| {
+            ZincError::OfferError(format!(
+                "nostr transport event missing `{NOSTR_TAG_PAIRING_HASH_KEY}` tag"
+            ))
+        })?;
+    validate_hex64("nostr transport pairing hash tag", pairing_hash)?;
+    Ok(())
+}
+
+fn ensure_event_pairing_hash_matches(
+    event: &NostrTransportEventV1,
+    pairing_id: &str,
+) -> Result<(), ZincError> {
+    let expected = pairing_tag_hash_hex(pairing_id)?;
+    let actual = event
+        .tag_value(NOSTR_TAG_PAIRING_HASH_KEY)
+        .ok_or_else(|| {
+            ZincError::OfferError(format!(
+                "nostr transport event missing `{NOSTR_TAG_PAIRING_HASH_KEY}` tag"
+            ))
+        })?;
+    if actual != expected {
+        return Err(ZincError::OfferError(
+            "nostr transport pairing hash tag does not match payload pairing id".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn compute_nostr_event_id_hex(
+    pubkey_hex: &str,
+    created_at: u64,
+    kind: u64,
+    tags: &[Vec<String>],
+    content: &str,
+) -> Result<String, ZincError> {
+    let payload = serde_json::json!([0, pubkey_hex, created_at, kind, tags, content]);
+    let serialized = serde_json::to_vec(&payload).map_err(|e| {
+        ZincError::SerializationError(format!("failed to serialize nostr event payload: {e}"))
+    })?;
+    let digest = sha256::Hash::hash(&serialized);
+    Ok(digest.to_string())
+}
+
+fn sign_nostr_event_id_hex(event_id_hex: &str, secret_key: &SecretKey) -> Result<String, ZincError> {
+    let digest = hex_to_digest32(event_id_hex)?;
+    let message = Message::from_digest(digest);
+    let secp = Secp256k1::new();
+    let keypair = Keypair::from_secret_key(&secp, secret_key);
+    let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+    Ok(signature.to_string())
+}
+
+fn hex_to_digest32(hex: &str) -> Result<[u8; 32], ZincError> {
+    validate_hex64("digest", hex)?;
+    let mut bytes = [0u8; 32];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let part = std::str::from_utf8(chunk)
+            .map_err(|e| ZincError::OfferError(format!("invalid digest hex utf8: {e}")))?;
+        bytes[idx] = u8::from_str_radix(part, 16)
+            .map_err(|e| ZincError::OfferError(format!("invalid digest hex byte: {e}")))?;
+    }
+    Ok(bytes)
 }
 
 fn validate_version(version: u8) -> Result<(), ZincError> {
