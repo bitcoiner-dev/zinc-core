@@ -1,19 +1,21 @@
 use crate::sign_intent::{
     build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
-    build_signed_pairing_complete_receipt, pairing_tag_hash_hex, pubkey_hex_from_secret_key,
-    validate_pairing_ack_envelope_json, validate_signed_pairing_complete_receipt_json,
-    validate_nostr_transport_event_json,
-    validate_signed_pairing_ack_json, validate_signed_pairing_request_json,
+    build_signed_pairing_complete_receipt, decode_pairing_ack_envelope_event,
+    decode_pairing_ack_envelope_event_with_secret, decode_signed_pairing_complete_receipt_event,
+    decode_signed_pairing_complete_receipt_event_with_secret, decrypt_pairing_transport_content,
+    encrypt_pairing_transport_content, pairing_tag_hash_hex, pairing_transport_tags,
+    pubkey_hex_from_secret_key, validate_nostr_transport_event_json,
+    validate_pairing_ack_envelope_json, validate_signed_pairing_ack_json,
+    validate_signed_pairing_complete_receipt_json, validate_signed_pairing_request_json,
     validate_signed_sign_intent_json, validate_signed_sign_intent_receipt_json,
-    verify_pairing_approval, BuildBuyerOfferIntentV1, CapabilityPolicyV1,
-    decode_pairing_ack_envelope_event, decode_signed_pairing_complete_receipt_event,
-    pairing_transport_tags, NostrTransportEventV1, PairingAckDecisionV1, PairingAckEnvelopeV1,
-    PairingAckV1, PairingRequestV1, PAIRING_TRANSPORT_EVENT_KIND,
-    PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1, SignIntentActionV1,
-    SignIntentPayloadV1, SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1,
-    SignedPairingAckV1, SignedPairingCompleteReceiptV1, SignedPairingRequestV1,
-    SignedSignIntentReceiptV1, SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+    verify_pairing_approval, BuildBuyerOfferIntentV1, CapabilityPolicyV1, NostrTransportEventV1,
+    PairingAckDecisionV1, PairingAckEnvelopeV1, PairingAckV1, PairingCompleteReceiptStatusV1,
+    PairingCompleteReceiptV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
+    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignedPairingAckV1,
+    SignedPairingCompleteReceiptV1, SignedPairingRequestV1, SignedSignIntentReceiptV1,
+    SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
     NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
+    PAIRING_TRANSPORT_EVENT_KIND,
 };
 
 fn agent_secret_hex() -> &'static str {
@@ -408,7 +410,8 @@ fn pairing_ack_envelope_validates_embedded_ack_and_tags() {
     );
 
     let envelope_json = serde_json::to_string(&envelope).expect("envelope json");
-    let envelope_id = validate_pairing_ack_envelope_json(&envelope_json).expect("validate envelope");
+    let envelope_id =
+        validate_pairing_ack_envelope_json(&envelope_json).expect("validate envelope");
     assert_eq!(envelope_id.len(), 64);
 }
 
@@ -468,9 +471,8 @@ fn signed_pairing_complete_receipt_roundtrip_and_builder() {
         status: PairingCompleteReceiptStatusV1::Rejected,
         error_message: Some("operator cancelled".to_string()),
     };
-    let signed_rejected =
-        SignedPairingCompleteReceiptV1::new(rejected_receipt, agent_secret_hex())
-            .expect("signed rejected receipt");
+    let signed_rejected = SignedPairingCompleteReceiptV1::new(rejected_receipt, agent_secret_hex())
+        .expect("signed rejected receipt");
     signed_rejected.verify().expect("verify rejected receipt");
 }
 
@@ -490,17 +492,29 @@ fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
         &signed_ack.ack.agent_pubkey_hex,
     )
     .expect("ack tags");
+    let ack_content = encrypt_pairing_transport_content(
+        &envelope_json,
+        wallet_secret_hex(),
+        &signed_ack.ack.agent_pubkey_hex,
+    )
+    .expect("encrypted ack content");
     let ack_event = NostrTransportEventV1::new(
         PAIRING_TRANSPORT_EVENT_KIND,
         ack_tags,
-        envelope_json,
+        ack_content,
         1_710_000_110,
         wallet_secret_hex(),
     )
     .expect("ack event");
     let ack_event_json = serde_json::to_string(&ack_event).expect("ack event json");
     assert!(validate_nostr_transport_event_json(&ack_event_json).is_ok());
-    let decoded_envelope = decode_pairing_ack_envelope_event(&ack_event).expect("decode ack envelope");
+    assert!(
+        decode_pairing_ack_envelope_event(&ack_event).is_err(),
+        "encrypted event should not decode without recipient secret"
+    );
+    let decoded_envelope =
+        decode_pairing_ack_envelope_event_with_secret(&ack_event, agent_secret_hex())
+            .expect("decode ack envelope");
     assert_eq!(
         decoded_envelope.signed_ack.ack.pairing_id,
         signed_request.pairing_id_hex().expect("pairing id")
@@ -520,18 +534,82 @@ fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
         &signed_complete.receipt.wallet_pubkey_hex,
     )
     .expect("complete tags");
+    let complete_content = encrypt_pairing_transport_content(
+        &complete_json,
+        agent_secret_hex(),
+        &signed_complete.receipt.wallet_pubkey_hex,
+    )
+    .expect("encrypted complete content");
     let complete_event = NostrTransportEventV1::new(
         PAIRING_TRANSPORT_EVENT_KIND,
         complete_tags,
-        complete_json,
+        complete_content,
         1_710_000_121,
         agent_secret_hex(),
     )
     .expect("complete event");
-    let decoded_complete =
-        decode_signed_pairing_complete_receipt_event(&complete_event).expect("decode complete");
+    assert!(
+        decode_signed_pairing_complete_receipt_event(&complete_event).is_err(),
+        "encrypted event should not decode without recipient secret"
+    );
+    let decoded_complete = decode_signed_pairing_complete_receipt_event_with_secret(
+        &complete_event,
+        wallet_secret_hex(),
+    )
+    .expect("decode complete");
     assert_eq!(
         decoded_complete.receipt.status,
         PairingCompleteReceiptStatusV1::Confirmed
+    );
+}
+
+#[test]
+fn pairing_transport_content_encrypt_decrypt_roundtrip() {
+    let payload = r#"{"hello":"world","n":1}"#;
+    let recipient_pubkey =
+        pubkey_hex_from_secret_key(agent_secret_hex()).expect("recipient pubkey");
+    let encrypted =
+        encrypt_pairing_transport_content(payload, wallet_secret_hex(), &recipient_pubkey)
+            .expect("encrypt");
+    assert_ne!(encrypted, payload);
+    let decrypted = decrypt_pairing_transport_content(
+        &encrypted,
+        agent_secret_hex(),
+        &pubkey_hex_from_secret_key(wallet_secret_hex()).expect("sender pubkey"),
+    )
+    .expect("decrypt");
+    assert_eq!(decrypted, payload);
+}
+
+#[test]
+fn decode_pairing_transport_event_with_secret_accepts_plaintext_for_compat() {
+    let request = sample_pairing_request();
+    let signed_request =
+        SignedPairingRequestV1::new(request, agent_secret_hex()).expect("signed request");
+    let signed_ack =
+        build_signed_pairing_ack(&signed_request, wallet_secret_hex(), 1_710_000_100, 600)
+            .expect("signed ack");
+    let envelope = PairingAckEnvelopeV1::new(signed_ack.clone(), 1_710_000_101).expect("envelope");
+    let envelope_json = serde_json::to_string(&envelope).expect("envelope json");
+    let ack_tags = pairing_transport_tags(
+        NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+        &signed_ack.ack.pairing_id,
+        &signed_ack.ack.agent_pubkey_hex,
+    )
+    .expect("ack tags");
+    let ack_event = NostrTransportEventV1::new(
+        PAIRING_TRANSPORT_EVENT_KIND,
+        ack_tags,
+        envelope_json,
+        1_710_000_111,
+        wallet_secret_hex(),
+    )
+    .expect("ack event");
+    let decoded_envelope =
+        decode_pairing_ack_envelope_event_with_secret(&ack_event, agent_secret_hex())
+            .expect("decode plaintext event with secret");
+    assert_eq!(
+        decoded_envelope.signed_ack.ack.pairing_id,
+        signed_request.pairing_id_hex().expect("pairing id")
     );
 }

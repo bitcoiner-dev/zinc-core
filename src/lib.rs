@@ -71,19 +71,20 @@ pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
 pub use sign_intent::{
     build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
-    build_signed_pairing_complete_receipt, pairing_tag_hash_hex, pubkey_hex_from_secret_key,
-    pairing_transport_tags, decode_pairing_ack_envelope_event,
-    decode_signed_pairing_complete_receipt_event, verify_pairing_approval,
-    BuildBuyerOfferIntentV1, CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1,
-    PairingAckEnvelopeV1, PairingAckV1, PairingCompleteReceiptStatusV1,
-    PairingCompleteReceiptV1, PairingLinkApprovalV1, PairingRequestV1, SignIntentActionV1,
-    SignIntentPayloadV1, SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1,
-    SignSellerInputIntentV1, SignedPairingAckV1, SignedPairingCompleteReceiptV1,
-    SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
-    PAIRING_TRANSPORT_EVENT_KIND, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+    build_signed_pairing_complete_receipt, decode_pairing_ack_envelope_event,
+    decode_pairing_ack_envelope_event_with_secret, decode_signed_pairing_complete_receipt_event,
+    decode_signed_pairing_complete_receipt_event_with_secret, decrypt_pairing_transport_content,
+    encrypt_pairing_transport_content, pairing_tag_hash_hex, pairing_transport_tags,
+    pubkey_hex_from_secret_key, verify_pairing_approval, BuildBuyerOfferIntentV1,
+    CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1, PairingAckEnvelopeV1,
+    PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1, PairingLinkApprovalV1,
+    PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1, SignIntentReceiptStatusV1,
+    SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1, SignedPairingAckV1,
+    SignedPairingCompleteReceiptV1, SignedPairingRequestV1, SignedSignIntentReceiptV1,
+    SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
     NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
     NOSTR_TAG_APP_KEY, NOSTR_TAG_PAIRING_HASH_KEY, NOSTR_TAG_RECIPIENT_PUBKEY_KEY,
-    NOSTR_TAG_TYPE_KEY,
+    NOSTR_TAG_TYPE_KEY, PAIRING_TRANSPORT_EVENT_KIND,
 };
 
 // Re-export bitcoin types we use
@@ -405,7 +406,9 @@ pub fn validate_pairing_ack_envelope_json(payload_json: &str) -> Result<String, 
 /// Returns:
 /// `{ "ok": true, "receiptId": "<hex>" }`
 #[wasm_bindgen]
-pub fn validate_signed_pairing_complete_receipt_json(payload_json: &str) -> Result<String, JsValue> {
+pub fn validate_signed_pairing_complete_receipt_json(
+    payload_json: &str,
+) -> Result<String, JsValue> {
     let receipt_id =
         crate::sign_intent::validate_signed_pairing_complete_receipt_json(payload_json)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -1822,8 +1825,9 @@ impl ZincWasmWallet {
         created_at_unix: i64,
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
-        let signed_ack: crate::sign_intent::SignedPairingAckV1 = serde_json::from_str(signed_ack_json)
-            .map_err(|e| JsValue::from_str(&format!("invalid signed pairing ack json: {e}")))?;
+        let signed_ack: crate::sign_intent::SignedPairingAckV1 =
+            serde_json::from_str(signed_ack_json)
+                .map_err(|e| JsValue::from_str(&format!("invalid signed pairing ack json: {e}")))?;
         let envelope = crate::sign_intent::PairingAckEnvelopeV1::new(signed_ack, created_at_unix)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         serde_json::to_string(&envelope).map_err(|e| {
@@ -1853,10 +1857,16 @@ impl ZincWasmWallet {
                     recipient_pubkey_hex,
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                let encrypted_content = crate::sign_intent::encrypt_pairing_transport_content(
+                    content_json,
+                    &secret_hex,
+                    recipient_pubkey_hex,
+                )
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
                 let event = crate::sign_intent::NostrTransportEventV1::new(
                     crate::sign_intent::PAIRING_TRANSPORT_EVENT_KIND,
                     tags,
-                    content_json.to_string(),
+                    encrypted_content,
                     created_at_unix,
                     &secret_hex,
                 )
@@ -1867,6 +1877,48 @@ impl ZincWasmWallet {
             }
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (build_pairing_transport_event_json): {}",
+                e
+            ))),
+        }
+    }
+
+    /// Decode/decrypt pairing transport event content using the account pairing key.
+    #[wasm_bindgen(js_name = decode_pairing_transport_event_content_json)]
+    pub fn decode_pairing_transport_event_content_json(
+        &self,
+        event_json: &str,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let event: crate::sign_intent::NostrTransportEventV1 = serde_json::from_str(event_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid transport event json: {e}")))?;
+        event
+            .verify()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let secret_hex = inner
+                    .get_pairing_secret_key_hex()
+                    .map_err(|e| JsValue::from_str(&e))?;
+
+                match crate::sign_intent::decrypt_pairing_transport_content(
+                    &event.content,
+                    &secret_hex,
+                    &event.pubkey,
+                ) {
+                    Ok(decrypted) => Ok(decrypted),
+                    Err(_) => {
+                        serde_json::from_str::<serde_json::Value>(&event.content).map_err(|_| {
+                            JsValue::from_str(
+                                "failed to decrypt transport event content and plaintext fallback is not valid json",
+                            )
+                        })?;
+                        Ok(event.content)
+                    }
+                }
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (decode_pairing_transport_event_content_json): {}",
                 e
             ))),
         }

@@ -10,6 +10,8 @@ use crate::ZincError;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
 use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
 use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
+use nostr::nips::nip44;
+use nostr::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -661,9 +663,10 @@ impl NostrTransportEventV1 {
         let pubkey = XOnlyPublicKey::from_str(&self.pubkey)
             .map_err(|e| ZincError::OfferError(format!("invalid nostr event pubkey: {e}")))?;
         let secp = Secp256k1::verification_only();
-        secp.verify_schnorr(&signature, &message, &pubkey).map_err(|e| {
-            ZincError::OfferError(format!("nostr event signature verification failed: {e}"))
-        })
+        secp.verify_schnorr(&signature, &message, &pubkey)
+            .map_err(|e| {
+                ZincError::OfferError(format!("nostr event signature verification failed: {e}"))
+            })
     }
 
     pub fn tag_value(&self, key: &str) -> Option<&str> {
@@ -1046,8 +1049,9 @@ pub fn validate_signed_pairing_ack_json(payload_json: &str) -> Result<String, Zi
 }
 
 pub fn validate_pairing_ack_envelope_json(payload_json: &str) -> Result<String, ZincError> {
-    let envelope: PairingAckEnvelopeV1 = serde_json::from_str(payload_json)
-        .map_err(|e| ZincError::SerializationError(format!("invalid pairing ack envelope json: {e}")))?;
+    let envelope: PairingAckEnvelopeV1 = serde_json::from_str(payload_json).map_err(|e| {
+        ZincError::SerializationError(format!("invalid pairing ack envelope json: {e}"))
+    })?;
     envelope.validate()?;
     envelope.envelope_id_hex()
 }
@@ -1055,9 +1059,12 @@ pub fn validate_pairing_ack_envelope_json(payload_json: &str) -> Result<String, 
 pub fn validate_signed_pairing_complete_receipt_json(
     payload_json: &str,
 ) -> Result<String, ZincError> {
-    let signed: SignedPairingCompleteReceiptV1 = serde_json::from_str(payload_json).map_err(
-        |e| ZincError::SerializationError(format!("invalid signed pairing complete receipt json: {e}")),
-    )?;
+    let signed: SignedPairingCompleteReceiptV1 =
+        serde_json::from_str(payload_json).map_err(|e| {
+            ZincError::SerializationError(format!(
+                "invalid signed pairing complete receipt json: {e}"
+            ))
+        })?;
     signed.verify()?;
     signed.receipt_id_hex()
 }
@@ -1078,7 +1085,10 @@ pub fn pairing_transport_tags(
     validate_pubkey_hex("recipient pubkey", recipient_pubkey_hex)?;
     let pairing_hash = pairing_tag_hash_hex(pairing_id)?;
     Ok(vec![
-        vec![NOSTR_TAG_APP_KEY.to_string(), NOSTR_SIGN_INTENT_APP_TAG_VALUE.to_string()],
+        vec![
+            NOSTR_TAG_APP_KEY.to_string(),
+            NOSTR_SIGN_INTENT_APP_TAG_VALUE.to_string(),
+        ],
         vec![NOSTR_TAG_TYPE_KEY.to_string(), type_tag.to_string()],
         vec![NOSTR_TAG_PAIRING_HASH_KEY.to_string(), pairing_hash],
         vec![
@@ -1088,15 +1098,65 @@ pub fn pairing_transport_tags(
     ])
 }
 
+pub fn encrypt_pairing_transport_content(
+    payload_json: &str,
+    sender_secret_key_hex: &str,
+    recipient_pubkey_hex: &str,
+) -> Result<String, ZincError> {
+    ensure_non_empty("pairing transport payload_json", payload_json)?;
+    validate_pubkey_hex(
+        "pairing transport recipient_pubkey_hex",
+        recipient_pubkey_hex,
+    )?;
+    let sender_secret_key = parse_nostr_secret_key_hex(sender_secret_key_hex)?;
+    let recipient_pubkey = parse_nostr_pubkey_hex(recipient_pubkey_hex)?;
+    nip44::encrypt(
+        &sender_secret_key,
+        &recipient_pubkey,
+        payload_json,
+        nip44::Version::V2,
+    )
+    .map_err(|e| ZincError::OfferError(format!("failed to encrypt pairing transport payload: {e}")))
+}
+
+pub fn decrypt_pairing_transport_content(
+    payload_ciphertext: &str,
+    recipient_secret_key_hex: &str,
+    sender_pubkey_hex: &str,
+) -> Result<String, ZincError> {
+    ensure_non_empty("pairing transport payload_ciphertext", payload_ciphertext)?;
+    validate_pubkey_hex("pairing transport sender_pubkey_hex", sender_pubkey_hex)?;
+    let recipient_secret_key = parse_nostr_secret_key_hex(recipient_secret_key_hex)?;
+    let sender_pubkey = parse_nostr_pubkey_hex(sender_pubkey_hex)?;
+    nip44::decrypt(&recipient_secret_key, &sender_pubkey, payload_ciphertext).map_err(|e| {
+        ZincError::OfferError(format!("failed to decrypt pairing transport payload: {e}"))
+    })
+}
+
 pub fn validate_nostr_transport_event_json(payload_json: &str) -> Result<String, ZincError> {
-    let event: NostrTransportEventV1 = serde_json::from_str(payload_json)
-        .map_err(|e| ZincError::SerializationError(format!("invalid nostr transport event json: {e}")))?;
+    let event: NostrTransportEventV1 = serde_json::from_str(payload_json).map_err(|e| {
+        ZincError::SerializationError(format!("invalid nostr transport event json: {e}"))
+    })?;
     event.verify()?;
     Ok(event.id)
 }
 
 pub fn decode_pairing_ack_envelope_event(
     event: &NostrTransportEventV1,
+) -> Result<PairingAckEnvelopeV1, ZincError> {
+    decode_pairing_ack_envelope_event_internal(event, None)
+}
+
+pub fn decode_pairing_ack_envelope_event_with_secret(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: &str,
+) -> Result<PairingAckEnvelopeV1, ZincError> {
+    decode_pairing_ack_envelope_event_internal(event, Some(recipient_secret_key_hex))
+}
+
+fn decode_pairing_ack_envelope_event_internal(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: Option<&str>,
 ) -> Result<PairingAckEnvelopeV1, ZincError> {
     event.verify()?;
     if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
@@ -1105,8 +1165,12 @@ pub fn decode_pairing_ack_envelope_event(
             event.kind, PAIRING_TRANSPORT_EVENT_KIND
         )));
     }
-    ensure_event_tags_match(event, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE)?;
-    let envelope: PairingAckEnvelopeV1 = serde_json::from_str(&event.content).map_err(|e| {
+    let payload_json = decode_pairing_transport_payload_json(
+        event,
+        NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+        recipient_secret_key_hex,
+    )?;
+    let envelope: PairingAckEnvelopeV1 = serde_json::from_str(&payload_json).map_err(|e| {
         ZincError::SerializationError(format!("invalid pairing ack envelope json: {e}"))
     })?;
     envelope.validate()?;
@@ -1117,6 +1181,20 @@ pub fn decode_pairing_ack_envelope_event(
 pub fn decode_signed_pairing_complete_receipt_event(
     event: &NostrTransportEventV1,
 ) -> Result<SignedPairingCompleteReceiptV1, ZincError> {
+    decode_signed_pairing_complete_receipt_event_internal(event, None)
+}
+
+pub fn decode_signed_pairing_complete_receipt_event_with_secret(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: &str,
+) -> Result<SignedPairingCompleteReceiptV1, ZincError> {
+    decode_signed_pairing_complete_receipt_event_internal(event, Some(recipient_secret_key_hex))
+}
+
+fn decode_signed_pairing_complete_receipt_event_internal(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: Option<&str>,
+) -> Result<SignedPairingCompleteReceiptV1, ZincError> {
     event.verify()?;
     if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
         return Err(ZincError::OfferError(format!(
@@ -1124,12 +1202,17 @@ pub fn decode_signed_pairing_complete_receipt_event(
             event.kind, PAIRING_TRANSPORT_EVENT_KIND
         )));
     }
-    ensure_event_tags_match(event, NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE)?;
-    let signed: SignedPairingCompleteReceiptV1 = serde_json::from_str(&event.content).map_err(
-        |e| ZincError::SerializationError(format!(
-            "invalid signed pairing complete receipt json: {e}"
-        )),
+    let payload_json = decode_pairing_transport_payload_json(
+        event,
+        NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE,
+        recipient_secret_key_hex,
     )?;
+    let signed: SignedPairingCompleteReceiptV1 =
+        serde_json::from_str(&payload_json).map_err(|e| {
+            ZincError::SerializationError(format!(
+                "invalid signed pairing complete receipt json: {e}"
+            ))
+        })?;
     signed.verify()?;
     ensure_event_pairing_hash_matches(event, &signed.receipt.pairing_id)?;
     Ok(signed)
@@ -1163,9 +1246,14 @@ pub fn pairing_tag_hash_hex(pairing_id: &str) -> Result<String, ZincError> {
     Ok(digest_hex(&digest))
 }
 
-fn ensure_event_tags_match(event: &NostrTransportEventV1, expected_type_tag: &str) -> Result<(), ZincError> {
+fn ensure_event_tags_match(
+    event: &NostrTransportEventV1,
+    expected_type_tag: &str,
+) -> Result<(), ZincError> {
     let app_tag = event.tag_value(NOSTR_TAG_APP_KEY).ok_or_else(|| {
-        ZincError::OfferError(format!("nostr transport event missing `{NOSTR_TAG_APP_KEY}` tag"))
+        ZincError::OfferError(format!(
+            "nostr transport event missing `{NOSTR_TAG_APP_KEY}` tag"
+        ))
     })?;
     if app_tag != NOSTR_SIGN_INTENT_APP_TAG_VALUE {
         return Err(ZincError::OfferError(format!(
@@ -1174,7 +1262,9 @@ fn ensure_event_tags_match(event: &NostrTransportEventV1, expected_type_tag: &st
     }
 
     let type_tag = event.tag_value(NOSTR_TAG_TYPE_KEY).ok_or_else(|| {
-        ZincError::OfferError(format!("nostr transport event missing `{NOSTR_TAG_TYPE_KEY}` tag"))
+        ZincError::OfferError(format!(
+            "nostr transport event missing `{NOSTR_TAG_TYPE_KEY}` tag"
+        ))
     })?;
     if type_tag != expected_type_tag {
         return Err(ZincError::OfferError(format!(
@@ -1182,13 +1272,11 @@ fn ensure_event_tags_match(event: &NostrTransportEventV1, expected_type_tag: &st
         )));
     }
 
-    let pairing_hash = event
-        .tag_value(NOSTR_TAG_PAIRING_HASH_KEY)
-        .ok_or_else(|| {
-            ZincError::OfferError(format!(
-                "nostr transport event missing `{NOSTR_TAG_PAIRING_HASH_KEY}` tag"
-            ))
-        })?;
+    let pairing_hash = event.tag_value(NOSTR_TAG_PAIRING_HASH_KEY).ok_or_else(|| {
+        ZincError::OfferError(format!(
+            "nostr transport event missing `{NOSTR_TAG_PAIRING_HASH_KEY}` tag"
+        ))
+    })?;
     validate_hex64("nostr transport pairing hash tag", pairing_hash)?;
     Ok(())
 }
@@ -1198,19 +1286,64 @@ fn ensure_event_pairing_hash_matches(
     pairing_id: &str,
 ) -> Result<(), ZincError> {
     let expected = pairing_tag_hash_hex(pairing_id)?;
-    let actual = event
-        .tag_value(NOSTR_TAG_PAIRING_HASH_KEY)
-        .ok_or_else(|| {
-            ZincError::OfferError(format!(
-                "nostr transport event missing `{NOSTR_TAG_PAIRING_HASH_KEY}` tag"
-            ))
-        })?;
+    let actual = event.tag_value(NOSTR_TAG_PAIRING_HASH_KEY).ok_or_else(|| {
+        ZincError::OfferError(format!(
+            "nostr transport event missing `{NOSTR_TAG_PAIRING_HASH_KEY}` tag"
+        ))
+    })?;
     if actual != expected {
         return Err(ZincError::OfferError(
             "nostr transport pairing hash tag does not match payload pairing id".to_string(),
         ));
     }
     Ok(())
+}
+
+fn decode_pairing_transport_payload_json(
+    event: &NostrTransportEventV1,
+    expected_type_tag: &str,
+    recipient_secret_key_hex: Option<&str>,
+) -> Result<String, ZincError> {
+    ensure_event_tags_match(event, expected_type_tag)?;
+    if let Some(secret_key_hex) = recipient_secret_key_hex {
+        ensure_event_recipient_tag_matches_secret(event, secret_key_hex)?;
+        if let Ok(decrypted) =
+            decrypt_pairing_transport_content(&event.content, secret_key_hex, &event.pubkey)
+        {
+            return Ok(decrypted);
+        }
+    }
+    Ok(event.content.clone())
+}
+
+fn ensure_event_recipient_tag_matches_secret(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: &str,
+) -> Result<(), ZincError> {
+    let recipient_pubkey_hex = pubkey_hex_from_secret_key(recipient_secret_key_hex)?;
+    let actual = event
+        .tag_value(NOSTR_TAG_RECIPIENT_PUBKEY_KEY)
+        .ok_or_else(|| {
+            ZincError::OfferError(format!(
+                "nostr transport event missing `{NOSTR_TAG_RECIPIENT_PUBKEY_KEY}` tag"
+            ))
+        })?;
+    if actual != recipient_pubkey_hex {
+        return Err(ZincError::OfferError(
+            "nostr transport recipient pubkey tag does not match recipient secret key".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_nostr_secret_key_hex(secret_key_hex: &str) -> Result<NostrSecretKey, ZincError> {
+    NostrSecretKey::from_str(secret_key_hex)
+        .map_err(|e| ZincError::OfferError(format!("invalid secret key: {e}")))
+}
+
+fn parse_nostr_pubkey_hex(pubkey_hex: &str) -> Result<NostrPublicKey, ZincError> {
+    NostrPublicKey::from_hex(pubkey_hex)
+        .map_err(|e| ZincError::OfferError(format!("invalid pubkey hex: {e}")))
 }
 
 fn compute_nostr_event_id_hex(
@@ -1228,7 +1361,10 @@ fn compute_nostr_event_id_hex(
     Ok(digest.to_string())
 }
 
-fn sign_nostr_event_id_hex(event_id_hex: &str, secret_key: &SecretKey) -> Result<String, ZincError> {
+fn sign_nostr_event_id_hex(
+    event_id_hex: &str,
+    secret_key: &SecretKey,
+) -> Result<String, ZincError> {
     let digest = hex_to_digest32(event_id_hex)?;
     let message = Message::from_digest(digest);
     let secp = Secp256k1::new();
