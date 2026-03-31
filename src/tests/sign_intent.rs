@@ -1,10 +1,11 @@
 use crate::sign_intent::{
-    build_signed_pairing_ack, pubkey_hex_from_secret_key, validate_signed_pairing_ack_json,
-    validate_signed_pairing_request_json, validate_signed_sign_intent_json,
-    validate_signed_sign_intent_receipt_json, verify_pairing_approval, BuildBuyerOfferIntentV1,
-    CapabilityPolicyV1, PairingAckDecisionV1, PairingAckV1, PairingRequestV1, SignIntentActionV1,
-    SignIntentPayloadV1, SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1,
-    SignedPairingAckV1, SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
+    build_signed_pairing_ack, build_signed_pairing_ack_with_granted, pubkey_hex_from_secret_key,
+    validate_signed_pairing_ack_json, validate_signed_pairing_request_json,
+    validate_signed_sign_intent_json, validate_signed_sign_intent_receipt_json,
+    verify_pairing_approval, BuildBuyerOfferIntentV1, CapabilityPolicyV1, PairingAckDecisionV1,
+    PairingAckV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
+    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignedPairingAckV1,
+    SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
 };
 
 fn agent_secret_hex() -> &'static str {
@@ -313,4 +314,58 @@ fn build_signed_pairing_ack_rejects_expired_request() {
     assert!(err
         .to_string()
         .contains("pairing request expired before ack creation"));
+}
+
+#[test]
+fn build_signed_pairing_ack_accepts_explicit_subset_grants() {
+    let request = sample_pairing_request();
+    let signed_request =
+        SignedPairingRequestV1::new(request, agent_secret_hex()).expect("signed request");
+
+    let granted = CapabilityPolicyV1 {
+        allowed_actions: vec![SignIntentActionV1::SignSellerInput],
+        max_sats_per_intent: Some(100_000),
+        daily_spend_limit_sats: Some(250_000),
+        max_fee_rate_sat_vb: Some(10),
+        allowed_networks: vec!["regtest".to_string()],
+    };
+
+    let signed_ack = build_signed_pairing_ack_with_granted(
+        &signed_request,
+        wallet_secret_hex(),
+        1_710_000_100,
+        600,
+        Some(granted.clone()),
+    )
+    .expect("build signed ack");
+
+    assert_eq!(signed_ack.ack.granted_capabilities, Some(granted));
+}
+
+#[test]
+fn build_signed_pairing_ack_rejects_explicit_capability_escalation() {
+    let request = sample_pairing_request();
+    let signed_request =
+        SignedPairingRequestV1::new(request, agent_secret_hex()).expect("signed request");
+
+    let escalation = CapabilityPolicyV1 {
+        allowed_actions: vec![SignIntentActionV1::BuildBuyerOffer],
+        max_sats_per_intent: Some(400_000),
+        daily_spend_limit_sats: Some(1_000_000),
+        max_fee_rate_sat_vb: Some(30),
+        allowed_networks: vec!["regtest".to_string()],
+    };
+
+    let err = build_signed_pairing_ack_with_granted(
+        &signed_request,
+        wallet_secret_hex(),
+        1_710_000_100,
+        600,
+        Some(escalation),
+    )
+    .expect_err("escalation must fail");
+
+    assert!(err
+        .to_string()
+        .contains("granted max_sats_per_intent=400000 exceeds requested limit 300000"));
 }

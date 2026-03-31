@@ -521,6 +521,22 @@ pub fn build_signed_pairing_ack(
     now_unix: i64,
     ack_ttl_secs: i64,
 ) -> Result<SignedPairingAckV1, ZincError> {
+    build_signed_pairing_ack_with_granted(
+        signed_request,
+        wallet_secret_key_hex,
+        now_unix,
+        ack_ttl_secs,
+        None,
+    )
+}
+
+pub fn build_signed_pairing_ack_with_granted(
+    signed_request: &SignedPairingRequestV1,
+    wallet_secret_key_hex: &str,
+    now_unix: i64,
+    ack_ttl_secs: i64,
+    granted_capabilities: Option<CapabilityPolicyV1>,
+) -> Result<SignedPairingAckV1, ZincError> {
     if ack_ttl_secs <= 0 {
         return Err(ZincError::OfferError(
             "pairing ack ttl must be greater than zero seconds".to_string(),
@@ -548,7 +564,8 @@ pub fn build_signed_pairing_ack(
 
     let pairing_id = signed_request.pairing_id_hex()?;
     let wallet_pubkey_hex = pubkey_hex_from_secret_key(wallet_secret_key_hex)?;
-    let granted_capabilities = request.requested_capabilities.clone();
+    let granted_capabilities =
+        granted_capabilities.unwrap_or_else(|| request.requested_capabilities.clone());
 
     let ack = PairingAckV1 {
         version: VERSION_V1,
