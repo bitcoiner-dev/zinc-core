@@ -1,11 +1,19 @@
 use crate::sign_intent::{
-    build_signed_pairing_ack, build_signed_pairing_ack_with_granted, pubkey_hex_from_secret_key,
+    build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
+    build_signed_pairing_complete_receipt, pairing_tag_hash_hex, pubkey_hex_from_secret_key,
+    validate_pairing_ack_envelope_json, validate_signed_pairing_complete_receipt_json,
+    validate_nostr_transport_event_json,
     validate_signed_pairing_ack_json, validate_signed_pairing_request_json,
     validate_signed_sign_intent_json, validate_signed_sign_intent_receipt_json,
-    verify_pairing_approval, BuildBuyerOfferIntentV1, CapabilityPolicyV1, PairingAckDecisionV1,
-    PairingAckV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
-    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignedPairingAckV1,
-    SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
+    verify_pairing_approval, BuildBuyerOfferIntentV1, CapabilityPolicyV1,
+    decode_pairing_ack_envelope_event, decode_signed_pairing_complete_receipt_event,
+    pairing_transport_tags, NostrTransportEventV1, PairingAckDecisionV1, PairingAckEnvelopeV1,
+    PairingAckV1, PairingRequestV1, PAIRING_TRANSPORT_EVENT_KIND,
+    PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1, SignIntentActionV1,
+    SignIntentPayloadV1, SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1,
+    SignedPairingAckV1, SignedPairingCompleteReceiptV1, SignedPairingRequestV1,
+    SignedSignIntentReceiptV1, SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+    NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
 };
 
 fn agent_secret_hex() -> &'static str {
@@ -368,4 +376,162 @@ fn build_signed_pairing_ack_rejects_explicit_capability_escalation() {
     assert!(err
         .to_string()
         .contains("granted max_sats_per_intent=400000 exceeds requested limit 300000"));
+}
+
+#[test]
+fn pairing_tag_hash_is_deterministic_hex64() {
+    let pairing_id = "a".repeat(64);
+    let first = pairing_tag_hash_hex(&pairing_id).expect("pairing tag hash first");
+    let second = pairing_tag_hash_hex(&pairing_id).expect("pairing tag hash second");
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 64);
+    assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+}
+
+#[test]
+fn pairing_ack_envelope_validates_embedded_ack_and_tags() {
+    let request = sample_pairing_request();
+    let signed_request =
+        SignedPairingRequestV1::new(request.clone(), agent_secret_hex()).expect("signed request");
+    let signed_ack =
+        build_signed_pairing_ack(&signed_request, wallet_secret_hex(), 1_710_000_100, 600)
+            .expect("signed ack");
+
+    let envelope = PairingAckEnvelopeV1::new(signed_ack, 1_710_000_101).expect("envelope");
+    assert_eq!(envelope.version, 1);
+    assert_eq!(envelope.app_tag, NOSTR_SIGN_INTENT_APP_TAG_VALUE);
+    assert_eq!(envelope.type_tag, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE);
+    assert_eq!(
+        envelope.pairing_tag_hash_hex,
+        pairing_tag_hash_hex(&request.pairing_id_hex().expect("pairing id"))
+            .expect("pairing tag hash")
+    );
+
+    let envelope_json = serde_json::to_string(&envelope).expect("envelope json");
+    let envelope_id = validate_pairing_ack_envelope_json(&envelope_json).expect("validate envelope");
+    assert_eq!(envelope_id.len(), 64);
+}
+
+#[test]
+fn pairing_ack_envelope_rejects_pairing_hash_mismatch() {
+    let request = sample_pairing_request();
+    let signed_request =
+        SignedPairingRequestV1::new(request, agent_secret_hex()).expect("signed request");
+    let signed_ack =
+        build_signed_pairing_ack(&signed_request, wallet_secret_hex(), 1_710_000_100, 600)
+            .expect("signed ack");
+    let mut envelope = PairingAckEnvelopeV1::new(signed_ack, 1_710_000_101).expect("envelope");
+    envelope.pairing_tag_hash_hex = "f".repeat(64);
+
+    let envelope_json = serde_json::to_string(&envelope).expect("envelope json");
+    let err = validate_pairing_ack_envelope_json(&envelope_json).expect_err("must fail");
+    assert!(err
+        .to_string()
+        .contains("pairing ack envelope pairing_tag_hash_hex does not match embedded pairing_id"));
+}
+
+#[test]
+fn signed_pairing_complete_receipt_roundtrip_and_builder() {
+    let request = sample_pairing_request();
+    let signed_request =
+        SignedPairingRequestV1::new(request.clone(), agent_secret_hex()).expect("signed request");
+    let signed_ack =
+        build_signed_pairing_ack(&signed_request, wallet_secret_hex(), 1_710_000_100, 600)
+            .expect("signed ack");
+
+    let signed_receipt = build_signed_pairing_complete_receipt(
+        &signed_request,
+        &signed_ack,
+        agent_secret_hex(),
+        1_710_000_120,
+    )
+    .expect("signed pairing complete receipt");
+    signed_receipt.verify().expect("verify signed receipt");
+    assert_eq!(
+        signed_receipt.receipt.status,
+        PairingCompleteReceiptStatusV1::Confirmed
+    );
+
+    let receipt_json = serde_json::to_string(&signed_receipt).expect("receipt json");
+    let receipt_id =
+        validate_signed_pairing_complete_receipt_json(&receipt_json).expect("validate receipt");
+    assert_eq!(receipt_id.len(), 64);
+
+    let rejected_receipt = PairingCompleteReceiptV1 {
+        version: 1,
+        pairing_id: signed_request.pairing_id_hex().expect("pairing id"),
+        ack_id: signed_ack.ack_id_hex().expect("ack id"),
+        challenge_nonce: request.challenge_nonce,
+        agent_pubkey_hex: request.agent_pubkey_hex,
+        wallet_pubkey_hex: pubkey_hex_from_secret_key(wallet_secret_hex()).expect("wallet pubkey"),
+        created_at_unix: 1_710_000_121,
+        status: PairingCompleteReceiptStatusV1::Rejected,
+        error_message: Some("operator cancelled".to_string()),
+    };
+    let signed_rejected =
+        SignedPairingCompleteReceiptV1::new(rejected_receipt, agent_secret_hex())
+            .expect("signed rejected receipt");
+    signed_rejected.verify().expect("verify rejected receipt");
+}
+
+#[test]
+fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
+    let request = sample_pairing_request();
+    let signed_request =
+        SignedPairingRequestV1::new(request.clone(), agent_secret_hex()).expect("signed request");
+    let signed_ack =
+        build_signed_pairing_ack(&signed_request, wallet_secret_hex(), 1_710_000_100, 600)
+            .expect("signed ack");
+    let envelope = PairingAckEnvelopeV1::new(signed_ack.clone(), 1_710_000_101).expect("envelope");
+    let envelope_json = serde_json::to_string(&envelope).expect("envelope json");
+    let ack_tags = pairing_transport_tags(
+        NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+        &signed_ack.ack.pairing_id,
+        &signed_ack.ack.agent_pubkey_hex,
+    )
+    .expect("ack tags");
+    let ack_event = NostrTransportEventV1::new(
+        PAIRING_TRANSPORT_EVENT_KIND,
+        ack_tags,
+        envelope_json,
+        1_710_000_110,
+        wallet_secret_hex(),
+    )
+    .expect("ack event");
+    let ack_event_json = serde_json::to_string(&ack_event).expect("ack event json");
+    assert!(validate_nostr_transport_event_json(&ack_event_json).is_ok());
+    let decoded_envelope = decode_pairing_ack_envelope_event(&ack_event).expect("decode ack envelope");
+    assert_eq!(
+        decoded_envelope.signed_ack.ack.pairing_id,
+        signed_request.pairing_id_hex().expect("pairing id")
+    );
+
+    let signed_complete = build_signed_pairing_complete_receipt(
+        &signed_request,
+        &signed_ack,
+        agent_secret_hex(),
+        1_710_000_120,
+    )
+    .expect("signed complete");
+    let complete_json = serde_json::to_string(&signed_complete).expect("complete json");
+    let complete_tags = pairing_transport_tags(
+        NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE,
+        &signed_complete.receipt.pairing_id,
+        &signed_complete.receipt.wallet_pubkey_hex,
+    )
+    .expect("complete tags");
+    let complete_event = NostrTransportEventV1::new(
+        PAIRING_TRANSPORT_EVENT_KIND,
+        complete_tags,
+        complete_json,
+        1_710_000_121,
+        agent_secret_hex(),
+    )
+    .expect("complete event");
+    let decoded_complete =
+        decode_signed_pairing_complete_receipt_event(&complete_event).expect("decode complete");
+    assert_eq!(
+        decoded_complete.receipt.status,
+        PairingCompleteReceiptStatusV1::Confirmed
+    );
 }
