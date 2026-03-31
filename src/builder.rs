@@ -969,25 +969,31 @@ impl ZincWallet {
 
         // ENRICHMENT STEP: Fill in missing witness_utxo from our own wallet if possible
         // This solves "Plain PSBT" issues where dApps don't include UTXO info
-        use std::collections::HashMap;
-        let mut known_utxos = HashMap::new();
+        let has_missing_utxos = psbt.inputs.iter().any(|input| {
+            input.witness_utxo.is_none() && input.non_witness_utxo.is_none()
+        });
 
-        let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-            for utxo in w.list_unspent() {
-                map.insert(utxo.outpoint, utxo.txout);
+        if has_missing_utxos {
+            use std::collections::HashMap;
+            let mut known_utxos = HashMap::new();
+
+            let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
+                for utxo in w.list_unspent() {
+                    map.insert(utxo.outpoint, utxo.txout);
+                }
+            };
+
+            collect_utxos(&self.vault_wallet, &mut known_utxos);
+            if let Some(w) = &self.payment_wallet {
+                collect_utxos(w, &mut known_utxos);
             }
-        };
 
-        collect_utxos(&self.vault_wallet, &mut known_utxos);
-        if let Some(w) = &self.payment_wallet {
-            collect_utxos(w, &mut known_utxos);
-        }
-
-        for (i, input) in psbt.inputs.iter_mut().enumerate() {
-            if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
-                let outpoint = psbt.unsigned_tx.input[i].previous_output;
-                if let Some(txout) = known_utxos.get(&outpoint) {
-                    input.witness_utxo = Some(txout.clone());
+            for (i, input) in psbt.inputs.iter_mut().enumerate() {
+                if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
+                    let outpoint = psbt.unsigned_tx.input[i].previous_output;
+                    if let Some(txout) = known_utxos.get(&outpoint) {
+                        input.witness_utxo = Some(txout.clone());
+                    }
                 }
             }
         }
@@ -1062,8 +1068,8 @@ impl ZincWallet {
 
         // Ordinal Shield Audit: BEFORE signing!
         // We must build the known_inscriptions map to check for BURNS (sophisticated check)
-        let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+        let mut known_inscriptions: std::collections::HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
+            std::collections::HashMap::new();
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -1188,36 +1194,42 @@ impl ZincWallet {
 
         // ENRICHMENT STEP: Fill in missing witness_utxo from our own wallet if possible
         // This solves "Plain PSBT" issues where dApps don't include UTXO info
-        let mut known_utxos = HashMap::new();
+        let has_missing_utxos = psbt.inputs.iter().any(|input| {
+            input.witness_utxo.is_none() && input.non_witness_utxo.is_none()
+        });
 
-        let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-            for utxo in w.list_unspent() {
-                map.insert(utxo.outpoint, utxo.txout);
+        if has_missing_utxos {
+            let mut known_utxos = HashMap::new();
+
+            let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
+                for utxo in w.list_unspent() {
+                    map.insert(utxo.outpoint, utxo.txout);
+                }
+            };
+
+            collect_utxos(&self.vault_wallet, &mut known_utxos);
+            if let Some(w) = &self.payment_wallet {
+                collect_utxos(w, &mut known_utxos);
             }
-        };
 
-        collect_utxos(&self.vault_wallet, &mut known_utxos);
-        if let Some(w) = &self.payment_wallet {
-            collect_utxos(w, &mut known_utxos);
-        }
-
-        let mut enriched_count = 0;
-        for (i, input) in psbt.inputs.iter_mut().enumerate() {
-            if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
-                let outpoint = psbt.unsigned_tx.input[i].previous_output;
-                if let Some(txout) = known_utxos.get(&outpoint) {
-                    input.witness_utxo = Some(txout.clone());
-                    enriched_count += 1;
+            let mut enriched_count = 0;
+            for (i, input) in psbt.inputs.iter_mut().enumerate() {
+                if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
+                    let outpoint = psbt.unsigned_tx.input[i].previous_output;
+                    if let Some(txout) = known_utxos.get(&outpoint) {
+                        input.witness_utxo = Some(txout.clone());
+                        enriched_count += 1;
+                    }
                 }
             }
-        }
 
-        if enriched_count > 0 {}
+            if enriched_count > 0 {}
+        }
 
         // Build Known Inscriptions Map from internal state
         // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
-        let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+        let mut known_inscriptions: std::collections::HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
+            std::collections::HashMap::new();
 
         // We also need a way to map offsets back to Inscription IDs for the result?
         // The `analyze_psbt` function currently generates keys like "Inscription {N}".
