@@ -49,6 +49,8 @@ pub mod offer_nostr;
 pub mod offer_relay;
 /// Ordinals data models, HTTP client, and protection analysis.
 pub mod ordinals;
+/// Signed pairing + sign-intent protocol primitives.
+pub mod sign_intent;
 
 // Re-exports for convenience
 pub use builder::{
@@ -67,6 +69,13 @@ pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
 pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
+pub use sign_intent::{
+    build_signed_pairing_ack, pubkey_hex_from_secret_key, verify_pairing_approval,
+    BuildBuyerOfferIntentV1, CapabilityPolicyV1, PairingAckDecisionV1, PairingAckV1,
+    PairingLinkApprovalV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
+    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1,
+    SignedPairingAckV1, SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
+};
 
 // Re-export bitcoin types we use
 pub use bdk_wallet::bitcoin::Network;
@@ -335,6 +344,89 @@ pub fn decrypt_wallet(encrypted_json: &str, password: &str) -> Result<JsValue, J
             Err(JsValue::from_str(&e.to_string()))
         }
     }
+}
+
+/// Validate and verify a signed pairing request payload.
+///
+/// Returns a compact JSON string:
+/// `{ "ok": true, "pairingId": "<hex>" }`
+#[wasm_bindgen]
+pub fn validate_signed_pairing_request_json(payload_json: &str) -> Result<String, JsValue> {
+    let pairing_id = crate::sign_intent::validate_signed_pairing_request_json(payload_json)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "pairingId": pairing_id
+    })
+    .to_string())
+}
+
+/// Validate and verify a signed pairing ack payload.
+///
+/// Returns:
+/// `{ "ok": true, "ackId": "<hex>" }`
+#[wasm_bindgen]
+pub fn validate_signed_pairing_ack_json(payload_json: &str) -> Result<String, JsValue> {
+    let ack_id = crate::sign_intent::validate_signed_pairing_ack_json(payload_json)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "ackId": ack_id
+    })
+    .to_string())
+}
+
+/// Validate and verify a signed sign-intent payload.
+///
+/// Returns:
+/// `{ "ok": true, "intentId": "<hex>" }`
+#[wasm_bindgen]
+pub fn validate_signed_sign_intent_json(payload_json: &str) -> Result<String, JsValue> {
+    let intent_id = crate::sign_intent::validate_signed_sign_intent_json(payload_json)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "intentId": intent_id
+    })
+    .to_string())
+}
+
+/// Validate and verify a signed sign-intent receipt payload.
+///
+/// Returns:
+/// `{ "ok": true, "receiptId": "<hex>" }`
+#[wasm_bindgen]
+pub fn validate_signed_sign_intent_receipt_json(payload_json: &str) -> Result<String, JsValue> {
+    let receipt_id = crate::sign_intent::validate_signed_sign_intent_receipt_json(payload_json)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "receiptId": receipt_id
+    })
+    .to_string())
+}
+
+/// Verify a signed pairing request + signed pairing ack bundle at a given unix timestamp.
+///
+/// Returns:
+/// `{ "ok": true, "approval": { ...PairingLinkApprovalV1 } }`
+#[wasm_bindgen]
+pub fn verify_pairing_approval_json(
+    signed_request_json: &str,
+    signed_ack_json: &str,
+    now_unix: i64,
+) -> Result<String, JsValue> {
+    let approval = crate::sign_intent::verify_pairing_approval_json(
+        signed_request_json,
+        signed_ack_json,
+        now_unix,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "approval": approval
+    })
+    .to_string())
 }
 
 // ============================================================================
@@ -1590,6 +1682,45 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&e)),
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (sign_message): {}",
+                e
+            ))),
+        }
+    }
+
+    /// Build a signed pairing-ack JSON payload for a validated signed pairing request.
+    ///
+    /// Uses the active account's first taproot key (`m/86'/coin'/account'/0/0`) as signer.
+    #[wasm_bindgen(js_name = build_signed_pairing_ack)]
+    pub fn build_signed_pairing_ack(
+        &self,
+        signed_request_json: &str,
+        now_unix: i64,
+        ack_ttl_secs: u32,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let wallet_secret_key_hex = inner
+                    .get_pairing_secret_key_hex()
+                    .map_err(|e| JsValue::from_str(&e))?;
+                let signed_request: crate::sign_intent::SignedPairingRequestV1 =
+                    serde_json::from_str(signed_request_json).map_err(|e| {
+                        JsValue::from_str(&format!("invalid signed pairing request json: {e}"))
+                    })?;
+
+                let signed_ack = crate::sign_intent::build_signed_pairing_ack(
+                    &signed_request,
+                    &wallet_secret_key_hex,
+                    now_unix,
+                    i64::from(ack_ttl_secs),
+                )
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+                serde_json::to_string(&signed_ack)
+                    .map_err(|e| JsValue::from_str(&format!("failed to serialize signed ack: {e}")))
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (build_signed_pairing_ack): {}",
                 e
             ))),
         }

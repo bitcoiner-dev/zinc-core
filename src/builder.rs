@@ -1329,30 +1329,9 @@ impl ZincWallet {
 
         // 2. Derive Key
         let secp = Secp256k1::new();
-        let coin_type = if self.vault_wallet.network() == Network::Bitcoin {
-            0
-        } else {
-            1
-        };
-        let account = self.account_index;
-
         // Derivation path components
         let (purpose, chain) = if is_vault { (86, 0) } else { (84, 0) };
-
-        let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
-        ];
-
-        let child_xprv = self
-            .master_xprv
-            .derive_priv(&secp, &derivation_path)
-            .map_err(|e| format!("Key derivation failed: {e}"))?;
-
-        let priv_key = child_xprv.private_key;
+        let priv_key = self.derive_private_key(purpose, chain, index)?;
 
         // 3. Sign Message
         let signature_hash = bitcoin::sign_message::signed_msg_hash(message);
@@ -1369,6 +1348,14 @@ impl ZincWallet {
         sig_bytes.extend_from_slice(&sig_bytes_compact);
 
         Ok(base64::engine::general_purpose::STANDARD.encode(&sig_bytes))
+    }
+
+    /// Derive the pairing signer secret key hex for this account.
+    ///
+    /// Uses the first taproot external key path: `m/86'/coin'/account'/0/0`.
+    pub fn get_pairing_secret_key_hex(&self) -> Result<String, String> {
+        let key = self.derive_private_key(86, 0, 0)?;
+        Ok(bytes_to_lower_hex(&key.secret_bytes()))
     }
     /// Derive the taproot public key for this account at `index`.
     pub fn get_taproot_public_key(&self, index: u32) -> Result<String, String> {
@@ -1390,6 +1377,46 @@ impl ZincWallet {
 
     fn derive_public_key(&self, purpose: u32, index: u32) -> Result<String, String> {
         self.derive_public_key_internal(purpose, self.account_index, index)
+    }
+
+    fn derive_private_key(
+        &self,
+        purpose: u32,
+        chain: u32,
+        index: u32,
+    ) -> Result<bitcoin::secp256k1::SecretKey, String> {
+        self.derive_private_key_internal(purpose, self.account_index, chain, index)
+    }
+
+    fn derive_private_key_internal(
+        &self,
+        purpose: u32,
+        account: u32,
+        chain: u32,
+        index: u32,
+    ) -> Result<bitcoin::secp256k1::SecretKey, String> {
+        use bitcoin::secp256k1::Secp256k1;
+        let secp = Secp256k1::new();
+        let coin_type = if self.vault_wallet.network() == Network::Bitcoin {
+            0
+        } else {
+            1
+        };
+
+        let derivation_path = [
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
+            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+        ];
+
+        let child_xprv = self
+            .master_xprv
+            .derive_priv(&secp, &derivation_path)
+            .map_err(|e| format!("Key derivation failed: {e}"))?;
+
+        Ok(child_xprv.private_key)
     }
 
     /// Sign inscription reveal script-path inputs that BDK's standard signer missed.
@@ -1940,28 +1967,8 @@ impl ZincWallet {
     ) -> Result<String, String> {
         use bitcoin::secp256k1::Secp256k1;
         let secp = Secp256k1::new();
-
-        let coin_type = if self.vault_wallet.network() == Network::Bitcoin {
-            0
-        } else {
-            1
-        };
-        let chain = 0;
-
-        let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
-        ];
-
-        let child_xprv = self
-            .master_xprv
-            .derive_priv(&secp, &derivation_path)
-            .map_err(|e| format!("Key derivation failed: {e}"))?;
-
-        let public_key = child_xprv.private_key.public_key(&secp);
+        let secret_key = self.derive_private_key_internal(purpose, account, 0, index)?;
+        let public_key = secret_key.public_key(&secp);
 
         // Check purpose to decide format
         if purpose == 86 {
@@ -1973,6 +1980,16 @@ impl ZincWallet {
             Ok(public_key.to_string())
         }
     }
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 /// Serializable persistence snapshot for taproot/payment wallet changesets.
