@@ -71,20 +71,24 @@ pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
 pub use sign_intent::{
     build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
-    build_signed_pairing_complete_receipt, decode_pairing_ack_envelope_event,
-    decode_pairing_ack_envelope_event_with_secret, decode_signed_pairing_complete_receipt_event,
-    decode_signed_pairing_complete_receipt_event_with_secret, decrypt_pairing_transport_content,
-    encrypt_pairing_transport_content, pairing_tag_hash_hex, pairing_transport_tags,
-    pubkey_hex_from_secret_key, verify_pairing_approval, BuildBuyerOfferIntentV1,
-    CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1, PairingAckEnvelopeV1,
-    PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1, PairingLinkApprovalV1,
-    PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1, SignIntentReceiptStatusV1,
-    SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1, SignedPairingAckV1,
-    SignedPairingCompleteReceiptV1, SignedPairingRequestV1, SignedSignIntentReceiptV1,
-    SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+    build_signed_pairing_complete_receipt, build_signed_sign_intent_rejection_receipt,
+    decode_pairing_ack_envelope_event, decode_pairing_ack_envelope_event_with_secret,
+    decode_signed_pairing_complete_receipt_event,
+    decode_signed_pairing_complete_receipt_event_with_secret, decode_signed_sign_intent_event,
+    decode_signed_sign_intent_event_with_secret, decode_signed_sign_intent_receipt_event,
+    decode_signed_sign_intent_receipt_event_with_secret, decrypt_pairing_transport_content,
+    encrypt_pairing_transport_content, generate_secret_key_hex, pairing_tag_hash_hex,
+    pairing_transport_tags, pubkey_hex_from_secret_key, verify_pairing_approval,
+    BuildBuyerOfferIntentV1, CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1,
+    PairingAckEnvelopeV1, PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1,
+    PairingLinkApprovalV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
+    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1,
+    SignedPairingAckV1, SignedPairingCompleteReceiptV1, SignedPairingRequestV1,
+    SignedSignIntentReceiptV1, SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
     NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
-    NOSTR_TAG_APP_KEY, NOSTR_TAG_PAIRING_HASH_KEY, NOSTR_TAG_RECIPIENT_PUBKEY_KEY,
-    NOSTR_TAG_TYPE_KEY, PAIRING_TRANSPORT_EVENT_KIND,
+    NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_TYPE_TAG_VALUE, NOSTR_TAG_APP_KEY,
+    NOSTR_TAG_PAIRING_HASH_KEY, NOSTR_TAG_RECIPIENT_PUBKEY_KEY, NOSTR_TAG_TYPE_KEY,
+    PAIRING_TRANSPORT_EVENT_KIND,
 };
 
 // Re-export bitcoin types we use
@@ -166,6 +170,23 @@ pub fn decrypt_wallet_internal(
         phrase: mnemonic.phrase(),
         words: mnemonic.words(),
     })
+}
+
+#[doc(hidden)]
+/// Encrypt arbitrary UTF-8 secret material with a password and return serialized JSON payload.
+pub fn encrypt_secret_internal(secret: &str, password: &str) -> Result<String, ZincError> {
+    let encrypted = crypto::encrypt_seed(secret.as_bytes(), password)?;
+    serde_json::to_string(&encrypted).map_err(|e| ZincError::SerializationError(e.to_string()))
+}
+
+#[doc(hidden)]
+/// Decrypt an encrypted secret JSON payload and recover UTF-8 plaintext.
+pub fn decrypt_secret_internal(encrypted_json: &str, password: &str) -> Result<String, ZincError> {
+    let encrypted: crypto::EncryptedWallet = serde_json::from_str(encrypted_json)
+        .map_err(|e| ZincError::SerializationError(e.to_string()))?;
+    let plaintext = crypto::decrypt_seed(&encrypted, password)?;
+    String::from_utf8(plaintext.to_vec())
+        .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {}", e)))
 }
 
 // ============================================================================
@@ -1812,6 +1833,44 @@ impl ZincWasmWallet {
             }
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (get_pairing_pubkey_hex): {}",
+                e
+            ))),
+        }
+    }
+
+    /// Build and sign a rejected sign-intent receipt using the account pairing key.
+    #[wasm_bindgen(js_name = build_signed_sign_intent_rejection_receipt_json)]
+    pub fn build_signed_sign_intent_rejection_receipt_json(
+        &self,
+        signed_intent_json: &str,
+        created_at_unix: i64,
+        rejection_reason: &str,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let signed_intent: crate::sign_intent::SignedSignIntentV1 =
+            serde_json::from_str(signed_intent_json)
+                .map_err(|e| JsValue::from_str(&format!("invalid signed sign intent json: {e}")))?;
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let secret_hex = inner
+                    .get_pairing_secret_key_hex()
+                    .map_err(|e| JsValue::from_str(&e))?;
+                let signed_receipt =
+                    crate::sign_intent::build_signed_sign_intent_rejection_receipt(
+                        &signed_intent,
+                        &secret_hex,
+                        created_at_unix,
+                        rejection_reason,
+                    )
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                serde_json::to_string(&signed_receipt).map_err(|e| {
+                    JsValue::from_str(&format!(
+                        "failed to serialize signed sign intent receipt: {e}"
+                    ))
+                })
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (build_signed_sign_intent_rejection_receipt_json): {}",
                 e
             ))),
         }

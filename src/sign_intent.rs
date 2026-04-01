@@ -10,6 +10,7 @@ use crate::ZincError;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
 use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
 use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
+use getrandom::getrandom;
 use nostr::nips::nip44;
 use nostr::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,8 @@ const DOMAIN_SIGN_INTENT_RECEIPT: &str = "zinc-sign-intent-receipt-v1";
 pub const NOSTR_SIGN_INTENT_APP_TAG_VALUE: &str = "zinc-sign-intent-v1";
 pub const NOSTR_PAIRING_ACK_TYPE_TAG_VALUE: &str = "pairing-ack-v1";
 pub const NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE: &str = "pairing-complete-receipt-v1";
+pub const NOSTR_SIGN_INTENT_TYPE_TAG_VALUE: &str = "sign-intent-v1";
+pub const NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE: &str = "sign-intent-receipt-v1";
 pub const PAIRING_TRANSPORT_EVENT_KIND: u64 = 31_978;
 pub const NOSTR_TAG_APP_KEY: &str = "z";
 pub const NOSTR_TAG_TYPE_KEY: &str = "t";
@@ -943,6 +946,31 @@ impl SignedSignIntentReceiptV1 {
     }
 }
 
+pub fn build_signed_sign_intent_rejection_receipt(
+    signed_intent: &SignedSignIntentV1,
+    wallet_secret_key_hex: &str,
+    now_unix: i64,
+    rejection_reason: &str,
+) -> Result<SignedSignIntentReceiptV1, ZincError> {
+    signed_intent.verify()?;
+    ensure_non_empty("sign intent rejection reason", rejection_reason)?;
+    let signer_pubkey_hex = pubkey_hex_from_secret_key(wallet_secret_key_hex)?;
+    let receipt = SignIntentReceiptV1 {
+        version: VERSION_V1,
+        intent_id: signed_intent.intent_id_hex()?,
+        pairing_id: signed_intent.intent.pairing_id.clone(),
+        signer_pubkey_hex,
+        created_at_unix: now_unix,
+        status: SignIntentReceiptStatusV1::Rejected,
+        signed_psbt_base64: None,
+        artifact_json: None,
+        error_message: Some(rejection_reason.to_string()),
+    };
+    let signed_receipt = SignedSignIntentReceiptV1::new(receipt, wallet_secret_key_hex)?;
+    signed_receipt.verify()?;
+    Ok(signed_receipt)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingLinkApprovalV1 {
@@ -1076,6 +1104,8 @@ pub fn pairing_transport_tags(
 ) -> Result<Vec<Vec<String>>, ZincError> {
     if type_tag != NOSTR_PAIRING_ACK_TYPE_TAG_VALUE
         && type_tag != NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE
+        && type_tag != NOSTR_SIGN_INTENT_TYPE_TAG_VALUE
+        && type_tag != NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE
     {
         return Err(ZincError::OfferError(format!(
             "unsupported pairing transport type tag `{type_tag}`"
@@ -1218,6 +1248,80 @@ fn decode_signed_pairing_complete_receipt_event_internal(
     Ok(signed)
 }
 
+pub fn decode_signed_sign_intent_event(
+    event: &NostrTransportEventV1,
+) -> Result<SignedSignIntentV1, ZincError> {
+    decode_signed_sign_intent_event_internal(event, None)
+}
+
+pub fn decode_signed_sign_intent_event_with_secret(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: &str,
+) -> Result<SignedSignIntentV1, ZincError> {
+    decode_signed_sign_intent_event_internal(event, Some(recipient_secret_key_hex))
+}
+
+fn decode_signed_sign_intent_event_internal(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: Option<&str>,
+) -> Result<SignedSignIntentV1, ZincError> {
+    event.verify()?;
+    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
+        return Err(ZincError::OfferError(format!(
+            "unexpected nostr event kind {}, expected {}",
+            event.kind, PAIRING_TRANSPORT_EVENT_KIND
+        )));
+    }
+    let payload_json = decode_pairing_transport_payload_json(
+        event,
+        NOSTR_SIGN_INTENT_TYPE_TAG_VALUE,
+        recipient_secret_key_hex,
+    )?;
+    let signed: SignedSignIntentV1 = serde_json::from_str(&payload_json).map_err(|e| {
+        ZincError::SerializationError(format!("invalid signed sign intent json: {e}"))
+    })?;
+    signed.verify()?;
+    ensure_event_pairing_hash_matches(event, &signed.intent.pairing_id)?;
+    Ok(signed)
+}
+
+pub fn decode_signed_sign_intent_receipt_event(
+    event: &NostrTransportEventV1,
+) -> Result<SignedSignIntentReceiptV1, ZincError> {
+    decode_signed_sign_intent_receipt_event_internal(event, None)
+}
+
+pub fn decode_signed_sign_intent_receipt_event_with_secret(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: &str,
+) -> Result<SignedSignIntentReceiptV1, ZincError> {
+    decode_signed_sign_intent_receipt_event_internal(event, Some(recipient_secret_key_hex))
+}
+
+fn decode_signed_sign_intent_receipt_event_internal(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: Option<&str>,
+) -> Result<SignedSignIntentReceiptV1, ZincError> {
+    event.verify()?;
+    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
+        return Err(ZincError::OfferError(format!(
+            "unexpected nostr event kind {}, expected {}",
+            event.kind, PAIRING_TRANSPORT_EVENT_KIND
+        )));
+    }
+    let payload_json = decode_pairing_transport_payload_json(
+        event,
+        NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE,
+        recipient_secret_key_hex,
+    )?;
+    let signed: SignedSignIntentReceiptV1 = serde_json::from_str(&payload_json).map_err(|e| {
+        ZincError::SerializationError(format!("invalid signed sign intent receipt json: {e}"))
+    })?;
+    signed.verify()?;
+    ensure_event_pairing_hash_matches(event, &signed.receipt.pairing_id)?;
+    Ok(signed)
+}
+
 pub fn validate_signed_sign_intent_json(payload_json: &str) -> Result<String, ZincError> {
     let signed: SignedSignIntentV1 = serde_json::from_str(payload_json).map_err(|e| {
         ZincError::SerializationError(format!("invalid signed sign intent json: {e}"))
@@ -1238,6 +1342,17 @@ pub fn pubkey_hex_from_secret_key(secret_key_hex: &str) -> Result<String, ZincEr
     let secret_key = SecretKey::from_str(secret_key_hex)
         .map_err(|e| ZincError::OfferError(format!("invalid secret key: {e}")))?;
     Ok(pubkey_hex_from_secret(&secret_key))
+}
+
+pub fn generate_secret_key_hex() -> Result<String, ZincError> {
+    let mut candidate = [0u8; 32];
+    loop {
+        getrandom(&mut candidate)
+            .map_err(|e| ZincError::OfferError(format!("failed to generate secret key: {e}")))?;
+        if let Ok(secret_key) = SecretKey::from_slice(&candidate) {
+            return Ok(bytes_to_hex_lower(&secret_key.secret_bytes()));
+        }
+    }
 }
 
 pub fn pairing_tag_hash_hex(pairing_id: &str) -> Result<String, ZincError> {
@@ -1279,6 +1394,23 @@ fn ensure_event_tags_match(
     })?;
     validate_hex64("nostr transport pairing hash tag", pairing_hash)?;
     Ok(())
+}
+
+fn bytes_to_hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(nibble_to_hex(byte >> 4));
+        out.push(nibble_to_hex(byte & 0x0f));
+    }
+    out
+}
+
+fn nibble_to_hex(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => '0',
+    }
 }
 
 fn ensure_event_pairing_hash_matches(

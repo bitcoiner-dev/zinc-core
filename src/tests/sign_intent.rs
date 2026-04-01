@@ -1,10 +1,13 @@
 use crate::sign_intent::{
     build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
-    build_signed_pairing_complete_receipt, decode_pairing_ack_envelope_event,
-    decode_pairing_ack_envelope_event_with_secret, decode_signed_pairing_complete_receipt_event,
-    decode_signed_pairing_complete_receipt_event_with_secret, decrypt_pairing_transport_content,
-    encrypt_pairing_transport_content, pairing_tag_hash_hex, pairing_transport_tags,
-    pubkey_hex_from_secret_key, validate_nostr_transport_event_json,
+    build_signed_pairing_complete_receipt, build_signed_sign_intent_rejection_receipt,
+    decode_pairing_ack_envelope_event, decode_pairing_ack_envelope_event_with_secret,
+    decode_signed_pairing_complete_receipt_event,
+    decode_signed_pairing_complete_receipt_event_with_secret, decode_signed_sign_intent_event,
+    decode_signed_sign_intent_event_with_secret, decode_signed_sign_intent_receipt_event,
+    decode_signed_sign_intent_receipt_event_with_secret, decrypt_pairing_transport_content,
+    encrypt_pairing_transport_content, generate_secret_key_hex, pairing_tag_hash_hex,
+    pairing_transport_tags, pubkey_hex_from_secret_key, validate_nostr_transport_event_json,
     validate_pairing_ack_envelope_json, validate_signed_pairing_ack_json,
     validate_signed_pairing_complete_receipt_json, validate_signed_pairing_request_json,
     validate_signed_sign_intent_json, validate_signed_sign_intent_receipt_json,
@@ -15,8 +18,10 @@ use crate::sign_intent::{
     SignedPairingCompleteReceiptV1, SignedPairingRequestV1, SignedSignIntentReceiptV1,
     SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
     NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
+    NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_TYPE_TAG_VALUE,
     PAIRING_TRANSPORT_EVENT_KIND,
 };
+use crate::{decrypt_secret_internal, encrypt_secret_internal};
 
 fn agent_secret_hex() -> &'static str {
     "0001020304050607080900010203040506070809000102030405060708090001"
@@ -163,6 +168,71 @@ fn signed_sign_intent_and_receipt_roundtrip() {
     let signed_receipt =
         SignedSignIntentReceiptV1::new(receipt, wallet_secret_hex()).expect("signed receipt");
     signed_receipt.verify().expect("verify signed receipt");
+}
+
+#[test]
+fn build_signed_sign_intent_rejection_receipt_sets_expected_fields() {
+    let request = sample_pairing_request();
+    let pairing_id = request.pairing_id_hex().expect("pairing id");
+    let wallet_pubkey_hex = pubkey_hex_from_secret_key(wallet_secret_hex()).expect("wallet pubkey");
+    let intent = SignIntentV1 {
+        version: 1,
+        pairing_id,
+        agent_pubkey_hex: request.agent_pubkey_hex.clone(),
+        wallet_pubkey_hex,
+        network: "regtest".to_string(),
+        created_at_unix: 1_710_000_020,
+        expires_at_unix: 1_710_000_920,
+        nonce: 9,
+        payload: SignIntentPayloadV1::BuildBuyerOffer(BuildBuyerOfferIntentV1 {
+            inscription_id: "inscription-123".to_string(),
+            seller_outpoint: "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0"
+                .to_string(),
+            ask_sats: 100_000,
+            fee_rate_sat_vb: 3,
+        }),
+    };
+    let signed_intent = SignedSignIntentV1::new(intent, agent_secret_hex()).expect("signed intent");
+    let signed_receipt = build_signed_sign_intent_rejection_receipt(
+        &signed_intent,
+        wallet_secret_hex(),
+        1_710_000_030,
+        "user rejected intent",
+    )
+    .expect("signed rejected receipt");
+
+    signed_receipt.verify().expect("verify rejected receipt");
+    assert_eq!(
+        signed_receipt.receipt.status,
+        SignIntentReceiptStatusV1::Rejected
+    );
+    assert_eq!(
+        signed_receipt.receipt.error_message.as_deref(),
+        Some("user rejected intent")
+    );
+    assert_eq!(
+        signed_receipt.receipt.intent_id,
+        signed_intent.intent_id_hex().expect("intent id")
+    );
+}
+
+#[test]
+fn generate_secret_key_hex_returns_valid_32_byte_hex() {
+    let generated = generate_secret_key_hex().expect("generate secret key hex");
+    assert_eq!(generated.len(), 64);
+    assert!(generated.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert!(
+        pubkey_hex_from_secret_key(&generated).is_ok(),
+        "generated secret should derive a secp256k1 pubkey"
+    );
+}
+
+#[test]
+fn encrypt_secret_internal_roundtrip() {
+    let secret = generate_secret_key_hex().expect("generate secret");
+    let encrypted = encrypt_secret_internal(&secret, "test-password").expect("encrypt secret");
+    let decrypted = decrypt_secret_internal(&encrypted, "test-password").expect("decrypt secret");
+    assert_eq!(decrypted, secret);
 }
 
 #[test]
@@ -560,6 +630,109 @@ fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
     assert_eq!(
         decoded_complete.receipt.status,
         PairingCompleteReceiptStatusV1::Confirmed
+    );
+
+    let signed_intent =
+        SignedSignIntentV1::new(
+            SignIntentV1 {
+                version: 1,
+                pairing_id: signed_request.pairing_id_hex().expect("pairing id"),
+                agent_pubkey_hex: signed_request.request.agent_pubkey_hex.clone(),
+                wallet_pubkey_hex: pubkey_hex_from_secret_key(wallet_secret_hex())
+                    .expect("wallet pubkey"),
+                network: "regtest".to_string(),
+                created_at_unix: 1_710_000_122,
+                expires_at_unix: 1_710_000_522,
+                nonce: 44,
+                payload: SignIntentPayloadV1::BuildBuyerOffer(BuildBuyerOfferIntentV1 {
+                    inscription_id: "inscription-555".to_string(),
+                    seller_outpoint:
+                        "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:1"
+                            .to_string(),
+                    ask_sats: 120_000,
+                    fee_rate_sat_vb: 4,
+                }),
+            },
+            agent_secret_hex(),
+        )
+        .expect("signed intent");
+    let signed_intent_json = serde_json::to_string(&signed_intent).expect("signed intent json");
+    let sign_intent_tags = pairing_transport_tags(
+        NOSTR_SIGN_INTENT_TYPE_TAG_VALUE,
+        &signed_intent.intent.pairing_id,
+        &signed_intent.intent.wallet_pubkey_hex,
+    )
+    .expect("sign intent tags");
+    let sign_intent_content = encrypt_pairing_transport_content(
+        &signed_intent_json,
+        agent_secret_hex(),
+        &signed_intent.intent.wallet_pubkey_hex,
+    )
+    .expect("encrypted sign intent content");
+    let sign_intent_event = NostrTransportEventV1::new(
+        PAIRING_TRANSPORT_EVENT_KIND,
+        sign_intent_tags,
+        sign_intent_content,
+        1_710_000_123,
+        agent_secret_hex(),
+    )
+    .expect("sign intent event");
+    assert!(
+        decode_signed_sign_intent_event(&sign_intent_event).is_err(),
+        "encrypted sign intent should not decode without recipient secret"
+    );
+    let decoded_sign_intent =
+        decode_signed_sign_intent_event_with_secret(&sign_intent_event, wallet_secret_hex())
+            .expect("decode sign intent");
+    assert_eq!(
+        decoded_sign_intent
+            .intent
+            .intent_id_hex()
+            .expect("decoded intent id"),
+        signed_intent.intent_id_hex().expect("original intent id")
+    );
+
+    let signed_reject_receipt = build_signed_sign_intent_rejection_receipt(
+        &signed_intent,
+        wallet_secret_hex(),
+        1_710_000_124,
+        "user rejected",
+    )
+    .expect("signed reject receipt");
+    let signed_reject_receipt_json =
+        serde_json::to_string(&signed_reject_receipt).expect("signed reject receipt json");
+    let sign_intent_receipt_tags = pairing_transport_tags(
+        NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE,
+        &signed_reject_receipt.receipt.pairing_id,
+        &signed_intent.intent.agent_pubkey_hex,
+    )
+    .expect("sign intent receipt tags");
+    let sign_intent_receipt_content = encrypt_pairing_transport_content(
+        &signed_reject_receipt_json,
+        wallet_secret_hex(),
+        &signed_intent.intent.agent_pubkey_hex,
+    )
+    .expect("encrypted sign intent receipt content");
+    let sign_intent_receipt_event = NostrTransportEventV1::new(
+        PAIRING_TRANSPORT_EVENT_KIND,
+        sign_intent_receipt_tags,
+        sign_intent_receipt_content,
+        1_710_000_125,
+        wallet_secret_hex(),
+    )
+    .expect("sign intent receipt event");
+    assert!(
+        decode_signed_sign_intent_receipt_event(&sign_intent_receipt_event).is_err(),
+        "encrypted sign intent receipt should not decode without recipient secret"
+    );
+    let decoded_sign_intent_receipt = decode_signed_sign_intent_receipt_event_with_secret(
+        &sign_intent_receipt_event,
+        agent_secret_hex(),
+    )
+    .expect("decode sign intent receipt");
+    assert_eq!(
+        decoded_sign_intent_receipt.receipt.intent_id,
+        signed_intent.intent_id_hex().expect("intent id")
     );
 }
 
