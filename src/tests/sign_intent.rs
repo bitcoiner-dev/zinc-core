@@ -1,8 +1,8 @@
 use crate::sign_intent::{
-    build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
-    build_signed_pairing_complete_receipt, build_signed_sign_intent_rejection_receipt,
-    decode_pairing_ack_envelope_event, decode_pairing_ack_envelope_event_with_secret,
-    decode_signed_pairing_complete_receipt_event,
+    build_pairing_transport_event, build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
+    build_signed_pairing_complete_receipt, build_signed_sign_intent_approved_receipt,
+    build_signed_sign_intent_rejection_receipt, decode_pairing_ack_envelope_event,
+    decode_pairing_ack_envelope_event_with_secret, decode_signed_pairing_complete_receipt_event,
     decode_signed_pairing_complete_receipt_event_with_secret, decode_signed_sign_intent_event,
     decode_signed_sign_intent_event_with_secret, decode_signed_sign_intent_receipt_event,
     decode_signed_sign_intent_receipt_event_with_secret, decrypt_pairing_transport_content,
@@ -11,17 +11,23 @@ use crate::sign_intent::{
     validate_pairing_ack_envelope_json, validate_signed_pairing_ack_json,
     validate_signed_pairing_complete_receipt_json, validate_signed_pairing_request_json,
     validate_signed_sign_intent_json, validate_signed_sign_intent_receipt_json,
-    verify_pairing_approval, BuildBuyerOfferIntentV1, CapabilityPolicyV1, NostrTransportEventV1,
-    PairingAckDecisionV1, PairingAckEnvelopeV1, PairingAckV1, PairingCompleteReceiptStatusV1,
-    PairingCompleteReceiptV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
-    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignedPairingAckV1,
-    SignedPairingCompleteReceiptV1, SignedPairingRequestV1, SignedSignIntentReceiptV1,
-    SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
-    NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
-    NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_TYPE_TAG_VALUE,
-    PAIRING_TRANSPORT_EVENT_KIND,
+    verify_pairing_approval, verify_sign_seller_input_scope, BuildBuyerOfferIntentV1,
+    CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1, PairingAckEnvelopeV1,
+    PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1, PairingRequestV1,
+    SignIntentActionV1, SignIntentPayloadV1, SignIntentReceiptStatusV1, SignIntentReceiptV1,
+    SignIntentV1, SignSellerInputIntentV1, SignedPairingAckV1, SignedPairingCompleteReceiptV1,
+    SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
+    NOSTR_PAIRING_ACK_TYPE_TAG_VALUE, NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE,
+    NOSTR_SIGN_INTENT_APP_TAG_VALUE, NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE,
+    NOSTR_SIGN_INTENT_TYPE_TAG_VALUE, PAIRING_TRANSPORT_EVENT_KIND,
 };
 use crate::{decrypt_secret_internal, encrypt_secret_internal};
+use base64::Engine;
+use bdk_wallet::bitcoin::hashes::Hash as _;
+use bdk_wallet::bitcoin::psbt::Psbt;
+use bdk_wallet::bitcoin::{
+    absolute, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+};
 
 fn agent_secret_hex() -> &'static str {
     "0001020304050607080900010203040506070809000102030405060708090001"
@@ -69,6 +75,128 @@ fn sample_approved_ack(request: &PairingRequestV1) -> PairingAckV1 {
         granted_capabilities: Some(sample_capability_policy()),
         rejection_reason: None,
     }
+}
+
+const SIGN_SELLER_INPUT_ASK_SATS: u64 = 100_000;
+const SIGN_SELLER_INPUT_POSTAGE_SATS: u64 = 330;
+
+fn sign_seller_input_seller_txid() -> Txid {
+    Txid::from_slice(&[0x11; 32]).expect("valid seller txid")
+}
+
+fn sign_seller_input_buyer_txid() -> Txid {
+    Txid::from_slice(&[0x22; 32]).expect("valid buyer txid")
+}
+
+fn sign_seller_input_psbt_base64(
+    expected_seller_outpoint: OutPoint,
+    include_duplicate_seller_input: bool,
+    seller_signed: bool,
+    buyer_signed: bool,
+    swap_outputs: bool,
+    mutate_seller_payout: bool,
+) -> String {
+    let mut inputs = vec![
+        TxIn {
+            previous_output: expected_seller_outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        },
+        TxIn {
+            previous_output: OutPoint {
+                txid: sign_seller_input_buyer_txid(),
+                vout: 1,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        },
+    ];
+    if include_duplicate_seller_input {
+        inputs.push(TxIn {
+            previous_output: expected_seller_outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        });
+    }
+
+    let mut outputs = vec![
+        TxOut {
+            value: Amount::from_sat(SIGN_SELLER_INPUT_POSTAGE_SATS),
+            script_pubkey: ScriptBuf::new(),
+        },
+        TxOut {
+            value: Amount::from_sat(SIGN_SELLER_INPUT_ASK_SATS + SIGN_SELLER_INPUT_POSTAGE_SATS),
+            script_pubkey: ScriptBuf::new(),
+        },
+    ];
+
+    if mutate_seller_payout {
+        outputs[1] = TxOut {
+            value: Amount::from_sat(
+                SIGN_SELLER_INPUT_ASK_SATS + SIGN_SELLER_INPUT_POSTAGE_SATS + 1,
+            ),
+            script_pubkey: ScriptBuf::new(),
+        };
+    }
+
+    let tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version(2),
+        lock_time: absolute::LockTime::ZERO,
+        input: inputs,
+        output: outputs,
+    };
+
+    let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
+    psbt.inputs[0].witness_utxo = Some(TxOut {
+        value: Amount::from_sat(SIGN_SELLER_INPUT_POSTAGE_SATS),
+        script_pubkey: ScriptBuf::new(),
+    });
+
+    if seller_signed {
+        let stack = vec![b"seller-sig".to_vec()];
+        psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&stack));
+    }
+    if buyer_signed {
+        let stack = vec![b"buyer-sig".to_vec()];
+        psbt.inputs[1].final_script_witness = Some(Witness::from_slice(&stack));
+    }
+
+    if swap_outputs {
+        psbt.unsigned_tx.output.swap(0, 1);
+        psbt.outputs.swap(0, 1);
+    }
+
+    base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
+}
+
+fn signed_sign_seller_input_intent(
+    offer_psbt_base64: String,
+    expected_seller_outpoint: OutPoint,
+    expected_ask_sats: u64,
+    expires_at_unix: i64,
+) -> SignedSignIntentV1 {
+    let request = sample_pairing_request();
+    let intent = SignIntentV1 {
+        version: 1,
+        pairing_id: request.pairing_id_hex().expect("pairing id"),
+        agent_pubkey_hex: request.agent_pubkey_hex,
+        wallet_pubkey_hex: pubkey_hex_from_secret_key(wallet_secret_hex()).expect("wallet pubkey"),
+        network: "regtest".to_string(),
+        created_at_unix: 1_710_000_200,
+        expires_at_unix,
+        nonce: 99,
+        payload: SignIntentPayloadV1::SignSellerInput(SignSellerInputIntentV1 {
+            offer_id: "ab".repeat(32),
+            offer_psbt_base64,
+            expected_seller_outpoint: expected_seller_outpoint.to_string(),
+            expected_ask_sats,
+        }),
+    };
+
+    SignedSignIntentV1::new(intent, agent_secret_hex()).expect("signed sign-seller intent")
 }
 
 #[test]
@@ -217,6 +345,66 @@ fn build_signed_sign_intent_rejection_receipt_sets_expected_fields() {
 }
 
 #[test]
+fn build_signed_sign_intent_approved_receipt_sets_expected_fields() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(expected_seller_outpoint, false, false, true, false, false),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    let signed_receipt = build_signed_sign_intent_approved_receipt(
+        &signed_intent,
+        wallet_secret_hex(),
+        1_710_000_220,
+        Some("signed-psbt-base64"),
+        None,
+    )
+    .expect("approved receipt");
+
+    signed_receipt.verify().expect("verify approved receipt");
+    assert_eq!(
+        signed_receipt.receipt.status,
+        SignIntentReceiptStatusV1::Approved
+    );
+    assert_eq!(
+        signed_receipt.receipt.intent_id,
+        signed_intent.intent_id_hex().expect("intent id")
+    );
+    assert!(signed_receipt.receipt.signed_psbt_base64.is_some());
+}
+
+#[test]
+fn build_signed_sign_intent_approved_receipt_rejects_scope_escape() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(expected_seller_outpoint, false, false, false, false, false),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    let err = build_signed_sign_intent_approved_receipt(
+        &signed_intent,
+        wallet_secret_hex(),
+        1_710_000_220,
+        Some("cHNidA=="),
+        None,
+    )
+    .expect_err("unsigned buyer input must fail");
+    assert!(err
+        .to_string()
+        .contains("must be signed before seller approval"));
+}
+
+#[test]
 fn generate_secret_key_hex_returns_valid_32_byte_hex() {
     let generated = generate_secret_key_hex().expect("generate secret key hex");
     assert_eq!(generated.len(), 64);
@@ -233,6 +421,125 @@ fn encrypt_secret_internal_roundtrip() {
     let encrypted = encrypt_secret_internal(&secret, "test-password").expect("encrypt secret");
     let decrypted = decrypt_secret_internal(&encrypted, "test-password").expect("decrypt secret");
     assert_eq!(decrypted, secret);
+}
+
+#[test]
+fn verify_sign_seller_input_scope_accepts_valid_intent() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(expected_seller_outpoint, false, false, true, false, false),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    let plan =
+        verify_sign_seller_input_scope(&signed_intent, 1_710_000_210).expect("valid scope plan");
+    assert_eq!(plan.seller_input_index, 0);
+    assert_eq!(plan.input_count, 2);
+    assert_eq!(
+        plan.expected_seller_outpoint,
+        expected_seller_outpoint.to_string()
+    );
+    assert_eq!(plan.expected_ask_sats, SIGN_SELLER_INPUT_ASK_SATS);
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_missing_expected_seller_input() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let psbt_seller_outpoint = OutPoint {
+        txid: Txid::from_slice(&[0x33; 32]).expect("valid txid"),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(psbt_seller_outpoint, false, false, true, false, false),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    let err = verify_sign_seller_input_scope(&signed_intent, 1_710_000_210).expect_err("must fail");
+    assert!(err
+        .to_string()
+        .contains("contains no expected seller input"));
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_signed_seller_input() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(expected_seller_outpoint, false, true, true, false, false),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    let err = verify_sign_seller_input_scope(&signed_intent, 1_710_000_210).expect_err("must fail");
+    assert!(err.to_string().contains("must be unsigned"));
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_unsigned_buyer_input() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(expected_seller_outpoint, false, false, false, false, false),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    let err = verify_sign_seller_input_scope(&signed_intent, 1_710_000_210).expect_err("must fail");
+    assert!(err
+        .to_string()
+        .contains("must be signed before seller approval"));
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_non_canonical_output_layout() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(expected_seller_outpoint, false, false, true, false, true),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    let err = verify_sign_seller_input_scope(&signed_intent, 1_710_000_210).expect_err("must fail");
+    assert!(err
+        .to_string()
+        .contains("expected seller payout output at index 1"));
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_expired_intent() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(expected_seller_outpoint, false, false, true, false, false),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_205,
+    );
+
+    let err = verify_sign_seller_input_scope(&signed_intent, 1_710_000_210).expect_err("must fail");
+    assert!(err.to_string().contains("sign seller input intent expired"));
 }
 
 #[test]
@@ -556,26 +863,16 @@ fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
             .expect("signed ack");
     let envelope = PairingAckEnvelopeV1::new(signed_ack.clone(), 1_710_000_101).expect("envelope");
     let envelope_json = serde_json::to_string(&envelope).expect("envelope json");
-    let ack_tags = pairing_transport_tags(
+    let ack_event = build_pairing_transport_event(
+        &envelope_json,
         NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
         &signed_ack.ack.pairing_id,
         &signed_ack.ack.agent_pubkey_hex,
-    )
-    .expect("ack tags");
-    let ack_content = encrypt_pairing_transport_content(
-        &envelope_json,
-        wallet_secret_hex(),
-        &signed_ack.ack.agent_pubkey_hex,
-    )
-    .expect("encrypted ack content");
-    let ack_event = NostrTransportEventV1::new(
-        PAIRING_TRANSPORT_EVENT_KIND,
-        ack_tags,
-        ack_content,
         1_710_000_110,
         wallet_secret_hex(),
     )
     .expect("ack event");
+    assert_eq!(ack_event.kind, PAIRING_TRANSPORT_EVENT_KIND);
     let ack_event_json = serde_json::to_string(&ack_event).expect("ack event json");
     assert!(validate_nostr_transport_event_json(&ack_event_json).is_ok());
     assert!(
@@ -598,22 +895,11 @@ fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
     )
     .expect("signed complete");
     let complete_json = serde_json::to_string(&signed_complete).expect("complete json");
-    let complete_tags = pairing_transport_tags(
+    let complete_event = build_pairing_transport_event(
+        &complete_json,
         NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE,
         &signed_complete.receipt.pairing_id,
         &signed_complete.receipt.wallet_pubkey_hex,
-    )
-    .expect("complete tags");
-    let complete_content = encrypt_pairing_transport_content(
-        &complete_json,
-        agent_secret_hex(),
-        &signed_complete.receipt.wallet_pubkey_hex,
-    )
-    .expect("encrypted complete content");
-    let complete_event = NostrTransportEventV1::new(
-        PAIRING_TRANSPORT_EVENT_KIND,
-        complete_tags,
-        complete_content,
         1_710_000_121,
         agent_secret_hex(),
     )
@@ -657,22 +943,11 @@ fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
         )
         .expect("signed intent");
     let signed_intent_json = serde_json::to_string(&signed_intent).expect("signed intent json");
-    let sign_intent_tags = pairing_transport_tags(
+    let sign_intent_event = build_pairing_transport_event(
+        &signed_intent_json,
         NOSTR_SIGN_INTENT_TYPE_TAG_VALUE,
         &signed_intent.intent.pairing_id,
         &signed_intent.intent.wallet_pubkey_hex,
-    )
-    .expect("sign intent tags");
-    let sign_intent_content = encrypt_pairing_transport_content(
-        &signed_intent_json,
-        agent_secret_hex(),
-        &signed_intent.intent.wallet_pubkey_hex,
-    )
-    .expect("encrypted sign intent content");
-    let sign_intent_event = NostrTransportEventV1::new(
-        PAIRING_TRANSPORT_EVENT_KIND,
-        sign_intent_tags,
-        sign_intent_content,
         1_710_000_123,
         agent_secret_hex(),
     )
@@ -701,22 +976,11 @@ fn nostr_transport_event_roundtrip_for_ack_and_complete_receipt() {
     .expect("signed reject receipt");
     let signed_reject_receipt_json =
         serde_json::to_string(&signed_reject_receipt).expect("signed reject receipt json");
-    let sign_intent_receipt_tags = pairing_transport_tags(
+    let sign_intent_receipt_event = build_pairing_transport_event(
+        &signed_reject_receipt_json,
         NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE,
         &signed_reject_receipt.receipt.pairing_id,
         &signed_intent.intent.agent_pubkey_hex,
-    )
-    .expect("sign intent receipt tags");
-    let sign_intent_receipt_content = encrypt_pairing_transport_content(
-        &signed_reject_receipt_json,
-        wallet_secret_hex(),
-        &signed_intent.intent.agent_pubkey_hex,
-    )
-    .expect("encrypted sign intent receipt content");
-    let sign_intent_receipt_event = NostrTransportEventV1::new(
-        PAIRING_TRANSPORT_EVENT_KIND,
-        sign_intent_receipt_tags,
-        sign_intent_receipt_content,
         1_710_000_125,
         wallet_secret_hex(),
     )
@@ -755,7 +1019,7 @@ fn pairing_transport_content_encrypt_decrypt_roundtrip() {
 }
 
 #[test]
-fn decode_pairing_transport_event_with_secret_accepts_plaintext_for_compat() {
+fn decode_pairing_transport_event_with_secret_rejects_non_1059_kind() {
     let request = sample_pairing_request();
     let signed_request =
         SignedPairingRequestV1::new(request, agent_secret_hex()).expect("signed request");
@@ -771,18 +1035,17 @@ fn decode_pairing_transport_event_with_secret_accepts_plaintext_for_compat() {
     )
     .expect("ack tags");
     let ack_event = NostrTransportEventV1::new(
-        PAIRING_TRANSPORT_EVENT_KIND,
+        31_978,
         ack_tags,
         envelope_json,
         1_710_000_111,
         wallet_secret_hex(),
     )
     .expect("ack event");
-    let decoded_envelope =
-        decode_pairing_ack_envelope_event_with_secret(&ack_event, agent_secret_hex())
-            .expect("decode plaintext event with secret");
-    assert_eq!(
-        decoded_envelope.signed_ack.ack.pairing_id,
-        signed_request.pairing_id_hex().expect("pairing id")
+    let err = decode_pairing_ack_envelope_event_with_secret(&ack_event, agent_secret_hex())
+        .expect_err("legacy kind must be rejected");
+    assert!(
+        err.to_string().contains("unexpected nostr event kind"),
+        "unexpected error: {err}"
     );
 }

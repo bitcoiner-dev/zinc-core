@@ -7,9 +7,12 @@
 //! - Structural validation for local fixtures and adapters
 
 use crate::ZincError;
+use base64::Engine;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
+use bdk_wallet::bitcoin::psbt::{Input as PsbtInput, Psbt};
 use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
 use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
+use bdk_wallet::bitcoin::OutPoint;
 use getrandom::getrandom;
 use nostr::nips::nip44;
 use nostr::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
@@ -31,11 +34,14 @@ pub const NOSTR_PAIRING_ACK_TYPE_TAG_VALUE: &str = "pairing-ack-v1";
 pub const NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE: &str = "pairing-complete-receipt-v1";
 pub const NOSTR_SIGN_INTENT_TYPE_TAG_VALUE: &str = "sign-intent-v1";
 pub const NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE: &str = "sign-intent-receipt-v1";
-pub const PAIRING_TRANSPORT_EVENT_KIND: u64 = 31_978;
+pub const PAIRING_TRANSPORT_EVENT_KIND: u64 = 1_059;
 pub const NOSTR_TAG_APP_KEY: &str = "z";
 pub const NOSTR_TAG_TYPE_KEY: &str = "t";
 pub const NOSTR_TAG_PAIRING_HASH_KEY: &str = "x";
 pub const NOSTR_TAG_RECIPIENT_PUBKEY_KEY: &str = "p";
+
+const PAIRING_TRANSPORT_SEAL_EVENT_KIND: u64 = 13;
+const PAIRING_TRANSPORT_RUMOR_EVENT_KIND: u64 = PAIRING_TRANSPORT_EVENT_KIND;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -685,6 +691,45 @@ impl NostrTransportEventV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct NostrTransportRumorV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    pubkey: String,
+    #[serde(rename = "created_at", alias = "createdAt")]
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+    content: String,
+}
+
+impl NostrTransportRumorV1 {
+    fn verify(&self) -> Result<(), ZincError> {
+        validate_pubkey_hex("nostr rumor pubkey", &self.pubkey)?;
+        if self.kind != PAIRING_TRANSPORT_RUMOR_EVENT_KIND {
+            return Err(ZincError::OfferError(format!(
+                "unexpected nostr rumor kind {}, expected {}",
+                self.kind, PAIRING_TRANSPORT_RUMOR_EVENT_KIND
+            )));
+        }
+        if let Some(id) = &self.id {
+            validate_hex64("nostr rumor id", id)?;
+            let expected_id = compute_nostr_event_id_hex(
+                &self.pubkey,
+                self.created_at,
+                self.kind,
+                &self.tags,
+                &self.content,
+            )?;
+            if expected_id != *id {
+                return Err(ZincError::OfferError("nostr rumor id mismatch".to_string()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PairingCompleteReceiptStatusV1 {
     Confirmed,
     Rejected,
@@ -923,6 +968,78 @@ impl SignedSignIntentV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SignSellerInputScopeV1 {
+    pub intent_id: String,
+    pub offer_id: String,
+    pub seller_input_index: usize,
+    pub input_count: usize,
+    pub expected_seller_outpoint: String,
+    pub expected_ask_sats: u64,
+}
+
+pub fn verify_sign_seller_input_scope(
+    signed_intent: &SignedSignIntentV1,
+    now_unix: i64,
+) -> Result<SignSellerInputScopeV1, ZincError> {
+    signed_intent.verify()?;
+    if now_unix > signed_intent.intent.expires_at_unix {
+        return Err(ZincError::OfferError(format!(
+            "sign seller input intent expired at {}",
+            signed_intent.intent.expires_at_unix
+        )));
+    }
+
+    let details = match &signed_intent.intent.payload {
+        SignIntentPayloadV1::SignSellerInput(details) => details,
+        _ => {
+            return Err(ZincError::OfferError(
+                "sign intent payload action must be SignSellerInput".to_string(),
+            ))
+        }
+    };
+    details.validate()?;
+
+    let expected_seller_outpoint = details
+        .expected_seller_outpoint
+        .parse::<OutPoint>()
+        .map_err(|e| {
+            ZincError::OfferError(format!(
+                "invalid sign seller input expected_seller_outpoint `{}`: {e}",
+                details.expected_seller_outpoint
+            ))
+        })?;
+    let psbt = decode_sign_seller_input_psbt(&details.offer_psbt_base64)?;
+    let seller_input_index = locate_expected_seller_input(&psbt, expected_seller_outpoint)?;
+    enforce_sign_seller_input_scope_constraints(
+        &psbt,
+        seller_input_index,
+        expected_seller_outpoint,
+        details.expected_ask_sats,
+    )?;
+
+    Ok(SignSellerInputScopeV1 {
+        intent_id: signed_intent.intent_id_hex()?,
+        offer_id: details.offer_id.clone(),
+        seller_input_index,
+        input_count: psbt.inputs.len(),
+        expected_seller_outpoint: details.expected_seller_outpoint.clone(),
+        expected_ask_sats: details.expected_ask_sats,
+    })
+}
+
+pub fn verify_sign_seller_input_scope_json(
+    signed_intent_json: &str,
+    now_unix: i64,
+) -> Result<SignSellerInputScopeV1, ZincError> {
+    let signed_intent: SignedSignIntentV1 =
+        serde_json::from_str(signed_intent_json).map_err(|e| {
+            ZincError::SerializationError(format!("invalid signed sign intent json: {e}"))
+        })?;
+    verify_sign_seller_input_scope(&signed_intent, now_unix)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SignedSignIntentReceiptV1 {
     pub receipt: SignIntentReceiptV1,
     pub signature_hex: String,
@@ -969,6 +1086,201 @@ pub fn build_signed_sign_intent_rejection_receipt(
     let signed_receipt = SignedSignIntentReceiptV1::new(receipt, wallet_secret_key_hex)?;
     signed_receipt.verify()?;
     Ok(signed_receipt)
+}
+
+pub fn build_signed_sign_intent_approved_receipt(
+    signed_intent: &SignedSignIntentV1,
+    wallet_secret_key_hex: &str,
+    now_unix: i64,
+    signed_psbt_base64: Option<&str>,
+    artifact_json: Option<&str>,
+) -> Result<SignedSignIntentReceiptV1, ZincError> {
+    signed_intent.verify()?;
+    if now_unix > signed_intent.intent.expires_at_unix {
+        return Err(ZincError::OfferError(format!(
+            "sign intent expired at {}",
+            signed_intent.intent.expires_at_unix
+        )));
+    }
+    if signed_psbt_base64.is_none() && artifact_json.is_none() {
+        return Err(ZincError::OfferError(
+            "approved sign intent receipt must include signed_psbt_base64 or artifact_json"
+                .to_string(),
+        ));
+    }
+
+    if matches!(
+        signed_intent.intent.payload,
+        SignIntentPayloadV1::SignSellerInput(_)
+    ) {
+        verify_sign_seller_input_scope(signed_intent, now_unix)?;
+        if signed_psbt_base64.is_none() {
+            return Err(ZincError::OfferError(
+                "approved SignSellerInput receipt must include signed_psbt_base64".to_string(),
+            ));
+        }
+    }
+
+    let signer_pubkey_hex = pubkey_hex_from_secret_key(wallet_secret_key_hex)?;
+    let receipt = SignIntentReceiptV1 {
+        version: VERSION_V1,
+        intent_id: signed_intent.intent_id_hex()?,
+        pairing_id: signed_intent.intent.pairing_id.clone(),
+        signer_pubkey_hex,
+        created_at_unix: now_unix,
+        status: SignIntentReceiptStatusV1::Approved,
+        signed_psbt_base64: signed_psbt_base64.map(str::to_string),
+        artifact_json: artifact_json.map(str::to_string),
+        error_message: None,
+    };
+    let signed_receipt = SignedSignIntentReceiptV1::new(receipt, wallet_secret_key_hex)?;
+    signed_receipt.verify()?;
+    Ok(signed_receipt)
+}
+
+fn decode_sign_seller_input_psbt(offer_psbt_base64: &str) -> Result<Psbt, ZincError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(offer_psbt_base64.as_bytes())
+        .map_err(|e| {
+            ZincError::OfferError(format!("invalid sign seller input psbt base64: {e}"))
+        })?;
+    Psbt::deserialize(&bytes)
+        .map_err(|e| ZincError::OfferError(format!("invalid sign seller input psbt: {e}")))
+}
+
+fn locate_expected_seller_input(
+    psbt: &Psbt,
+    expected_seller_outpoint: OutPoint,
+) -> Result<usize, ZincError> {
+    let seller_indices: Vec<usize> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| {
+            (input.previous_output == expected_seller_outpoint).then_some(index)
+        })
+        .collect();
+    match seller_indices.len() {
+        0 => Err(ZincError::OfferError(format!(
+            "sign seller input psbt contains no expected seller input `{expected_seller_outpoint}`"
+        ))),
+        1 => Ok(seller_indices[0]),
+        count => Err(ZincError::OfferError(format!(
+            "sign seller input psbt contains {count} expected seller inputs `{expected_seller_outpoint}`"
+        ))),
+    }
+}
+
+fn enforce_sign_seller_input_scope_constraints(
+    psbt: &Psbt,
+    seller_input_index: usize,
+    expected_seller_outpoint: OutPoint,
+    expected_ask_sats: u64,
+) -> Result<(), ZincError> {
+    if seller_input_index != 0 {
+        return Err(ZincError::OfferError(format!(
+            "expected seller input `{expected_seller_outpoint}` must be first input (index 0), found index {seller_input_index}"
+        )));
+    }
+    if psbt
+        .inputs
+        .get(seller_input_index)
+        .is_some_and(psbt_input_has_signature)
+    {
+        return Err(ZincError::OfferError(format!(
+            "expected seller input `{expected_seller_outpoint}` must be unsigned"
+        )));
+    }
+
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        if index == seller_input_index {
+            continue;
+        }
+        if !psbt_input_has_signature(input) {
+            let outpoint = psbt.unsigned_tx.input[index].previous_output;
+            return Err(ZincError::OfferError(format!(
+                "buyer input `{outpoint}` must be signed before seller approval"
+            )));
+        }
+    }
+
+    let seller_postage_sats =
+        seller_input_prevout_sats(psbt, seller_input_index, expected_seller_outpoint)?;
+    if psbt.unsigned_tx.output.len() < 2 {
+        return Err(ZincError::OfferError(
+            "sign seller input psbt must include buyer postage and seller payout outputs"
+                .to_string(),
+        ));
+    }
+
+    let buyer_postage_out = &psbt.unsigned_tx.output[0];
+    if buyer_postage_out.value.to_sat() != seller_postage_sats {
+        return Err(ZincError::OfferError(format!(
+            "expected buyer postage output at index 0 to equal seller postage {} sats; found {} sats",
+            seller_postage_sats,
+            buyer_postage_out.value.to_sat()
+        )));
+    }
+
+    let expected_seller_payout = seller_postage_sats
+        .checked_add(expected_ask_sats)
+        .ok_or_else(|| {
+            ZincError::OfferError(
+                "sign seller input expected_ask_sats + postage overflows u64".to_string(),
+            )
+        })?;
+    let seller_payout_out = &psbt.unsigned_tx.output[1];
+    if seller_payout_out.value.to_sat() != expected_seller_payout {
+        return Err(ZincError::OfferError(format!(
+            "expected seller payout output at index 1 to equal ask+postage {} sats; found {} sats",
+            expected_seller_payout,
+            seller_payout_out.value.to_sat()
+        )));
+    }
+
+    Ok(())
+}
+
+fn seller_input_prevout_sats(
+    psbt: &Psbt,
+    seller_input_index: usize,
+    expected_seller_outpoint: OutPoint,
+) -> Result<u64, ZincError> {
+    let seller_input = psbt.inputs.get(seller_input_index).ok_or_else(|| {
+        ZincError::OfferError("expected seller input metadata is missing".to_string())
+    })?;
+    let seller_txin = psbt
+        .unsigned_tx
+        .input
+        .get(seller_input_index)
+        .ok_or_else(|| ZincError::OfferError("expected seller tx input is missing".to_string()))?;
+
+    seller_input
+        .witness_utxo
+        .as_ref()
+        .map(|txout| txout.value.to_sat())
+        .or_else(|| {
+            seller_input.non_witness_utxo.as_ref().and_then(|prev_tx| {
+                prev_tx
+                    .output
+                    .get(seller_txin.previous_output.vout as usize)
+                    .map(|txout| txout.value.to_sat())
+            })
+        })
+        .ok_or_else(|| {
+            ZincError::OfferError(format!(
+                "expected seller input `{expected_seller_outpoint}` is missing prevout value metadata"
+            ))
+        })
+}
+
+fn psbt_input_has_signature(input: &PsbtInput) -> bool {
+    input.final_script_sig.is_some()
+        || input.final_script_witness.is_some()
+        || !input.partial_sigs.is_empty()
+        || input.tap_key_sig.is_some()
+        || !input.tap_script_sigs.is_empty()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1128,6 +1440,72 @@ pub fn pairing_transport_tags(
     ])
 }
 
+pub fn build_pairing_transport_event(
+    payload_json: &str,
+    type_tag: &str,
+    pairing_id: &str,
+    recipient_pubkey_hex: &str,
+    created_at_unix: u64,
+    sender_secret_key_hex: &str,
+) -> Result<NostrTransportEventV1, ZincError> {
+    ensure_non_empty("pairing transport payload_json", payload_json)?;
+    let tags = pairing_transport_tags(type_tag, pairing_id, recipient_pubkey_hex)?;
+    let sender_pubkey_hex = pubkey_hex_from_secret_key(sender_secret_key_hex)?;
+
+    let rumor = NostrTransportRumorV1 {
+        id: None,
+        pubkey: sender_pubkey_hex,
+        created_at: created_at_unix,
+        kind: PAIRING_TRANSPORT_RUMOR_EVENT_KIND,
+        tags: tags.clone(),
+        content: payload_json.to_string(),
+    };
+    rumor.verify()?;
+
+    let rumor_json = serde_json::to_string(&rumor)
+        .map_err(|e| ZincError::SerializationError(format!("failed to serialize rumor: {e}")))?;
+    let seal_content = encrypt_pairing_transport_content(
+        &rumor_json,
+        sender_secret_key_hex,
+        recipient_pubkey_hex,
+    )?;
+    let seal_event = NostrTransportEventV1::new(
+        PAIRING_TRANSPORT_SEAL_EVENT_KIND,
+        Vec::new(),
+        seal_content,
+        created_at_unix,
+        sender_secret_key_hex,
+    )?;
+
+    let ephemeral_secret_key_hex = generate_secret_key_hex()?;
+    let seal_event_json = serde_json::to_string(&seal_event).map_err(|e| {
+        ZincError::SerializationError(format!("failed to serialize pairing transport seal: {e}"))
+    })?;
+    let wrapped_content = encrypt_pairing_transport_content(
+        &seal_event_json,
+        &ephemeral_secret_key_hex,
+        recipient_pubkey_hex,
+    )?;
+
+    NostrTransportEventV1::new(
+        PAIRING_TRANSPORT_EVENT_KIND,
+        tags,
+        wrapped_content,
+        created_at_unix,
+        &ephemeral_secret_key_hex,
+    )
+}
+
+pub fn decode_pairing_transport_event_content_with_secret(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: &str,
+) -> Result<String, ZincError> {
+    event.verify()?;
+    ensure_supported_pairing_transport_event_kind(event.kind)?;
+    ensure_event_recipient_tag_matches_secret(event, recipient_secret_key_hex)?;
+    decrypt_pairing_transport_gift_wrap_content(event, recipient_secret_key_hex)
+}
+
 pub fn encrypt_pairing_transport_content(
     payload_json: &str,
     sender_secret_key_hex: &str,
@@ -1189,12 +1567,7 @@ fn decode_pairing_ack_envelope_event_internal(
     recipient_secret_key_hex: Option<&str>,
 ) -> Result<PairingAckEnvelopeV1, ZincError> {
     event.verify()?;
-    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
-        return Err(ZincError::OfferError(format!(
-            "unexpected nostr event kind {}, expected {}",
-            event.kind, PAIRING_TRANSPORT_EVENT_KIND
-        )));
-    }
+    ensure_supported_pairing_transport_event_kind(event.kind)?;
     let payload_json = decode_pairing_transport_payload_json(
         event,
         NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
@@ -1226,12 +1599,7 @@ fn decode_signed_pairing_complete_receipt_event_internal(
     recipient_secret_key_hex: Option<&str>,
 ) -> Result<SignedPairingCompleteReceiptV1, ZincError> {
     event.verify()?;
-    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
-        return Err(ZincError::OfferError(format!(
-            "unexpected nostr event kind {}, expected {}",
-            event.kind, PAIRING_TRANSPORT_EVENT_KIND
-        )));
-    }
+    ensure_supported_pairing_transport_event_kind(event.kind)?;
     let payload_json = decode_pairing_transport_payload_json(
         event,
         NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE,
@@ -1266,12 +1634,7 @@ fn decode_signed_sign_intent_event_internal(
     recipient_secret_key_hex: Option<&str>,
 ) -> Result<SignedSignIntentV1, ZincError> {
     event.verify()?;
-    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
-        return Err(ZincError::OfferError(format!(
-            "unexpected nostr event kind {}, expected {}",
-            event.kind, PAIRING_TRANSPORT_EVENT_KIND
-        )));
-    }
+    ensure_supported_pairing_transport_event_kind(event.kind)?;
     let payload_json = decode_pairing_transport_payload_json(
         event,
         NOSTR_SIGN_INTENT_TYPE_TAG_VALUE,
@@ -1303,12 +1666,7 @@ fn decode_signed_sign_intent_receipt_event_internal(
     recipient_secret_key_hex: Option<&str>,
 ) -> Result<SignedSignIntentReceiptV1, ZincError> {
     event.verify()?;
-    if event.kind != PAIRING_TRANSPORT_EVENT_KIND {
-        return Err(ZincError::OfferError(format!(
-            "unexpected nostr event kind {}, expected {}",
-            event.kind, PAIRING_TRANSPORT_EVENT_KIND
-        )));
-    }
+    ensure_supported_pairing_transport_event_kind(event.kind)?;
     let payload_json = decode_pairing_transport_payload_json(
         event,
         NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE,
@@ -1431,6 +1789,50 @@ fn ensure_event_pairing_hash_matches(
     Ok(())
 }
 
+fn ensure_supported_pairing_transport_event_kind(kind: u64) -> Result<(), ZincError> {
+    if kind == PAIRING_TRANSPORT_EVENT_KIND {
+        return Ok(());
+    }
+    Err(ZincError::OfferError(format!(
+        "unexpected nostr event kind {}, expected {}",
+        kind, PAIRING_TRANSPORT_EVENT_KIND
+    )))
+}
+
+fn decrypt_pairing_transport_gift_wrap_content(
+    event: &NostrTransportEventV1,
+    recipient_secret_key_hex: &str,
+) -> Result<String, ZincError> {
+    let seal_json =
+        decrypt_pairing_transport_content(&event.content, recipient_secret_key_hex, &event.pubkey)?;
+    let seal_event: NostrTransportEventV1 = serde_json::from_str(&seal_json).map_err(|e| {
+        ZincError::SerializationError(format!("invalid pairing transport seal json: {e}"))
+    })?;
+    seal_event.verify()?;
+    if seal_event.kind != PAIRING_TRANSPORT_SEAL_EVENT_KIND {
+        return Err(ZincError::OfferError(format!(
+            "unexpected pairing transport seal kind {}, expected {}",
+            seal_event.kind, PAIRING_TRANSPORT_SEAL_EVENT_KIND
+        )));
+    }
+
+    let rumor_json = decrypt_pairing_transport_content(
+        &seal_event.content,
+        recipient_secret_key_hex,
+        &seal_event.pubkey,
+    )?;
+    let rumor: NostrTransportRumorV1 = serde_json::from_str(&rumor_json).map_err(|e| {
+        ZincError::SerializationError(format!("invalid pairing transport rumor json: {e}"))
+    })?;
+    rumor.verify()?;
+    if !rumor.pubkey.eq_ignore_ascii_case(&seal_event.pubkey) {
+        return Err(ZincError::OfferError(
+            "pairing transport rumor sender pubkey mismatch".to_string(),
+        ));
+    }
+    Ok(rumor.content)
+}
+
 fn decode_pairing_transport_payload_json(
     event: &NostrTransportEventV1,
     expected_type_tag: &str,
@@ -1438,12 +1840,7 @@ fn decode_pairing_transport_payload_json(
 ) -> Result<String, ZincError> {
     ensure_event_tags_match(event, expected_type_tag)?;
     if let Some(secret_key_hex) = recipient_secret_key_hex {
-        ensure_event_recipient_tag_matches_secret(event, secret_key_hex)?;
-        if let Ok(decrypted) =
-            decrypt_pairing_transport_content(&event.content, secret_key_hex, &event.pubkey)
-        {
-            return Ok(decrypted);
-        }
+        return decode_pairing_transport_event_content_with_secret(event, secret_key_hex);
     }
     Ok(event.content.clone())
 }
