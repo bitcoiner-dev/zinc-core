@@ -70,19 +70,22 @@ pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
 pub use ordinals::types::{Inscription, Satpoint};
 pub use sign_intent::{
-    build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
-    build_signed_pairing_complete_receipt, build_signed_sign_intent_rejection_receipt,
-    decode_pairing_ack_envelope_event, decode_pairing_ack_envelope_event_with_secret,
+    build_pairing_transport_event, build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
+    build_signed_pairing_complete_receipt, build_signed_sign_intent_approved_receipt,
+    build_signed_sign_intent_rejection_receipt, decode_pairing_ack_envelope_event,
+    decode_pairing_ack_envelope_event_with_secret,
+    decode_pairing_transport_event_content_with_secret,
     decode_signed_pairing_complete_receipt_event,
     decode_signed_pairing_complete_receipt_event_with_secret, decode_signed_sign_intent_event,
     decode_signed_sign_intent_event_with_secret, decode_signed_sign_intent_receipt_event,
     decode_signed_sign_intent_receipt_event_with_secret, decrypt_pairing_transport_content,
     encrypt_pairing_transport_content, generate_secret_key_hex, pairing_tag_hash_hex,
     pairing_transport_tags, pubkey_hex_from_secret_key, verify_pairing_approval,
-    BuildBuyerOfferIntentV1, CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1,
-    PairingAckEnvelopeV1, PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1,
-    PairingLinkApprovalV1, PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1,
-    SignIntentReceiptStatusV1, SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1,
+    verify_sign_seller_input_scope, verify_sign_seller_input_scope_json, BuildBuyerOfferIntentV1,
+    CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1, PairingAckEnvelopeV1,
+    PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1, PairingLinkApprovalV1,
+    PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1, SignIntentReceiptStatusV1,
+    SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1, SignSellerInputScopeV1,
     SignedPairingAckV1, SignedPairingCompleteReceiptV1, SignedPairingRequestV1,
     SignedSignIntentReceiptV1, SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
     NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
@@ -1876,6 +1879,60 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Build and sign an approved sign-intent receipt using the account pairing key.
+    #[wasm_bindgen(js_name = build_signed_sign_intent_approved_receipt_json)]
+    pub fn build_signed_sign_intent_approved_receipt_json(
+        &self,
+        signed_intent_json: &str,
+        created_at_unix: i64,
+        signed_psbt_base64: Option<String>,
+        artifact_json: Option<String>,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let signed_intent: crate::sign_intent::SignedSignIntentV1 =
+            serde_json::from_str(signed_intent_json)
+                .map_err(|e| JsValue::from_str(&format!("invalid signed sign intent json: {e}")))?;
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let secret_hex = inner
+                    .get_pairing_secret_key_hex()
+                    .map_err(|e| JsValue::from_str(&e))?;
+                let signed_receipt = crate::sign_intent::build_signed_sign_intent_approved_receipt(
+                    &signed_intent,
+                    &secret_hex,
+                    created_at_unix,
+                    signed_psbt_base64.as_deref(),
+                    artifact_json.as_deref(),
+                )
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                serde_json::to_string(&signed_receipt).map_err(|e| {
+                    JsValue::from_str(&format!(
+                        "failed to serialize signed sign intent receipt: {e}"
+                    ))
+                })
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (build_signed_sign_intent_approved_receipt_json): {}",
+                e
+            ))),
+        }
+    }
+
+    /// Verify and extract seller signing scope for a signed `SignSellerInput` intent.
+    #[wasm_bindgen(js_name = verify_sign_seller_input_scope_json)]
+    pub fn verify_sign_seller_input_scope_json(
+        &self,
+        signed_intent_json: &str,
+        now_unix: i64,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let plan =
+            crate::sign_intent::verify_sign_seller_input_scope_json(signed_intent_json, now_unix)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        serde_json::to_string(&plan)
+            .map_err(|e| JsValue::from_str(&format!("failed to serialize scope plan: {e}")))
+    }
+
     /// Build a pairing ack envelope JSON payload from a signed pairing ack JSON string.
     #[wasm_bindgen(js_name = build_pairing_ack_envelope_json)]
     pub fn build_pairing_ack_envelope_json(
@@ -1910,22 +1967,11 @@ impl ZincWasmWallet {
                 let secret_hex = inner
                     .get_pairing_secret_key_hex()
                     .map_err(|e| JsValue::from_str(&e))?;
-                let tags = crate::sign_intent::pairing_transport_tags(
+                let event = crate::sign_intent::build_pairing_transport_event(
+                    content_json,
                     type_tag,
                     pairing_id,
                     recipient_pubkey_hex,
-                )
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                let encrypted_content = crate::sign_intent::encrypt_pairing_transport_content(
-                    content_json,
-                    &secret_hex,
-                    recipient_pubkey_hex,
-                )
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                let event = crate::sign_intent::NostrTransportEventV1::new(
-                    crate::sign_intent::PAIRING_TRANSPORT_EVENT_KIND,
-                    tags,
-                    encrypted_content,
                     created_at_unix,
                     &secret_hex,
                 )
@@ -1959,22 +2005,11 @@ impl ZincWasmWallet {
                 let secret_hex = inner
                     .get_pairing_secret_key_hex()
                     .map_err(|e| JsValue::from_str(&e))?;
-
-                match crate::sign_intent::decrypt_pairing_transport_content(
-                    &event.content,
+                crate::sign_intent::decode_pairing_transport_event_content_with_secret(
+                    &event,
                     &secret_hex,
-                    &event.pubkey,
-                ) {
-                    Ok(decrypted) => Ok(decrypted),
-                    Err(_) => {
-                        serde_json::from_str::<serde_json::Value>(&event.content).map_err(|_| {
-                            JsValue::from_str(
-                                "failed to decrypt transport event content and plaintext fallback is not valid json",
-                            )
-                        })?;
-                        Ok(event.content)
-                    }
-                }
+                )
+                .map_err(|e| JsValue::from_str(&e.to_string()))
             }
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (decode_pairing_transport_event_content_json): {}",
