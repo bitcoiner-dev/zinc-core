@@ -174,3 +174,56 @@ fn test_account_and_address_views_stay_coherent_after_switches() {
         "active account preview should match get_addresses output"
     );
 }
+
+#[wasm_bindgen_test]
+fn test_index_mode_addresses_follow_active_account() {
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let wallet = ZincWasmWallet::new("regtest", phrase, Some("dual".to_string()), None, Some(0))
+        .expect("Failed to create wallet");
+
+    wallet
+        .set_derivation_mode("index")
+        .expect("set_derivation_mode should succeed");
+    wallet
+        .set_active_account(2)
+        .expect("set_active_account should succeed");
+
+    let addrs_js = wallet.get_addresses().expect("get_addresses failed");
+    let addrs: serde_json::Value =
+        serde_wasm_bindgen::from_value(addrs_js).expect("address payload should deserialize");
+    assert_eq!(addrs["account_index"].as_u64(), Some(2));
+
+    let accounts_js = wallet.get_accounts(3).expect("get_accounts failed");
+    let accounts: Vec<serde_json::Value> =
+        serde_wasm_bindgen::from_value(accounts_js).expect("accounts should deserialize");
+    let active_account = accounts
+        .iter()
+        .find(|acc| acc.get("index").and_then(|v| v.as_u64()) == Some(2))
+        .expect("account index 2 should exist");
+
+    let account_taproot = active_account
+        .get("taprootAddress")
+        .and_then(|v| v.as_str())
+        .expect("account taprootAddress should be a string");
+    let current_taproot = addrs
+        .get("taproot")
+        .and_then(|v| v.as_str())
+        .expect("current taproot should be a string");
+    assert_eq!(
+        account_taproot, current_taproot,
+        "index-mode active taproot should match get_addresses output"
+    );
+
+    let account_payment = active_account
+        .get("paymentAddress")
+        .and_then(|v| v.as_str())
+        .expect("account paymentAddress should be a string");
+    let current_payment = addrs
+        .get("payment")
+        .and_then(|v| v.as_str())
+        .expect("current payment should be a string");
+    assert_eq!(
+        account_payment, current_payment,
+        "index-mode active payment should match get_addresses output"
+    );
+}
