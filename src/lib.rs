@@ -54,9 +54,10 @@ pub mod sign_intent;
 
 // Re-exports for convenience
 pub use builder::{
-    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest, DiscoveryAccountPlan,
-    DiscoveryContext, Seed64, SignOptions, SyncRequestType, SyncSleeper, WalletBuilder,
-    ZincBalance, ZincPersistence, ZincSyncRequest, ZincWallet,
+    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest, DerivationMode,
+    DiscoveryAccountPlan, DiscoveryContext, PaymentAddressType, Seed64, SignOptions,
+    SyncRequestType, SyncSleeper, WalletBuilder, ZincBalance, ZincPersistence, ZincSyncRequest,
+    ZincWallet,
 };
 pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
@@ -529,6 +530,8 @@ const ORD_SYNC_STALE_ERROR: &str =
 struct WalletState {
     network: Network,
     scheme: AddressScheme,
+    derivation_mode: DerivationMode,
+    payment_address_type: PaymentAddressType,
     account_index: u32,
 }
 
@@ -627,7 +630,11 @@ impl ZincWasmWallet {
         let active_index = account_index.unwrap_or(0);
 
         let mut builder = WalletBuilder::from_mnemonic(network, &mnemonic);
-        builder = builder.with_scheme(scheme).with_account_index(active_index);
+        builder = builder
+            .with_scheme(scheme)
+            .with_derivation_mode(DerivationMode::Account)
+            .with_payment_address_type(PaymentAddressType::NativeSegwit)
+            .with_account_index(active_index);
 
         if let Some(json) = persistence_json {
             builder = builder
@@ -643,6 +650,8 @@ impl ZincWasmWallet {
             state: Cell::new(WalletState {
                 network,
                 scheme,
+                derivation_mode: DerivationMode::Account,
+                payment_address_type: PaymentAddressType::NativeSegwit,
                 account_index: active_index,
             }),
             vitality: VITALITY_MAGIC,
@@ -758,6 +767,8 @@ impl ZincWasmWallet {
         let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
         builder = builder
             .with_scheme(new_scheme)
+            .with_derivation_mode(state.derivation_mode)
+            .with_payment_address_type(state.payment_address_type)
             .with_account_index(state.account_index);
 
         let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
@@ -787,6 +798,8 @@ impl ZincWasmWallet {
         let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
         builder = builder
             .with_scheme(state.scheme)
+            .with_derivation_mode(state.derivation_mode)
+            .with_payment_address_type(state.payment_address_type)
             .with_account_index(account_index);
 
         let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
@@ -822,6 +835,8 @@ impl ZincWasmWallet {
         let mut builder = WalletBuilder::from_mnemonic(new_network, &mnemonic);
         builder = builder
             .with_scheme(state.scheme)
+            .with_derivation_mode(state.derivation_mode)
+            .with_payment_address_type(state.payment_address_type)
             .with_account_index(state.account_index);
 
         let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
@@ -835,6 +850,90 @@ impl ZincWasmWallet {
         )
     }
 
+    /// Switch logical account derivation mode.
+    pub fn set_derivation_mode(&self, mode_str: &str) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        let new_mode = match mode_str {
+            "account" => DerivationMode::Account,
+            "index" => DerivationMode::Index,
+            _ => return Err(JsValue::from_str("Invalid derivation mode")),
+        };
+        let state = self.state_snapshot();
+        if state.derivation_mode == new_mode {
+            return Ok(());
+        }
+
+        let mnemonic =
+            ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
+        builder = builder
+            .with_scheme(state.scheme)
+            .with_derivation_mode(new_mode)
+            .with_payment_address_type(state.payment_address_type)
+            .with_account_index(state.account_index);
+
+        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        self.replace_wallet(
+            next_wallet,
+            WalletState {
+                derivation_mode: new_mode,
+                ..state
+            },
+            "set_derivation_mode",
+        )
+    }
+
+    /// Get the current derivation mode label.
+    pub fn get_derivation_mode(&self) -> String {
+        match self.state_snapshot().derivation_mode {
+            DerivationMode::Account => "account".to_string(),
+            DerivationMode::Index => "index".to_string(),
+        }
+    }
+
+    /// Switch payment address type for dual scheme wallets.
+    pub fn set_payment_address_type(&self, address_type_str: &str) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        let new_type = match address_type_str {
+            "native" => PaymentAddressType::NativeSegwit,
+            "nested" => PaymentAddressType::NestedSegwit,
+            "legacy" => PaymentAddressType::Legacy,
+            _ => return Err(JsValue::from_str("Invalid payment address type")),
+        };
+        let state = self.state_snapshot();
+        if state.payment_address_type == new_type {
+            return Ok(());
+        }
+
+        let mnemonic =
+            ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
+        builder = builder
+            .with_scheme(state.scheme)
+            .with_derivation_mode(state.derivation_mode)
+            .with_payment_address_type(new_type)
+            .with_account_index(state.account_index);
+
+        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        self.replace_wallet(
+            next_wallet,
+            WalletState {
+                payment_address_type: new_type,
+                ..state
+            },
+            "set_payment_address_type",
+        )
+    }
+
+    /// Get the current payment address type label.
+    pub fn get_payment_address_type(&self) -> String {
+        match self.state_snapshot().payment_address_type {
+            PaymentAddressType::NativeSegwit => "native".to_string(),
+            PaymentAddressType::NestedSegwit => "nested".to_string(),
+            PaymentAddressType::Legacy => "legacy".to_string(),
+        }
+    }
+
     #[wasm_bindgen(js_name = get_accounts)]
     /// Enumerate account previews from index `0..count` for the active seed.
     pub fn get_accounts(&self, count: u32) -> Result<JsValue, JsValue> {
@@ -846,20 +945,23 @@ impl ZincWasmWallet {
         let state = self.state_snapshot();
         let network = state.network;
         let scheme = state.scheme;
+        let derivation_mode = state.derivation_mode;
+        let payment_address_type = state.payment_address_type;
 
         let mut accounts = Vec::new();
         for i in 0..count {
             let mut builder = WalletBuilder::from_mnemonic(network, &mnemonic);
-            builder = builder.with_scheme(scheme).with_account_index(i);
+            builder = builder
+                .with_scheme(scheme)
+                .with_derivation_mode(derivation_mode)
+                .with_payment_address_type(payment_address_type)
+                .with_account_index(i);
 
             // Build temporary wallet (no persistence)
             let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
 
             // Use peek_address for speed (no revealing/saving in memory)
-            let vault_addr = zwallet
-                .vault_wallet
-                .peek_address(KeychainKind::External, 0)
-                .address;
+            let vault_addr = zwallet.peek_taproot_address(0);
 
             let vault_pubkey = zwallet
                 .get_taproot_public_key(0)
@@ -869,13 +971,8 @@ impl ZincWasmWallet {
                 (
                     Some(
                         zwallet
-                            .payment_wallet
-                            .as_ref()
-                            .ok_or_else(|| {
-                                JsValue::from_str("Payment wallet missing in dual mode")
-                            })?
-                            .peek_address(KeychainKind::External, 0)
-                            .address
+                            .peek_payment_address(0)
+                            .ok_or_else(|| JsValue::from_str("Payment wallet missing in dual mode"))?
                             .to_string(),
                     ),
                     Some(
@@ -1237,6 +1334,8 @@ impl ZincWasmWallet {
         let state = self.state_snapshot();
         let network = state.network;
         let scheme = state.scheme;
+        let derivation_mode = state.derivation_mode;
+        let payment_address_type = state.payment_address_type;
         let account_gap_limit = account_gap_limit.max(1);
         let requested_address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
         // Strict scan policy: account discovery checks only main receive addresses (external/0).
@@ -1279,6 +1378,8 @@ impl ZincWasmWallet {
                 let mut builder = WalletBuilder::from_seed(network, seed);
                 builder = builder
                     .with_scheme(scheme)
+                    .with_derivation_mode(derivation_mode)
+                    .with_payment_address_type(payment_address_type)
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
@@ -1317,19 +1418,10 @@ impl ZincWasmWallet {
                 // on later derived addresses during recovery.
                 let has_activity =
                     account_is_active_from_receive_scan(address_scan_depth, |address_index| {
-                        let vault_addr = zwallet
-                            .vault_wallet
-                            .peek_address(KeychainKind::External, address_index)
-                            .address
-                            .to_string();
+                        let vault_addr = zwallet.peek_taproot_address(address_index).to_string();
 
                         let payment_addr = if scheme == AddressScheme::Dual {
-                            zwallet.payment_wallet.as_ref().map(|wallet| {
-                                wallet
-                                    .peek_address(KeychainKind::External, address_index)
-                                    .address
-                                    .to_string()
-                            })
+                            zwallet.peek_payment_address(address_index).map(|addr| addr.to_string())
                         } else {
                             None
                         };

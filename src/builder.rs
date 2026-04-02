@@ -126,6 +126,51 @@ pub enum AddressScheme {
     Dual,
 }
 
+/// Payment address branch type used in dual-scheme mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaymentAddressType {
+    /// BIP84 native segwit (bech32 `bc1q...` / `tb1q...`).
+    NativeSegwit,
+    /// BIP49 nested segwit (P2SH `3...` / `2...`).
+    NestedSegwit,
+    /// BIP44 legacy P2PKH (`1...` / `m|n...`).
+    Legacy,
+}
+
+impl Default for PaymentAddressType {
+    fn default() -> Self {
+        Self::NativeSegwit
+    }
+}
+
+impl PaymentAddressType {
+    #[must_use]
+    pub fn purpose(self) -> u32 {
+        match self {
+            Self::NativeSegwit => 84,
+            Self::NestedSegwit => 49,
+            Self::Legacy => 44,
+        }
+    }
+}
+
+/// Logical account mapping mode for descriptor derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DerivationMode {
+    /// Traditional account derivation: account=N, address index=0.
+    Account,
+    /// Index-style derivation: account=0, address index=N.
+    Index,
+}
+
+impl Default for DerivationMode {
+    fn default() -> Self {
+        Self::Account
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WasmSleeper;
@@ -200,6 +245,8 @@ pub struct WalletBuilder {
     network: Network,
     seed: Vec<u8>,
     scheme: AddressScheme,
+    derivation_mode: DerivationMode,
+    payment_address_type: PaymentAddressType,
     persistence: Option<ZincPersistence>,
     account_index: u32,
 }
@@ -214,6 +261,10 @@ pub struct ZincWallet {
     pub(crate) payment_wallet: Option<Wallet>,
     /// Current address scheme in use.
     pub(crate) scheme: AddressScheme,
+    /// Account derivation mode.
+    pub(crate) derivation_mode: DerivationMode,
+    /// Payment branch address type (used in dual scheme).
+    pub(crate) payment_address_type: PaymentAddressType,
     // Store original loaded changesets to merge with staged changes for full persistence
     /// Loaded taproot changeset baseline used for persistence merges.
     pub(crate) loaded_vault_changeset: bdk_wallet::ChangeSet,
@@ -298,12 +349,16 @@ pub struct DiscoveryAccountPlan {
     pub taproot_change_descriptor: String,
     /// Account taproot public key.
     pub taproot_public_key: String,
+    /// Receive index used for taproot lookups in this logical account.
+    pub taproot_receive_index: u32,
     /// Optional payment external descriptor template.
     pub payment_descriptor: Option<String>,
     /// Optional payment internal/change descriptor template.
     pub payment_change_descriptor: Option<String>,
     /// Optional payment public key.
     pub payment_public_key: Option<String>,
+    /// Optional payment receive index used for lookups in this logical account.
+    pub payment_receive_index: Option<u32>,
 }
 
 /// Precomputed account discovery context that avoids exposing raw xprv externally.
@@ -313,8 +368,46 @@ pub struct DiscoveryContext {
     pub network: Network,
     /// Address scheme for descriptors in this context.
     pub scheme: AddressScheme,
+    /// Account derivation mode for descriptor/account mapping.
+    pub derivation_mode: DerivationMode,
+    /// Payment branch type for dual descriptors.
+    pub payment_address_type: PaymentAddressType,
     /// Account plans to evaluate.
     pub accounts: Vec<DiscoveryAccountPlan>,
+}
+
+fn payment_descriptor_for_xprv(
+    xprv: &bdk_wallet::bitcoin::bip32::Xpriv,
+    address_type: PaymentAddressType,
+    coin_type: i32,
+    account: u32,
+    chain: u32,
+) -> String {
+    let purpose = address_type.purpose();
+    match address_type {
+        PaymentAddressType::NativeSegwit => {
+            format!("wpkh({}/{}'/{coin_type}'/{account}'/{chain}/*)", xprv, purpose)
+        }
+        PaymentAddressType::NestedSegwit => format!(
+            "sh(wpkh({}/{}'/{coin_type}'/{account}'/{chain}/*))",
+            xprv, purpose
+        ),
+        PaymentAddressType::Legacy => {
+            format!("pkh({}/{}'/{coin_type}'/{account}'/{chain}/*)", xprv, purpose)
+        }
+    }
+}
+
+fn payment_descriptor_for_xpub(
+    xpub: &bdk_wallet::bitcoin::bip32::Xpub,
+    address_type: PaymentAddressType,
+    chain: u32,
+) -> String {
+    match address_type {
+        PaymentAddressType::NativeSegwit => format!("wpkh({}/{chain}/*)", xpub),
+        PaymentAddressType::NestedSegwit => format!("sh(wpkh({}/{chain}/*))", xpub),
+        PaymentAddressType::Legacy => format!("pkh({}/{chain}/*)", xpub),
+    }
 }
 
 impl ZincWallet {
@@ -359,6 +452,37 @@ impl ZincWallet {
         self.scheme == AddressScheme::Unified
     }
 
+    /// Return the active derivation mode.
+    #[must_use]
+    pub fn derivation_mode(&self) -> DerivationMode {
+        self.derivation_mode
+    }
+
+    /// Return the active payment address type.
+    #[must_use]
+    pub fn payment_address_type(&self) -> PaymentAddressType {
+        self.payment_address_type
+    }
+
+    fn logical_account_path(&self, logical_account_index: u32) -> (u32, u32) {
+        match self.derivation_mode {
+            DerivationMode::Account => (logical_account_index, 0),
+            DerivationMode::Index => (0, logical_account_index),
+        }
+    }
+
+    fn active_receive_index(&self) -> u32 {
+        self.logical_account_path(self.account_index).1
+    }
+
+    fn active_derivation_account(&self) -> u32 {
+        self.logical_account_path(self.account_index).0
+    }
+
+    fn dual_payment_purpose(&self) -> u32 {
+        self.payment_address_type.purpose()
+    }
+
     /// Return `true` when wallet state indicates a full scan is needed.
     pub fn needs_full_scan(&self) -> bool {
         // If we have no transactions and the tip is at genesis (or missing), we likely need a full scan
@@ -367,6 +491,9 @@ impl ZincWallet {
 
     /// Reveal and return the next taproot receive address.
     pub fn next_taproot_address(&mut self) -> Result<Address, String> {
+        if self.derivation_mode == DerivationMode::Index {
+            return Ok(self.peek_taproot_address(0));
+        }
         let info = self
             .vault_wallet
             .reveal_next_address(KeychainKind::External);
@@ -375,8 +502,9 @@ impl ZincWallet {
 
     /// Peek a taproot receive address at `index` without advancing state.
     pub fn peek_taproot_address(&self, index: u32) -> Address {
+        let resolved_index = self.active_receive_index().saturating_add(index);
         self.vault_wallet
-            .peek_address(KeychainKind::External, index)
+            .peek_address(KeychainKind::External, resolved_index)
             .address
     }
 
@@ -385,6 +513,11 @@ impl ZincWallet {
     /// In unified mode this returns the next taproot address.
     pub fn get_payment_address(&mut self) -> Result<bitcoin::Address, String> {
         if self.scheme == AddressScheme::Dual {
+            if self.derivation_mode == DerivationMode::Index {
+                return self
+                    .peek_payment_address(0)
+                    .ok_or_else(|| "Payment wallet not initialized".to_string());
+            }
             if let Some(wallet) = &mut self.payment_wallet {
                 Ok(wallet.reveal_next_address(KeychainKind::External).address)
             } else {
@@ -400,9 +533,10 @@ impl ZincWallet {
     /// In unified mode this resolves to the taproot branch.
     pub fn peek_payment_address(&self, index: u32) -> Option<Address> {
         if self.scheme == AddressScheme::Dual {
+            let resolved_index = self.active_receive_index().saturating_add(index);
             self.payment_wallet
                 .as_ref()
-                .map(|w| w.peek_address(KeychainKind::External, index).address)
+                .map(|w| w.peek_address(KeychainKind::External, resolved_index).address)
         } else {
             Some(self.peek_taproot_address(index))
         }
@@ -491,14 +625,22 @@ impl ZincWallet {
     /// Build sync requests for taproot/payment wallets.
     pub fn prepare_requests(&self) -> ZincSyncRequest {
         let now = now_unix();
+        let active_receive_index = self.active_receive_index();
         // Strict scan policy: only track main receive addresses (external/0).
         // This intentionally avoids scanning non-main derived branches.
-        let vault =
-            SyncRequestType::Full(Self::main_only_full_scan_request(&self.vault_wallet, now));
+        let vault = SyncRequestType::Full(Self::main_only_full_scan_request(
+            &self.vault_wallet,
+            now,
+            active_receive_index,
+        ));
 
         let payment = self.payment_wallet.as_ref().map(|w| {
             // Same strict policy for payment wallet.
-            SyncRequestType::Full(Self::main_only_full_scan_request(w, now))
+            SyncRequestType::Full(Self::main_only_full_scan_request(
+                w,
+                now,
+                active_receive_index,
+            ))
         });
 
         ZincSyncRequest {
@@ -589,11 +731,13 @@ impl ZincWallet {
             .map_err(|e| format!("{:?}", e))?;
 
         let now = now_unix();
-        let vault_req = Self::main_only_full_scan_request(&self.vault_wallet, now);
+        let active_receive_index = self.active_receive_index();
+        let vault_req =
+            Self::main_only_full_scan_request(&self.vault_wallet, now, active_receive_index);
         let payment_req = self
             .payment_wallet
             .as_ref()
-            .map(|w| Self::main_only_full_scan_request(w, now));
+            .map(|w| Self::main_only_full_scan_request(w, now, active_receive_index));
 
         // 1. Sync Vault
         let vault_update = client
@@ -880,6 +1024,7 @@ impl ZincWallet {
             ));
         }
 
+        let active_receive_index = self.active_receive_index();
         let wallet = if self.scheme == AddressScheme::Dual {
             self.payment_wallet.as_mut().ok_or_else(|| {
                 ZincError::WalletError("Payment wallet not initialized".to_string())
@@ -895,7 +1040,7 @@ impl ZincWallet {
             .map_err(|e| ZincError::ConfigError(format!("Network mismatch: {e}")))?;
 
         let change_script = wallet
-            .peek_address(KeychainKind::External, 0)
+            .peek_address(KeychainKind::External, active_receive_index)
             .script_pubkey();
 
         let mut builder = wallet.build_tx();
@@ -1304,10 +1449,10 @@ impl ZincWallet {
         use bitcoin::secp256k1::{Message, Secp256k1};
 
         // 1. Identify which wallet/keychain owns this address
-        let index = 0;
+        let active_receive_index = self.active_receive_index();
         let vault_addr = self
             .vault_wallet
-            .peek_address(KeychainKind::External, index)
+            .peek_address(KeychainKind::External, active_receive_index)
             .address
             .to_string();
 
@@ -1315,7 +1460,7 @@ impl ZincWallet {
             (true, false)
         } else if let Some(w) = &self.payment_wallet {
             let pay_addr = w
-                .peek_address(KeychainKind::External, index)
+                .peek_address(KeychainKind::External, active_receive_index)
                 .address
                 .to_string();
             (false, address == pay_addr)
@@ -1330,8 +1475,12 @@ impl ZincWallet {
         // 2. Derive Key
         let secp = Secp256k1::new();
         // Derivation path components
-        let (purpose, chain) = if is_vault { (86, 0) } else { (84, 0) };
-        let priv_key = self.derive_private_key(purpose, chain, index)?;
+        let (purpose, chain) = if is_vault {
+            (86, 0)
+        } else {
+            (self.dual_payment_purpose(), 0)
+        };
+        let priv_key = self.derive_private_key(purpose, chain, 0)?;
 
         // 3. Sign Message
         let signature_hash = bitcoin::sign_message::signed_msg_hash(message);
@@ -1366,9 +1515,9 @@ impl ZincWallet {
     ///
     /// In unified mode this uses the same key family as taproot.
     pub fn get_payment_public_key(&self, index: u32) -> Result<String, String> {
-        // Dual uses 84 (SegWit), Unified uses 86 (same as taproot)
+        // Dual uses the selected payment family, unified mirrors taproot.
         let purpose = if self.scheme == AddressScheme::Dual {
-            84
+            self.dual_payment_purpose()
         } else {
             86
         };
@@ -1376,7 +1525,9 @@ impl ZincWallet {
     }
 
     fn derive_public_key(&self, purpose: u32, index: u32) -> Result<String, String> {
-        self.derive_public_key_internal(purpose, self.account_index, index)
+        let account = self.active_derivation_account();
+        let effective_index = self.active_receive_index().saturating_add(index);
+        self.derive_public_key_internal(purpose, account, effective_index)
     }
 
     fn derive_private_key(
@@ -1385,7 +1536,9 @@ impl ZincWallet {
         chain: u32,
         index: u32,
     ) -> Result<bitcoin::secp256k1::SecretKey, String> {
-        self.derive_private_key_internal(purpose, self.account_index, chain, index)
+        let account = self.active_derivation_account();
+        let effective_index = self.active_receive_index().saturating_add(index);
+        self.derive_private_key_internal(purpose, account, chain, effective_index)
     }
 
     fn derive_private_key_internal(
@@ -1559,10 +1712,18 @@ impl ZincWallet {
         let network = self.vault_wallet.network();
         let coin_type = i32::from(network != Network::Bitcoin);
 
-        for i in 0..count {
+        for logical_index in 0..count {
+            let (derivation_account, receive_index) = self.logical_account_path(logical_index);
+
             // Derive Vault Address
-            let vault_desc = format!("tr({}/86'/{coin_type}'/{i}'/0/*)", self.master_xprv);
-            let vault_change_desc = format!("tr({}/86'/{coin_type}'/{i}'/1/*)", self.master_xprv);
+            let vault_desc = format!(
+                "tr({}/86'/{coin_type}'/{derivation_account}'/0/*)",
+                self.master_xprv
+            );
+            let vault_change_desc = format!(
+                "tr({}/86'/{coin_type}'/{derivation_account}'/1/*)",
+                self.master_xprv
+            );
 
             // Temporary wallet for peeking
             if let Ok(vw) = Wallet::create(vault_desc, vault_change_desc)
@@ -1570,17 +1731,28 @@ impl ZincWallet {
                 .create_wallet_no_persist()
             {
                 let taproot_address = vw
-                    .peek_address(KeychainKind::External, 0)
+                    .peek_address(KeychainKind::External, receive_index)
                     .address
                     .to_string();
                 let taproot_public_key = self
-                    .derive_public_key_internal(86, i, 0)
+                    .derive_public_key_internal(86, derivation_account, receive_index)
                     .unwrap_or_default();
 
                 let (payment_address, payment_public_key) = if self.scheme == AddressScheme::Dual {
-                    let pay_desc = format!("wpkh({}/84'/{coin_type}'/{i}'/0/*)", self.master_xprv);
-                    let pay_change_desc =
-                        format!("wpkh({}/84'/{coin_type}'/{i}'/1/*)", self.master_xprv);
+                    let pay_desc = payment_descriptor_for_xprv(
+                        &self.master_xprv,
+                        self.payment_address_type,
+                        coin_type,
+                        derivation_account,
+                        0,
+                    );
+                    let pay_change_desc = payment_descriptor_for_xprv(
+                        &self.master_xprv,
+                        self.payment_address_type,
+                        coin_type,
+                        derivation_account,
+                        1,
+                    );
 
                     if let Ok(pw) = Wallet::create(pay_desc, pay_change_desc)
                         .network(network)
@@ -1588,13 +1760,17 @@ impl ZincWallet {
                     {
                         (
                             Some(
-                                pw.peek_address(KeychainKind::External, 0)
+                                pw.peek_address(KeychainKind::External, receive_index)
                                     .address
                                     .to_string(),
                             ),
                             Some(
-                                self.derive_public_key_internal(84, i, 0)
-                                    .unwrap_or_default(),
+                                self.derive_public_key_internal(
+                                    self.dual_payment_purpose(),
+                                    derivation_account,
+                                    receive_index,
+                                )
+                                .unwrap_or_default(),
                             ),
                         )
                     } else {
@@ -1608,8 +1784,8 @@ impl ZincWallet {
                 };
 
                 accounts.push(Account {
-                    index: i,
-                    label: format!("Account {}", i + 1),
+                    index: logical_index,
+                    label: format!("Account {}", logical_index + 1),
                     taproot_address,
                     taproot_public_key,
                     payment_address,
@@ -1634,31 +1810,41 @@ impl ZincWallet {
         master_xprv: bdk_wallet::bitcoin::bip32::Xpriv,
         network: Network,
         scheme: AddressScheme,
-        account_index: u32,
+        derivation_mode: DerivationMode,
+        payment_address_type: PaymentAddressType,
+        logical_account_index: u32,
     ) -> Result<DiscoveryAccountPlan, String> {
         use bitcoin::secp256k1::Secp256k1;
 
         let secp = Secp256k1::new();
         let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+        let (derivation_account, receive_index) = match derivation_mode {
+            DerivationMode::Account => (logical_account_index, 0),
+            DerivationMode::Index => (0, logical_account_index),
+        };
 
         let vault_path = [
             Self::child_hardened(86)?,
             Self::child_hardened(coin_type)?,
-            Self::child_hardened(account_index)?,
+            Self::child_hardened(derivation_account)?,
         ];
         let vault_account_xprv = master_xprv.derive_priv(&secp, &vault_path).map_err(|e| {
-            format!("Failed to derive taproot account xprv for account {account_index}: {e}")
+            format!(
+                "Failed to derive taproot account xprv for account {logical_account_index}: {e}"
+            )
         })?;
         let vault_account_xpub =
             bdk_wallet::bitcoin::bip32::Xpub::from_priv(&secp, &vault_account_xprv);
         let taproot_descriptor = format!("tr({}/0/*)", vault_account_xpub);
         let taproot_change_descriptor = format!("tr({}/1/*)", vault_account_xpub);
 
-        let vault_pub_path = [Self::child_normal(0)?, Self::child_normal(0)?];
+        let vault_pub_path = [Self::child_normal(0)?, Self::child_normal(receive_index)?];
         let vault_pubkey = vault_account_xpub
             .derive_pub(&secp, &vault_pub_path)
             .map_err(|e| {
-                format!("Failed to derive taproot public key for account {account_index}: {e}")
+                format!(
+                    "Failed to derive taproot public key for account {logical_account_index}: {e}"
+                )
             })?
             .public_key;
         let taproot_public_key = vault_pubkey.x_only_public_key().0.to_string();
@@ -1667,14 +1853,14 @@ impl ZincWallet {
             == AddressScheme::Dual
         {
             let payment_path = [
-                Self::child_hardened(84)?,
+                Self::child_hardened(payment_address_type.purpose())?,
                 Self::child_hardened(coin_type)?,
-                Self::child_hardened(account_index)?,
+                Self::child_hardened(derivation_account)?,
             ];
             let payment_account_xprv =
                 master_xprv.derive_priv(&secp, &payment_path).map_err(|e| {
                     format!(
-                        "Failed to derive payment account xprv for account {account_index}: {e}"
+                        "Failed to derive payment account xprv for account {logical_account_index}: {e}"
                     )
                 })?;
             let payment_account_xpub =
@@ -1682,14 +1868,24 @@ impl ZincWallet {
             let payment_pubkey = payment_account_xpub
                 .derive_pub(&secp, &vault_pub_path)
                 .map_err(|e| {
-                    format!("Failed to derive payment public key for account {account_index}: {e}")
+                    format!(
+                        "Failed to derive payment public key for account {logical_account_index}: {e}"
+                    )
                 })?
                 .public_key
                 .to_string();
 
             (
-                Some(format!("wpkh({}/0/*)", payment_account_xpub)),
-                Some(format!("wpkh({}/1/*)", payment_account_xpub)),
+                Some(payment_descriptor_for_xpub(
+                    &payment_account_xpub,
+                    payment_address_type,
+                    0,
+                )),
+                Some(payment_descriptor_for_xpub(
+                    &payment_account_xpub,
+                    payment_address_type,
+                    1,
+                )),
                 Some(payment_pubkey),
             )
         } else {
@@ -1697,13 +1893,19 @@ impl ZincWallet {
         };
 
         Ok(DiscoveryAccountPlan {
-            index: account_index,
+            index: logical_account_index,
             taproot_descriptor,
             taproot_change_descriptor,
             taproot_public_key,
+            taproot_receive_index: receive_index,
             payment_descriptor,
             payment_change_descriptor,
             payment_public_key,
+            payment_receive_index: if scheme == AddressScheme::Dual {
+                Some(receive_index)
+            } else {
+                None
+            },
         })
     }
 
@@ -1711,24 +1913,30 @@ impl ZincWallet {
         master_xprv: bdk_wallet::bitcoin::bip32::Xpriv,
         network: Network,
         scheme: AddressScheme,
+        derivation_mode: DerivationMode,
+        payment_address_type: PaymentAddressType,
         start: u32,
         count: u32,
     ) -> Result<DiscoveryContext, String> {
         let mut accounts = Vec::new();
         let end = start.saturating_add(count);
 
-        for account_index in start..end {
+        for logical_account_index in start..end {
             accounts.push(Self::account_discovery_plan_from_xprv(
                 master_xprv,
                 network,
                 scheme,
-                account_index,
+                derivation_mode,
+                payment_address_type,
+                logical_account_index,
             )?);
         }
 
         Ok(DiscoveryContext {
             network,
             scheme,
+            derivation_mode,
+            payment_address_type,
             accounts,
         })
     }
@@ -1743,6 +1951,8 @@ impl ZincWallet {
             self.master_xprv,
             self.vault_wallet.network(),
             self.scheme,
+            self.derivation_mode,
+            self.payment_address_type,
             start,
             count,
         )
@@ -1792,7 +2002,9 @@ impl ZincWallet {
             .create_wallet_no_persist()
             .map_err(|e| e.to_string())?;
 
-            let taproot_main = vault_wallet.peek_address(KeychainKind::External, 0).address;
+            let taproot_main = vault_wallet
+                .peek_address(KeychainKind::External, plan.taproot_receive_index)
+                .address;
             let taproot_stats = client
                 .get_address_stats(&taproot_main)
                 .await
@@ -1812,7 +2024,10 @@ impl ZincWallet {
                 {
                     if !has_activity {
                         let payment_main = created_wallet
-                            .peek_address(KeychainKind::External, 0)
+                            .peek_address(
+                                KeychainKind::External,
+                                plan.payment_receive_index.unwrap_or(0),
+                            )
                             .address;
                         let payment_stats = client
                             .get_address_stats(&payment_main)
@@ -1830,14 +2045,17 @@ impl ZincWallet {
 
             if has_activity {
                 let taproot_address = vault_wallet
-                    .peek_address(KeychainKind::External, 0)
+                    .peek_address(KeychainKind::External, plan.taproot_receive_index)
                     .address
                     .to_string();
                 let taproot_public_key = plan.taproot_public_key.clone();
                 let payment_address = if context.scheme == AddressScheme::Dual {
                     payment_wallet.as_ref().map(|wallet| {
                         wallet
-                            .peek_address(KeychainKind::External, 0)
+                            .peek_address(
+                                KeychainKind::External,
+                                plan.payment_receive_index.unwrap_or(0),
+                            )
                             .address
                             .to_string()
                     })
@@ -1867,18 +2085,68 @@ impl ZincWallet {
     fn main_only_full_scan_request(
         wallet: &Wallet,
         start_time: u64,
+        receive_index: u32,
     ) -> FullScanRequest<KeychainKind> {
         let main_receive_spk = wallet
-            .peek_address(KeychainKind::External, 0)
+            .peek_address(KeychainKind::External, receive_index)
             .script_pubkey();
 
         FullScanRequest::builder_at(start_time)
             .chain_tip(wallet.local_chain().tip())
             .spks_for_keychain(
                 KeychainKind::External,
-                std::iter::once((0u32, main_receive_spk)),
+                std::iter::once((receive_index, main_receive_spk)),
             )
             .build()
+    }
+
+    fn build_vault_wallet_for_logical_account(&self, logical_account_index: u32) -> Result<Wallet, String> {
+        let network = self.vault_wallet.network();
+        let coin_type = i32::from(network != Network::Bitcoin);
+        let (derivation_account, _) = self.logical_account_path(logical_account_index);
+        let vault_desc = format!(
+            "tr({}/86'/{coin_type}'/{derivation_account}'/0/*)",
+            self.master_xprv
+        );
+        let vault_change_desc = format!(
+            "tr({}/86'/{coin_type}'/{derivation_account}'/1/*)",
+            self.master_xprv
+        );
+        Wallet::create(vault_desc, vault_change_desc)
+            .network(network)
+            .create_wallet_no_persist()
+            .map_err(|e| e.to_string())
+    }
+
+    fn build_payment_wallet_for_logical_account(
+        &self,
+        logical_account_index: u32,
+    ) -> Result<Option<Wallet>, String> {
+        if self.scheme != AddressScheme::Dual {
+            return Ok(None);
+        }
+        let network = self.vault_wallet.network();
+        let coin_type = i32::from(network != Network::Bitcoin);
+        let (derivation_account, _) = self.logical_account_path(logical_account_index);
+        let pay_desc = payment_descriptor_for_xprv(
+            &self.master_xprv,
+            self.payment_address_type,
+            coin_type,
+            derivation_account,
+            0,
+        );
+        let pay_change_desc = payment_descriptor_for_xprv(
+            &self.master_xprv,
+            self.payment_address_type,
+            coin_type,
+            derivation_account,
+            1,
+        );
+        let wallet = Wallet::create(pay_desc, pay_change_desc)
+            .network(network)
+            .create_wallet_no_persist()
+            .map_err(|e| e.to_string())?;
+        Ok(Some(wallet))
     }
 
     /// Switch the active account and reset account-scoped runtime state.
@@ -1887,33 +2155,8 @@ impl ZincWallet {
             return Ok(());
         }
 
-        let network = self.vault_wallet.network();
-        let coin_type = i32::from(network != Network::Bitcoin);
-
-        // Rebuild Vault Wallet
-        let vault_desc = format!("tr({}/86'/{coin_type}'/{index}'/0/*)", self.master_xprv);
-        let vault_change_desc = format!("tr({}/86'/{coin_type}'/{index}'/1/*)", self.master_xprv);
-
-        let next_vault_wallet = Wallet::create(vault_desc, vault_change_desc)
-            .network(network)
-            .create_wallet_no_persist()
-            .map_err(|e| e.to_string())?;
-
-        // Rebuild Payment Wallet if in Dual mode
-        let next_payment_wallet = if self.scheme == AddressScheme::Dual {
-            let pay_desc = format!("wpkh({}/84'/{coin_type}'/{index}'/0/*)", self.master_xprv);
-            let pay_change_desc =
-                format!("wpkh({}/84'/{coin_type}'/{index}'/1/*)", self.master_xprv);
-
-            Some(
-                Wallet::create(pay_desc, pay_change_desc)
-                    .network(network)
-                    .create_wallet_no_persist()
-                    .map_err(|e| e.to_string())?,
-            )
-        } else {
-            None
-        };
+        let next_vault_wallet = self.build_vault_wallet_for_logical_account(index)?;
+        let next_payment_wallet = self.build_payment_wallet_for_logical_account(index)?;
 
         self.account_index = index;
         self.vault_wallet = next_vault_wallet;
@@ -1937,24 +2180,47 @@ impl ZincWallet {
         }
 
         self.scheme = scheme;
-        let network = self.vault_wallet.network();
-        let index = self.account_index;
-        let coin_type = i32::from(network != Network::Bitcoin);
+        self.payment_wallet = self.build_payment_wallet_for_logical_account(self.account_index)?;
+        self.loaded_payment_changeset = None;
+        self.ordinals_verified = false;
+        self.ordinals_metadata_complete = false;
+        self.account_generation = self.account_generation.wrapping_add(1);
 
-        if scheme == AddressScheme::Dual {
-            let pay_desc = format!("wpkh({}/84'/{coin_type}'/{index}'/0/*)", self.master_xprv);
-            let pay_change_desc =
-                format!("wpkh({}/84'/{coin_type}'/{index}'/1/*)", self.master_xprv);
+        Ok(())
+    }
 
-            self.payment_wallet = Some(
-                Wallet::create(pay_desc, pay_change_desc)
-                    .network(network)
-                    .create_wallet_no_persist()
-                    .map_err(|e| e.to_string())?,
-            );
-        } else {
-            self.payment_wallet = None;
+    /// Switch account mapping mode (`account` vs `index`) and rebind wallets.
+    pub fn set_derivation_mode(&mut self, mode: DerivationMode) -> Result<(), String> {
+        if self.derivation_mode == mode {
+            return Ok(());
         }
+
+        self.derivation_mode = mode;
+        self.vault_wallet = self.build_vault_wallet_for_logical_account(self.account_index)?;
+        self.payment_wallet = self.build_payment_wallet_for_logical_account(self.account_index)?;
+        self.loaded_vault_changeset = bdk_wallet::ChangeSet::default();
+        self.loaded_payment_changeset = None;
+        self.inscribed_utxos.clear();
+        self.inscriptions.clear();
+        self.ordinals_verified = false;
+        self.ordinals_metadata_complete = false;
+        self.is_syncing = false;
+        self.account_generation = self.account_generation.wrapping_add(1);
+
+        Ok(())
+    }
+
+    /// Switch payment address type and rebuild payment wallet when dual mode is enabled.
+    pub fn set_payment_address_type(&mut self, address_type: PaymentAddressType) -> Result<(), String> {
+        if self.payment_address_type == address_type {
+            return Ok(());
+        }
+        self.payment_address_type = address_type;
+        self.payment_wallet = self.build_payment_wallet_for_logical_account(self.account_index)?;
+        self.loaded_payment_changeset = None;
+        self.ordinals_verified = false;
+        self.ordinals_metadata_complete = false;
+        self.account_generation = self.account_generation.wrapping_add(1);
 
         Ok(())
     }
@@ -2009,6 +2275,8 @@ impl WalletBuilder {
             network,
             seed: seed.as_ref().to_vec(),
             scheme: AddressScheme::Unified,
+            derivation_mode: DerivationMode::Account,
+            payment_address_type: PaymentAddressType::NativeSegwit,
             persistence: None,
             account_index: 0,
         }
@@ -2028,6 +2296,8 @@ impl WalletBuilder {
             network,
             seed: seed.to_vec(),
             scheme: AddressScheme::Unified,
+            derivation_mode: DerivationMode::Account,
+            payment_address_type: PaymentAddressType::NativeSegwit,
             persistence: None,
             account_index: 0,
         }
@@ -2044,6 +2314,20 @@ impl WalletBuilder {
     /// Set active account index used for descriptor derivation.
     pub fn with_account_index(mut self, account_index: u32) -> Self {
         self.account_index = account_index;
+        self
+    }
+
+    #[must_use]
+    /// Set logical account derivation mode.
+    pub fn with_derivation_mode(mut self, derivation_mode: DerivationMode) -> Self {
+        self.derivation_mode = derivation_mode;
+        self
+    }
+
+    #[must_use]
+    /// Set payment address branch type used in dual scheme.
+    pub fn with_payment_address_type(mut self, payment_address_type: PaymentAddressType) -> Self {
+        self.payment_address_type = payment_address_type;
         self
     }
 
@@ -2068,13 +2352,22 @@ impl WalletBuilder {
             .map_err(|e| e.to_string())?;
 
         let coin_type = i32::from(self.network != Network::Bitcoin);
-        let account = self.account_index;
+        let (derivation_account, _receive_index) = match self.derivation_mode {
+            DerivationMode::Account => (self.account_index, 0),
+            DerivationMode::Index => (0, self.account_index),
+        };
 
         // 1. Vault Wallet (Always BIP-86 Taproot)
         // Manual descriptor construction for dynamic account index support
         // Template: tr(xprv/86'/coin'/account'/0/*)
-        let vault_desc_str = format!("tr({}/86'/{coin_type}'/{account}'/0/*)", xprv);
-        let vault_change_desc_str = format!("tr({}/86'/{coin_type}'/{account}'/1/*)", xprv);
+        let vault_desc_str = format!(
+            "tr({}/86'/{coin_type}'/{derivation_account}'/0/*)",
+            xprv
+        );
+        let vault_change_desc_str = format!(
+            "tr({}/86'/{coin_type}'/{derivation_account}'/1/*)",
+            xprv
+        );
 
         let (vault_wallet, loaded_vault_changeset) = if let Some(p) = &self.persistence {
             let (wallet, changeset) = if let Some(changeset) = &p.taproot {
@@ -2119,12 +2412,22 @@ impl WalletBuilder {
             (wallet, bdk_wallet::ChangeSet::default())
         };
 
-        // 2. Payment Wallet (Only for Dual Scheme: BIP-84 SegWit)
+        // 2. Payment Wallet (Only for Dual Scheme)
         let (payment_wallet, loaded_payment_changeset) = if self.scheme == AddressScheme::Dual {
-            // Manual descriptor construction for dynamic account index support
-            // Template: wpkh(xprv/84'/coin'/account'/0/*)
-            let payment_desc_str = format!("wpkh({}/84'/{coin_type}'/{account}'/0/*)", xprv);
-            let payment_change_desc_str = format!("wpkh({}/84'/{coin_type}'/{account}'/1/*)", xprv);
+            let payment_desc_str = payment_descriptor_for_xprv(
+                &xprv,
+                self.payment_address_type,
+                coin_type,
+                derivation_account,
+                0,
+            );
+            let payment_change_desc_str = payment_descriptor_for_xprv(
+                &xprv,
+                self.payment_address_type,
+                coin_type,
+                derivation_account,
+                1,
+            );
 
             let (wallet, changeset) = if let Some(p) = &self.persistence {
                 if let Some(changeset) = &p.payment {
@@ -2185,6 +2488,8 @@ impl WalletBuilder {
             vault_wallet,
             payment_wallet,
             scheme: self.scheme,
+            derivation_mode: self.derivation_mode,
+            payment_address_type: self.payment_address_type,
             loaded_vault_changeset,
             loaded_payment_changeset,
             account_index: self.account_index,
