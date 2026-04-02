@@ -1080,10 +1080,7 @@ impl ZincWasmWallet {
         match self.inner.try_borrow() {
             Ok(inner) => {
                 let account_idx = inner.account_index;
-                let vault_addr = inner
-                    .vault_wallet
-                    .peek_address(KeychainKind::External, 0)
-                    .address;
+                let vault_addr = inner.peek_taproot_address(0);
                 let vault_pubkey = inner
                     .get_taproot_public_key(0)
                     .unwrap_or_else(|_| "".to_string());
@@ -1100,11 +1097,8 @@ impl ZincWasmWallet {
                     (Some(vault_addr.to_string()), Some(vault_pubkey.clone()))
                 } else {
                     let addr = inner
-                        .payment_wallet
-                        .as_ref()
-                        .ok_or_else(|| JsValue::from_str("Payment wallet missing in dual mode"))?
-                        .peek_address(KeychainKind::External, 0)
-                        .address;
+                        .peek_payment_address(0)
+                        .ok_or_else(|| JsValue::from_str("Payment wallet missing in dual mode"))?;
                     let pubkey = inner
                         .get_payment_public_key(0)
                         .unwrap_or_else(|_| "".to_string());
