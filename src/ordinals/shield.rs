@@ -434,8 +434,18 @@ pub fn analyze_psbt_with_scope(
             }
         }
 
+        let vout_u32 = match u32::try_from(vout) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(OrdError::RequestFailed(format!(
+                    "Ordinal Shield Error: Output index {} exceeds u32 limit",
+                    vout
+                )));
+            }
+        };
+
         outputs_info.push(OutputInfo {
-            vout: vout as u32,
+            vout: vout_u32,
             value: output_value,
             script_pubkey: output.script_pubkey.to_hex_string(),
             address,
