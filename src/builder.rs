@@ -277,6 +277,8 @@ pub struct ZincWallet {
     pub(crate) inscribed_utxos: std::collections::HashSet<bitcoin::OutPoint>,
     /// Cached inscription metadata known to the wallet.
     pub(crate) inscriptions: Vec<crate::ordinals::types::Inscription>,
+    /// Cached read-only rune balances known to the wallet.
+    pub(crate) rune_balances: Vec<crate::ordinals::types::RuneBalance>,
     /// Whether ordinals protection state is currently verified.
     pub(crate) ordinals_verified: bool,
     /// Whether inscription metadata refresh has completed.
@@ -415,6 +417,12 @@ impl ZincWallet {
     #[must_use]
     pub fn inscriptions(&self) -> &[crate::ordinals::types::Inscription] {
         &self.inscriptions
+    }
+
+    /// Return the cached rune balances currently tracked by the wallet.
+    #[must_use]
+    pub fn rune_balances(&self) -> &[crate::ordinals::types::RuneBalance] {
+        &self.rune_balances
     }
 
     /// Return the current account generation counter.
@@ -791,6 +799,7 @@ impl ZincWallet {
         &mut self,
         inscriptions: Vec<crate::ordinals::types::Inscription>,
         protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+        rune_balances: Vec<crate::ordinals::types::RuneBalance>,
     ) -> usize {
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
@@ -807,6 +816,7 @@ impl ZincWallet {
 
         self.inscribed_utxos = protected_outpoints;
         self.inscriptions = inscriptions;
+        self.rune_balances = rune_balances;
         self.ordinals_verified = true;
         self.ordinals_metadata_complete = true;
 
@@ -834,6 +844,7 @@ impl ZincWallet {
 
         self.inscribed_utxos.clear();
         self.inscriptions = inscriptions;
+        self.rune_balances.clear();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = true;
 
@@ -905,6 +916,10 @@ impl ZincWallet {
             .map_err(|e| e.to_string())?;
         let wallet_height = self.vault_wallet.local_chain().tip().height();
         self.verify_ord_indexer_is_current(ord_height, wallet_height)?;
+        let rune_balances = client
+            .get_rune_balances_for_addresses(&addresses)
+            .await
+            .map_err(|e| format!("Failed to fetch rune balances: {}", e))?;
 
         let mut all_inscriptions = Vec::new();
         for addr_str in addresses {
@@ -925,6 +940,7 @@ impl ZincWallet {
         }
 
         self.inscriptions = all_inscriptions;
+        self.rune_balances = rune_balances;
         self.ordinals_metadata_complete = true;
         Ok(self.inscriptions.len())
     }
@@ -2165,6 +2181,7 @@ impl ZincWallet {
         self.loaded_payment_changeset = None;
         self.inscribed_utxos.clear();
         self.inscriptions.clear();
+        self.rune_balances.clear();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = false;
         self.is_syncing = false;
@@ -2182,6 +2199,7 @@ impl ZincWallet {
         self.scheme = scheme;
         self.payment_wallet = self.build_payment_wallet_for_logical_account(self.account_index)?;
         self.loaded_payment_changeset = None;
+        self.rune_balances.clear();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = false;
         self.account_generation = self.account_generation.wrapping_add(1);
@@ -2202,6 +2220,7 @@ impl ZincWallet {
         self.loaded_payment_changeset = None;
         self.inscribed_utxos.clear();
         self.inscriptions.clear();
+        self.rune_balances.clear();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = false;
         self.is_syncing = false;
@@ -2218,6 +2237,7 @@ impl ZincWallet {
         self.payment_address_type = address_type;
         self.payment_wallet = self.build_payment_wallet_for_logical_account(self.account_index)?;
         self.loaded_payment_changeset = None;
+        self.rune_balances.clear();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = false;
         self.account_generation = self.account_generation.wrapping_add(1);
@@ -2495,6 +2515,7 @@ impl WalletBuilder {
             account_index: self.account_index,
             inscribed_utxos: std::collections::HashSet::default(), // Initialize empty
             inscriptions: Vec::new(),
+            rune_balances: Vec::new(),
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             master_xprv: xprv,
@@ -2628,6 +2649,12 @@ mod tests {
                 content_length: None,
                 timestamp: None,
             });
+        wallet.rune_balances.push(crate::ordinals::types::RuneBalance {
+            rune: "NO•ORDINARY•KIND".to_string(),
+            amount: "1".to_string(),
+            divisibility: Some(0),
+            symbol: Some("🚪".to_string()),
+        });
         wallet.ordinals_verified = true;
         let original_generation = wallet.account_generation;
 
@@ -2638,6 +2665,7 @@ mod tests {
         assert!(wallet.loaded_payment_changeset.is_none());
         assert!(wallet.inscribed_utxos.is_empty());
         assert!(wallet.inscriptions.is_empty());
+        assert!(wallet.rune_balances.is_empty());
         assert!(!wallet.ordinals_verified);
         assert_eq!(wallet.account_generation, original_generation + 1);
     }
@@ -2654,9 +2682,19 @@ mod tests {
 
         let mut protected = std::collections::HashSet::new();
         protected.insert(bitcoin::OutPoint::null());
-        wallet.apply_verified_ordinals_update(Vec::new(), protected);
+        wallet.apply_verified_ordinals_update(
+            Vec::new(),
+            protected,
+            vec![crate::ordinals::types::RuneBalance {
+                rune: "NO•ORDINARY•KIND".to_string(),
+                amount: "10".to_string(),
+                divisibility: Some(0),
+                symbol: Some("🚪".to_string()),
+            }],
+        );
         assert!(wallet.ordinals_verified);
         assert!(!wallet.inscribed_utxos.is_empty());
+        assert_eq!(wallet.rune_balances.len(), 1);
 
         let count =
             wallet.apply_unverified_inscriptions_cache(vec![crate::ordinals::types::Inscription {
@@ -2672,8 +2710,69 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(wallet.inscriptions.len(), 1);
         assert!(wallet.inscribed_utxos.is_empty());
+        assert!(wallet.rune_balances.is_empty());
         assert!(!wallet.ordinals_verified);
         assert!(wallet.ordinals_metadata_complete);
+    }
+
+    #[test]
+    fn test_set_address_scheme_clears_rune_balances_and_ordinals_state() {
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let network = Network::Regtest;
+
+        let mut wallet = WalletBuilder::from_seed(network, Seed64::from_array(*seed))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .unwrap();
+        wallet.rune_balances.push(crate::ordinals::types::RuneBalance {
+            rune: "NO•ORDINARY•KIND".to_string(),
+            amount: "99".to_string(),
+            divisibility: Some(0),
+            symbol: Some("🚪".to_string()),
+        });
+        wallet.ordinals_verified = true;
+        wallet.ordinals_metadata_complete = true;
+        let original_generation = wallet.account_generation;
+
+        wallet.set_address_scheme(AddressScheme::Unified).unwrap();
+
+        assert_eq!(wallet.scheme, AddressScheme::Unified);
+        assert!(wallet.rune_balances.is_empty());
+        assert!(!wallet.ordinals_verified);
+        assert!(!wallet.ordinals_metadata_complete);
+        assert_eq!(wallet.account_generation, original_generation + 1);
+    }
+
+    #[test]
+    fn test_set_payment_address_type_clears_rune_balances_and_ordinals_state() {
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let network = Network::Regtest;
+
+        let mut wallet = WalletBuilder::from_seed(network, Seed64::from_array(*seed))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .unwrap();
+        wallet.rune_balances.push(crate::ordinals::types::RuneBalance {
+            rune: "NO•ORDINARY•KIND".to_string(),
+            amount: "21".to_string(),
+            divisibility: Some(0),
+            symbol: Some("🚪".to_string()),
+        });
+        wallet.ordinals_verified = true;
+        wallet.ordinals_metadata_complete = true;
+        let original_generation = wallet.account_generation;
+
+        wallet
+            .set_payment_address_type(PaymentAddressType::NestedSegwit)
+            .unwrap();
+
+        assert_eq!(wallet.payment_address_type, PaymentAddressType::NestedSegwit);
+        assert!(wallet.rune_balances.is_empty());
+        assert!(!wallet.ordinals_verified);
+        assert!(!wallet.ordinals_metadata_complete);
+        assert_eq!(wallet.account_generation, original_generation + 1);
     }
 
     #[test]

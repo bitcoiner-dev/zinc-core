@@ -1,9 +1,9 @@
 use crate::ordinals::error::OrdError;
-use crate::ordinals::types::Inscription;
+use crate::ordinals::types::{Inscription, RuneBalance};
 use bitcoin::OutPoint;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Debug)]
 /// Lightweight client for ord-compatible REST APIs.
@@ -18,6 +18,8 @@ struct AddressResponse {
     inscriptions: Vec<String>,
     #[serde(default)]
     outputs: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_json_value_or_default")]
+    runes_balances: serde_json::Value,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +29,8 @@ pub struct AddressAssetSnapshot {
     pub inscription_ids: Vec<String>,
     /// Outpoint strings potentially carrying protected assets.
     pub outputs: Vec<String>,
+    /// Aggregated rune balances for the address, when provided by the ord endpoint.
+    pub rune_balances: Vec<RuneBalance>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +149,185 @@ fn parse_offers_payload(body: &str) -> Result<Vec<String>, OrdError> {
     })
 }
 
+fn canonical_decimal_digits(value: &str) -> Option<String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = value.trim_start_matches('0');
+    if trimmed.is_empty() {
+        Some("0".to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn amount_value_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(raw) => canonical_decimal_digits(raw.trim()),
+        serde_json::Value::Number(number) => canonical_decimal_digits(&number.to_string()),
+        _ => None,
+    }
+}
+
+fn add_decimal_strings(lhs: &str, rhs: &str) -> Option<String> {
+    let lhs_digits = canonical_decimal_digits(lhs)?;
+    let rhs_digits = canonical_decimal_digits(rhs)?;
+
+    let lhs_bytes = lhs_digits.as_bytes();
+    let rhs_bytes = rhs_digits.as_bytes();
+    let mut i = lhs_bytes.len();
+    let mut j = rhs_bytes.len();
+    let mut carry: u8 = 0;
+    let mut output: Vec<u8> = Vec::with_capacity(lhs_bytes.len().max(rhs_bytes.len()) + 1);
+
+    while i > 0 || j > 0 || carry > 0 {
+        let left = if i > 0 {
+            i -= 1;
+            lhs_bytes[i] - b'0'
+        } else {
+            0
+        };
+        let right = if j > 0 {
+            j -= 1;
+            rhs_bytes[j] - b'0'
+        } else {
+            0
+        };
+        let sum = left + right + carry;
+        output.push((sum % 10) + b'0');
+        carry = sum / 10;
+    }
+
+    output.reverse();
+    String::from_utf8(output).ok()
+}
+
+fn merge_rune_balances(entries: impl IntoIterator<Item = RuneBalance>) -> Vec<RuneBalance> {
+    let mut merged: BTreeMap<String, RuneBalance> = BTreeMap::new();
+
+    for entry in entries {
+        if entry.rune.trim().is_empty() {
+            continue;
+        }
+        let Some(normalized_amount) = canonical_decimal_digits(&entry.amount) else {
+            continue;
+        };
+
+        if let Some(existing) = merged.get_mut(&entry.rune) {
+            if let Some(sum) = add_decimal_strings(&existing.amount, &normalized_amount) {
+                existing.amount = sum;
+            }
+            if existing.divisibility.is_none() {
+                existing.divisibility = entry.divisibility;
+            }
+            if existing.symbol.is_none() {
+                existing.symbol = entry.symbol;
+            }
+            continue;
+        }
+
+        merged.insert(
+            entry.rune.clone(),
+            RuneBalance {
+                rune: entry.rune,
+                amount: normalized_amount,
+                divisibility: entry.divisibility,
+                symbol: entry.symbol,
+            },
+        );
+    }
+
+    merged.into_values().collect()
+}
+
+fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
+    match value {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => {
+            let parsed = items
+                .iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::Array(tuple) if tuple.len() >= 2 => {
+                        let rune = tuple.first().and_then(serde_json::Value::as_str)?.trim();
+                        if rune.is_empty() {
+                            return None;
+                        }
+                        let amount = amount_value_to_string(tuple.get(1)?)?;
+                        let symbol = tuple.get(2).and_then(serde_json::Value::as_str).and_then(
+                            |value| {
+                                let trimmed = value.trim();
+                                if trimmed.is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                }
+                            },
+                        );
+                        Some(RuneBalance {
+                            rune: rune.to_string(),
+                            amount,
+                            divisibility: None,
+                            symbol,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            merge_rune_balances(parsed)
+        }
+        serde_json::Value::Object(map) => {
+            let parsed = map
+                .iter()
+                .filter_map(|(rune, meta)| {
+                    let rune_name = rune.trim();
+                    if rune_name.is_empty() {
+                        return None;
+                    }
+
+                    match meta {
+                        serde_json::Value::Object(obj) => {
+                            let amount =
+                                obj.get("amount").and_then(amount_value_to_string)?;
+                            let divisibility = obj
+                                .get("divisibility")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|value| u8::try_from(value).ok());
+                            let symbol =
+                                obj.get("symbol")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| {
+                                        let trimmed = value.trim();
+                                        if trimmed.is_empty() {
+                                            None
+                                        } else {
+                                            Some(trimmed.to_string())
+                                        }
+                                    });
+                            Some(RuneBalance {
+                                rune: rune_name.to_string(),
+                                amount,
+                                divisibility,
+                                symbol,
+                            })
+                        }
+                        other => {
+                            let amount = amount_value_to_string(other)?;
+                            Some(RuneBalance {
+                                rune: rune_name.to_string(),
+                                amount,
+                                divisibility: None,
+                                symbol: None,
+                            })
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            merge_rune_balances(parsed)
+        }
+        _ => Vec::new(),
+    }
+}
+
 impl OrdClient {
     /// Create a new client with the given base URL.
     pub fn new(base_url: String) -> Self {
@@ -176,6 +359,7 @@ impl OrdClient {
                 return Ok(AddressAssetSnapshot {
                     inscription_ids: Vec::new(),
                     outputs: Vec::new(),
+                    rune_balances: Vec::new(),
                 });
             }
             return Err(OrdError::RequestFailed(format!(
@@ -192,6 +376,7 @@ impl OrdClient {
         Ok(AddressAssetSnapshot {
             inscription_ids: data.inscriptions,
             outputs: data.outputs,
+            rune_balances: parse_runes_balances_value(&data.runes_balances),
         })
     }
 
@@ -263,6 +448,37 @@ impl OrdClient {
         }
 
         Ok(inscriptions)
+    }
+
+    /// Resolve rune balances for a single address.
+    ///
+    /// Prefers aggregated balances from `/address/<addr>` and falls back to
+    /// deriving balances from each listed output when needed.
+    pub async fn get_rune_balances(&self, address: &str) -> Result<Vec<RuneBalance>, OrdError> {
+        let snapshot = self.get_address_asset_snapshot(address).await?;
+        if !snapshot.rune_balances.is_empty() {
+            return Ok(snapshot.rune_balances);
+        }
+
+        let mut collected = Vec::new();
+        for outpoint_str in &snapshot.outputs {
+            let output = self.get_output_response(outpoint_str).await?;
+            collected.extend(parse_runes_balances_value(&output.runes));
+        }
+
+        Ok(merge_rune_balances(collected))
+    }
+
+    /// Resolve and aggregate rune balances across multiple addresses.
+    pub async fn get_rune_balances_for_addresses(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<RuneBalance>, OrdError> {
+        let mut collected = Vec::new();
+        for address in addresses {
+            collected.extend(self.get_rune_balances(address).await?);
+        }
+        Ok(merge_rune_balances(collected))
     }
 
     /// Resolve protected outpoints for assets referenced by an address.
@@ -419,7 +635,7 @@ impl OrdClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_offers_payload, OrdClient, OutputResponse};
+    use super::{parse_offers_payload, parse_runes_balances_value, OrdClient, OutputResponse};
 
     #[test]
     fn output_response_accepts_null_asset_fields() {
@@ -500,6 +716,84 @@ mod tests {
             )
             .expect_err("must fail");
         assert!(err.to_string().contains("missing required address field"));
+    }
+
+    #[test]
+    fn parse_runes_balances_supports_address_tuple_shape() {
+        let value: serde_json::Value = serde_json::json!([
+            ["NO•ORDINARY•KIND", "150000", "🚪"],
+            ["NO•ORDINARY•KIND", "50000", "🚪"],
+            ["SECOND", 5]
+        ]);
+
+        let balances = parse_runes_balances_value(&value);
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].rune, "NO•ORDINARY•KIND");
+        assert_eq!(balances[0].amount, "200000");
+        assert_eq!(balances[0].symbol.as_deref(), Some("🚪"));
+        assert_eq!(balances[1].rune, "SECOND");
+        assert_eq!(balances[1].amount, "5");
+    }
+
+    #[test]
+    fn parse_runes_balances_supports_output_object_shape() {
+        let value: serde_json::Value = serde_json::json!({
+            "NO•ORDINARY•KIND": {
+                "amount": 150000,
+                "divisibility": 0,
+                "symbol": "🚪"
+            },
+            "SECOND": {
+                "amount": "42"
+            }
+        });
+
+        let balances = parse_runes_balances_value(&value);
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].rune, "NO•ORDINARY•KIND");
+        assert_eq!(balances[0].amount, "150000");
+        assert_eq!(balances[0].divisibility, Some(0));
+        assert_eq!(balances[0].symbol.as_deref(), Some("🚪"));
+        assert_eq!(balances[1].rune, "SECOND");
+        assert_eq!(balances[1].amount, "42");
+    }
+
+    #[test]
+    fn parse_runes_balances_handles_null_and_empty_shapes() {
+        let null_balances = parse_runes_balances_value(&serde_json::Value::Null);
+        assert!(null_balances.is_empty());
+
+        let empty_array_balances = parse_runes_balances_value(&serde_json::json!([]));
+        assert!(empty_array_balances.is_empty());
+
+        let empty_object_balances = parse_runes_balances_value(&serde_json::json!({}));
+        assert!(empty_object_balances.is_empty());
+    }
+
+    #[test]
+    fn parse_runes_balances_ignores_malformed_entries() {
+        let tuple_shape: serde_json::Value = serde_json::json!([
+            ["NO•ORDINARY•KIND", "not-a-number", "🚪"],
+            ["", "10"],
+            ["GOOD•RUNE", "25"]
+        ]);
+
+        let tuple_balances = parse_runes_balances_value(&tuple_shape);
+        assert_eq!(tuple_balances.len(), 1);
+        assert_eq!(tuple_balances[0].rune, "GOOD•RUNE");
+        assert_eq!(tuple_balances[0].amount, "25");
+
+        let object_shape: serde_json::Value = serde_json::json!({
+            "BAD•RUNE": { "amount": "oops" },
+            "": { "amount": "10" },
+            "GOOD•RUNE": { "amount": 7, "divisibility": 0 }
+        });
+
+        let object_balances = parse_runes_balances_value(&object_shape);
+        assert_eq!(object_balances.len(), 1);
+        assert_eq!(object_balances[0].rune, "GOOD•RUNE");
+        assert_eq!(object_balances[0].amount, "7");
+        assert_eq!(object_balances[0].divisibility, Some(0));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

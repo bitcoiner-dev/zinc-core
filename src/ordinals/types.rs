@@ -101,6 +101,20 @@ pub struct Inscription {
     pub timestamp: Option<u64>,
 }
 
+/// Read-only rune holding view derived from ord-compatible APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuneBalance {
+    /// Rune name (for example `NO•ORDINARY•KIND`).
+    pub rune: String,
+    /// Raw integer amount serialized as a decimal string to preserve precision across WASM/JS.
+    pub amount: String,
+    /// Optional rune divisibility metadata from ord responses.
+    pub divisibility: Option<u8>,
+    /// Optional rune symbol metadata from ord responses.
+    pub symbol: Option<String>,
+}
+
 // Fallback for missing Satpoints (default to all zeros? Or option?)
 // For now, in our tests, we provide it.
 impl Default for Satpoint {
