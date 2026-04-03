@@ -59,6 +59,7 @@ fn main() -> Result<(), String> {
     wallet.apply_verified_ordinals_update(
         vec![tracked_inscription],
         HashSet::from([tracked_outpoint]),
+        Vec::new(),
     );
 
     let psbt = build_demo_psbt(tracked_outpoint, 10_000, 9_999)?;

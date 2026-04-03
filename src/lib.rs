@@ -69,7 +69,7 @@ pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
 #[cfg(not(target_arch = "wasm32"))]
 pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
-pub use ordinals::types::{Inscription, Satpoint};
+pub use ordinals::types::{Inscription, RuneBalance, Satpoint};
 pub use sign_intent::{
     build_pairing_transport_event, build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
     build_signed_pairing_complete_receipt, build_signed_sign_intent_approved_receipt,
@@ -1015,6 +1015,21 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Return cached read-only rune balances currently loaded in wallet state.
+    #[wasm_bindgen(js_name = getRuneBalances)]
+    pub fn get_rune_balances(&self) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => serde_wasm_bindgen::to_value(inner.rune_balances()).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize rune balances: {}", e))
+            }),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (get_rune_balances): {}",
+                e
+            ))),
+        }
+    }
+
     /// Return total, spendable, display-spendable, and inscribed balances.
     pub fn get_balance(&self) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
@@ -1590,7 +1605,33 @@ impl ZincWasmWallet {
                 )));
             }
 
-            // 2b. Fetch artifact metadata
+            // 2b. Fetch rune balances and artifact metadata
+            let rune_balances = match client.get_rune_balances_for_addresses(&addresses).await {
+                Ok(balances) => balances,
+                Err(e) => {
+                    zinc_log_debug!(
+                        target: LOG_TARGET_WASM,
+                        "Failed to fetch rune balances: {:?}",
+                        e
+                    );
+                    ZincWasmWallet::clear_syncing_if_generation_matches(
+                        &inner_rc,
+                        sync_generation,
+                    );
+                    if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
+                        &inner_rc,
+                        sync_generation,
+                        ORD_SYNC_STALE_ERROR,
+                    ) {
+                        return Err(stale);
+                    }
+                    return Err(JsValue::from_str(&format!(
+                        "Failed to fetch rune balances: {}",
+                        e
+                    )));
+                }
+            };
+
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: fetching inscriptions");
             let mut all_inscriptions = Vec::new();
             let mut protected_outpoints = std::collections::HashSet::new();
@@ -1670,7 +1711,11 @@ impl ZincWasmWallet {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
                         let c = inner
-                            .apply_verified_ordinals_update(all_inscriptions, protected_outpoints);
+                            .apply_verified_ordinals_update(
+                                all_inscriptions,
+                                protected_outpoints,
+                                rune_balances,
+                            );
                         inner.is_syncing = false; // FINISHED
                         c
                     }

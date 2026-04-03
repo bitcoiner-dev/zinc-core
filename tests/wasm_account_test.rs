@@ -88,6 +88,29 @@ fn test_get_accounts_dual_returns_public_keys() {
 }
 
 #[wasm_bindgen_test]
+fn test_get_rune_balances_returns_stable_empty_array_shape() {
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let wallet = ZincWasmWallet::new(
+        "regtest",
+        phrase,
+        Some("unified".to_string()),
+        None,
+        Some(0),
+    )
+    .expect("Failed to create wallet");
+
+    let balances_js = wallet
+        .get_rune_balances()
+        .expect("get_rune_balances should succeed");
+    let balances: Vec<serde_json::Value> =
+        serde_wasm_bindgen::from_value(balances_js).expect("balances should deserialize");
+    assert!(
+        balances.is_empty(),
+        "fresh wallet should expose an empty rune balance list"
+    );
+}
+
+#[wasm_bindgen_test]
 fn test_shared_receiver_methods_do_not_alias_trap() {
     let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     let wallet = ZincWasmWallet::new(

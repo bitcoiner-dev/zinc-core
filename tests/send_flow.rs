@@ -24,7 +24,7 @@ fn test_create_psbt_basic() {
         .expect("wallet build");
 
     // BYPASS SAFETY LOCK: Mark ordinals as verified (0 inscriptions)
-    wallet.apply_verified_ordinals_update(vec![], std::collections::HashSet::new());
+    wallet.apply_verified_ordinals_update(vec![], std::collections::HashSet::new(), vec![]);
 
     // For this test to pass, wallet needs UTXOs.
     // In a real scenario, we'd fund it first via regtest.
@@ -83,7 +83,7 @@ fn test_create_psbt_wrong_network() {
         .expect("wallet build");
 
     // BYPASS SAFETY LOCK: Mark ordinals as verified (0 inscriptions)
-    wallet.apply_verified_ordinals_update(vec![], std::collections::HashSet::new());
+    wallet.apply_verified_ordinals_update(vec![], std::collections::HashSet::new(), vec![]);
 
     // Mainnet address (wrong network)
     let recipient = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
@@ -140,7 +140,7 @@ fn test_create_psbt_wrapper_matches_typed_path_error_surface() {
         .build()
         .expect("wallet build");
 
-    wallet.apply_verified_ordinals_update(vec![], std::collections::HashSet::new());
+    wallet.apply_verified_ordinals_update(vec![], std::collections::HashSet::new(), vec![]);
 
     let recipient = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
     let amount_sats = 10_000;
