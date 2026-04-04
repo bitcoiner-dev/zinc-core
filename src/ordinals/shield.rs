@@ -17,6 +17,17 @@ pub enum WarningLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Inscription detected inside an unsigned tapscript (i.e. currently being minted).
+pub struct NewInscription {
+    /// The MIME type of the inscription.
+    pub content_type: String,
+    /// Base64 encoded payload body.
+    pub body_base64: String,
+    /// Index of the PSBT input that contains the inscription tapscript.
+    pub input_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Destination mapping for an inscription after simulated PSBT sat flow.
 pub struct InscriptionDestination {
     /// Destination output index, or `None` when inscription is burned to fee.
@@ -70,6 +81,9 @@ pub struct OutputInfo {
 pub struct AnalysisResult {
     /// Overall risk level.
     pub warning_level: WarningLevel,
+    #[serde(default)]
+    /// Inscriptions that are currently being minted in this transaction.
+    pub new_inscriptions: Vec<NewInscription>,
     /// Inscriptions that would be burned as fee.
     pub inscriptions_burned: Vec<String>, // List of inscription IDs
     /// Destination map keyed by inscription id.
@@ -218,6 +232,7 @@ pub fn analyze_psbt_with_scope(
 
     let mut inputs_info = Vec::new();
     let mut outputs_info = Vec::new();
+    let mut new_inscriptions = Vec::new();
 
     // Check SIGHASH safety
     // Only checking ECDSA sighash for now as we key off psbt.inputs[i].sighash_type
@@ -376,6 +391,118 @@ pub fn analyze_psbt_with_scope(
             inscriptions: input_inscriptions_ids,
         });
 
+        // Look for Ordinal envelopes in the witness/tap_scripts
+        for (_, (script, _)) in &input.tap_scripts {
+            let script_bytes = script.as_bytes();
+            let envelope_marker = [0x00, 0x63, 0x03, 0x6f, 0x72, 0x64];
+            let mut search_pos = 0;
+
+            while let Some(pos) = script_bytes[search_pos..]
+                .windows(envelope_marker.len())
+                .position(|window| window == envelope_marker)
+            {
+                let absolute_pos = search_pos + pos;
+                let mut cursor = absolute_pos + envelope_marker.len();
+                let mut content_type = "Unknown".to_string();
+                let mut body = Vec::new();
+                let mut is_valid = false;
+
+                // Parse Tags until OP_0 (Separator) or OP_ENDIF
+                while cursor < script_bytes.len() {
+                    let opcode = script_bytes[cursor];
+                    if opcode == 0x00 {
+                        cursor += 1;
+                        is_valid = true;
+                        break;
+                    }
+                    if opcode == 0x68 {
+                        cursor += 1;
+                        break;
+                    }
+
+                    if opcode == 0x01 { // Tag Push (OP_PUSHBYTES_1)
+                        if cursor + 1 >= script_bytes.len() { break; }
+                        let tag = script_bytes[cursor + 1];
+                        cursor += 2;
+
+                        if cursor >= script_bytes.len() { break; }
+                        let val_opcode = script_bytes[cursor];
+                        let (val_len, header_len) = if val_opcode <= 75 {
+                            (val_opcode as usize, 1)
+                        } else if val_opcode == 0x4c {
+                            if cursor + 2 <= script_bytes.len() { (script_bytes[cursor + 1] as usize, 2) } else { (0, 0) }
+                        } else if val_opcode == 0x4d {
+                            if cursor + 3 <= script_bytes.len() { (u16::from_le_bytes(script_bytes[cursor + 1..cursor + 3].try_into().unwrap()) as usize, 3) } else { (0, 0) }
+                        } else {
+                            (0, 0)
+                        };
+
+                        if header_len > 0 && cursor + header_len + val_len <= script_bytes.len() {
+                            let val_bytes = &script_bytes[cursor + header_len..cursor + header_len + val_len];
+                            if tag == 1 {
+                                if let Ok(ct) = String::from_utf8(val_bytes.to_vec()) {
+                                    content_type = ct;
+                                }
+                            }
+                            cursor += header_len + val_len;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        // Skip unknown tags
+                        if cursor >= script_bytes.len() { break; }
+                        let op = script_bytes[cursor];
+                        let (skip_len, header_len) = if op <= 75 {
+                            (op as usize, 1)
+                        } else if op == 0x4c {
+                            if cursor + 2 <= script_bytes.len() { (script_bytes[cursor + 1] as usize, 2) } else { (0, 0) }
+                        } else if op == 0x4d {
+                            if cursor + 3 <= script_bytes.len() { (u16::from_le_bytes(script_bytes[cursor + 1..cursor + 3].try_into().unwrap()) as usize, 3) } else { (0, 0) }
+                        } else {
+                            (0, 0)
+                        };
+                        cursor += header_len + skip_len;
+                    }
+                }
+
+                if is_valid {
+                    // Extract body
+                    while cursor < script_bytes.len() {
+                        let opcode = script_bytes[cursor];
+                        if opcode == 0x68 { // OP_ENDIF
+                            break;
+                        }
+                        
+                        let (val_len, header_len) = if opcode <= 75 {
+                            (opcode as usize, 1)
+                        } else if opcode == 0x4c {
+                            if cursor + 2 <= script_bytes.len() { (script_bytes[cursor + 1] as usize, 2) } else { (0, 0) }
+                        } else if opcode == 0x4d {
+                            if cursor + 3 <= script_bytes.len() { (u16::from_le_bytes(script_bytes[cursor + 1..cursor + 3].try_into().unwrap()) as usize, 3) } else { (0, 0) }
+                        } else {
+                            (0, 0)
+                        };
+
+                        if header_len > 0 && cursor + header_len + val_len <= script_bytes.len() {
+                            body.extend_from_slice(&script_bytes[cursor + header_len..cursor + header_len + val_len]);
+                            cursor += header_len + val_len;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                    new_inscriptions.push(NewInscription {
+                        content_type,
+                        body_base64: STANDARD.encode(&body),
+                        input_index: i,
+                    });
+                }
+
+                search_pos = absolute_pos + envelope_marker.len();
+            }
+        }
+
         total_input_value += value;
         accumulated_input_offset += value;
     }
@@ -500,6 +627,7 @@ pub fn analyze_psbt_with_scope(
 
     Ok(AnalysisResult {
         warning_level,
+        new_inscriptions,
         inscriptions_burned,
         inscription_destinations,
 
