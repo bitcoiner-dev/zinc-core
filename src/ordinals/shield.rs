@@ -392,21 +392,21 @@ pub fn analyze_psbt_with_scope(
 
         let mut output_inscriptions = Vec::new();
 
+        let vout_u32 = match u32::try_from(vout) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(OrdError::RequestFailed(format!(
+                    "Ordinal Shield Error: Output index {} exceeds u32 limit",
+                    vout
+                )));
+            }
+        };
+
         // Check which inscriptions fall into this output's range
         for (key, abs_offset, original_input_value) in &active_inscriptions {
             if *abs_offset >= current_output_offset && *abs_offset < output_end {
                 // Found destination!
                 let relative_offset = abs_offset - current_output_offset;
-
-                let vout_u32 = match u32::try_from(vout) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Err(OrdError::RequestFailed(format!(
-                            "Ordinal Shield Error: Output index {} exceeds u32 limit",
-                            vout
-                        )));
-                    }
-                };
 
                 inscription_destinations.insert(
                     key.clone(),
@@ -435,7 +435,7 @@ pub fn analyze_psbt_with_scope(
         }
 
         outputs_info.push(OutputInfo {
-            vout: vout as u32,
+            vout: vout_u32,
             value: output_value,
             script_pubkey: output.script_pubkey.to_hex_string(),
             address,
