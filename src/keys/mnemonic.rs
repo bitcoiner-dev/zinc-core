@@ -2,14 +2,16 @@
 
 use bip39::Mnemonic;
 use rand::rngs::OsRng;
-use zeroize::Zeroizing;
-
-use crate::error::ZincError;
-
-/// A wrapper around BIP-39 mnemonic with zeroization.
-pub struct ZincMnemonic {
-    inner: Mnemonic,
-}
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+ 
+ use crate::error::ZincError;
+ 
+ /// A wrapper around BIP-39 mnemonic with zeroization.
+ #[derive(Zeroize, ZeroizeOnDrop)]
+ pub struct ZincMnemonic {
+    #[zeroize(skip)]
+     inner: Mnemonic,
+ }
 
 impl ZincMnemonic {
     /// Generate a new random mnemonic.
@@ -42,7 +44,7 @@ impl ZincMnemonic {
 
     /// Get the mnemonic words as a vector.
     pub fn words(&self) -> Vec<String> {
-        self.inner.words().map(|w| w.to_string()).collect()
+        self.inner.words().map(|w: &str| w.to_string()).collect()
     }
 
     /// Get the mnemonic phrase as a string.
