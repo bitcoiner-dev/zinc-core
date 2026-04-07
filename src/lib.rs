@@ -164,14 +164,16 @@ pub fn decrypt_wallet_internal(
         .map_err(|e| ZincError::SerializationError(e.to_string()))?;
 
     let plaintext = crypto::decrypt_seed(&encrypted, password)?;
-
-    let phrase = String::from_utf8(plaintext.to_vec())
-        .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {}", e)))?;
+ 
+    let phrase = zeroize::Zeroizing::new(
+        String::from_utf8(plaintext.to_vec())
+            .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {}", e)))?,
+    );
 
     let mnemonic = ZincMnemonic::parse(&phrase)?;
-
-    Ok(WalletResult {
-        phrase: mnemonic.phrase(),
+ 
+     Ok(WalletResult {
+         phrase: mnemonic.phrase(),
         words: mnemonic.words(),
     })
 }
@@ -187,11 +189,11 @@ pub fn encrypt_secret_internal(secret: &str, password: &str) -> Result<String, Z
 /// Decrypt an encrypted secret JSON payload and recover UTF-8 plaintext.
 pub fn decrypt_secret_internal(encrypted_json: &str, password: &str) -> Result<String, ZincError> {
     let encrypted: crypto::EncryptedWallet = serde_json::from_str(encrypted_json)
-        .map_err(|e| ZincError::SerializationError(e.to_string()))?;
+         .map_err(|e| ZincError::SerializationError(e.to_string()))?;
     let plaintext = crypto::decrypt_seed(&encrypted, password)?;
-    String::from_utf8(plaintext.to_vec())
-        .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {}", e)))
-}
+    Ok(String::from_utf8(plaintext.to_vec())
+        .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {}", e)))?)
+ }
 
 // ============================================================================
 // WASM Bindings

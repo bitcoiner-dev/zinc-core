@@ -33,9 +33,11 @@ pub struct SignOptions {
     pub finalize: bool,
 }
 
-/// Strongly-typed 64-byte seed material used by canonical constructors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Seed64([u8; 64]);
+use zeroize::{Zeroize, ZeroizeOnDrop};
+ 
+ /// Strongly-typed 64-byte seed material used by canonical constructors.
+ #[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+ pub struct Seed64([u8; 64]);
 
 impl Seed64 {
     /// Create a seed wrapper from a 64-byte array.
