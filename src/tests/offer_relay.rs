@@ -70,7 +70,7 @@ fn parse_ok_frame_extracts_acceptance_and_message() {
     let ok = NostrRelayClient::parse_ok_frame(r#"["OK","abcd1234",true,"accepted"]"#, "abcd1234")
         .expect("valid ok frame");
 
-    assert_eq!(ok.0, true);
+    assert!(ok.0);
     assert_eq!(ok.1, "accepted");
 }
 

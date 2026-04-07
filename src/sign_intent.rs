@@ -1794,8 +1794,7 @@ fn ensure_supported_pairing_transport_event_kind(kind: u64) -> Result<(), ZincEr
         return Ok(());
     }
     Err(ZincError::OfferError(format!(
-        "unexpected nostr event kind {}, expected {}",
-        kind, PAIRING_TRANSPORT_EVENT_KIND
+        "unexpected nostr event kind {kind}, expected {PAIRING_TRANSPORT_EVENT_KIND}"
     )))
 }
 

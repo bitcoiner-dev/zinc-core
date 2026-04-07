@@ -99,10 +99,10 @@ impl ZincWallet {
                 _ => {
                     // Deterministic tie-breakers
                     let idx_order = b.index.cmp(&a.index);
-                    if idx_order != std::cmp::Ordering::Equal {
-                        idx_order
-                    } else {
+                    if idx_order == std::cmp::Ordering::Equal {
                         b.txid.cmp(&a.txid)
+                    } else {
+                        idx_order
                     }
                 }
             }
@@ -120,7 +120,7 @@ impl ZincWallet {
 
             let fee_sats = wallet
                 .calculate_fee(&tx.tx_node.tx)
-                .map(|f| f.to_sat())
+                .map(bitcoin::Amount::to_sat)
                 .unwrap_or(0);
 
             let confirmation_time = match tx.chain_position {

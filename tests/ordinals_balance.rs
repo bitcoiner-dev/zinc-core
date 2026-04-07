@@ -10,7 +10,7 @@ mod tests {
 
     // Helper to create a dummy OutPoint
     fn make_outpoint(i: u8) -> OutPoint {
-        let hash = format!("{:064x}", i);
+        let hash = format!("{i:064x}");
         OutPoint::new(Txid::from_str(&hash).unwrap(), 0)
     }
 

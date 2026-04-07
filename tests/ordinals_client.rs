@@ -14,7 +14,7 @@ mod tests {
         // Mock response
         // 1. Mock List Response
         let _m1 = server
-            .mock("GET", format!("/address/{}", address).as_str())
+            .mock("GET", format!("/address/{address}").as_str())
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(

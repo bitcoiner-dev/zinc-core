@@ -169,7 +169,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100)); // Give async time if needed? (Not needed for synchronous apply)
 
         if debug_test_logs_enabled() {
-            println!("DEBUG: Balance: {:?}", balance);
+            println!("DEBUG: Balance: {balance:?}");
         }
         // Without chain tip, it shows as trusted_pending (3.24 BTC)
         assert_eq!(

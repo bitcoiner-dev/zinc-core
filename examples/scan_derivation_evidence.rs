@@ -41,7 +41,7 @@ enum AddressScript {
 
 impl AddressScript {
     fn descriptor(self, xprv: &Xpriv, purpose: u32, coin_type: u32, account: u32) -> String {
-        let account_path = format!("{}/{purpose}'/{coin_type}'/{account}'", xprv);
+        let account_path = format!("{xprv}/{purpose}'/{coin_type}'/{account}'");
         match self {
             AddressScript::Tr => format!("tr({account_path}/0/*)"),
             AddressScript::Wpkh => format!("wpkh({account_path}/0/*)"),
@@ -51,7 +51,7 @@ impl AddressScript {
     }
 
     fn change_descriptor(self, xprv: &Xpriv, purpose: u32, coin_type: u32, account: u32) -> String {
-        let account_path = format!("{}/{purpose}'/{coin_type}'/{account}'", xprv);
+        let account_path = format!("{xprv}/{purpose}'/{coin_type}'/{account}'");
         match self {
             AddressScript::Tr => format!("tr({account_path}/1/*)"),
             AddressScript::Wpkh => format!("wpkh({account_path}/1/*)"),
@@ -135,11 +135,7 @@ fn parse_network(network: Option<&str>) -> BitcoinNetwork {
 }
 
 fn coin_type(network: BitcoinNetwork) -> u32 {
-    if network == BitcoinNetwork::Bitcoin {
-        0
-    } else {
-        1
-    }
+    u32::from(network != BitcoinNetwork::Bitcoin)
 }
 
 fn derive_address_for_account(
@@ -279,9 +275,7 @@ fn score_label(result: &CandidateResult) -> String {
 
 fn main() -> Result<(), String> {
     let maybe_path_arg = env::args().nth(1);
-    let vectors_path = maybe_path_arg
-        .map(PathBuf::from)
-        .unwrap_or_else(default_vectors_path);
+    let vectors_path = maybe_path_arg.map_or_else(default_vectors_path, PathBuf::from);
 
     if !Path::new(&vectors_path).exists() {
         return Err(format!(
@@ -311,13 +305,12 @@ fn main() -> Result<(), String> {
     );
 
     for vector in payload.vectors {
-        let title = vector
-            .label
-            .as_ref()
-            .map(|label| format!("{} ({})", vector.provider_id, label))
-            .unwrap_or_else(|| vector.provider_id.clone());
+        let title = vector.label.as_ref().map_or_else(
+            || vector.provider_id.clone(),
+            |label| format!("{} ({})", vector.provider_id, label),
+        );
         let network = parse_network(vector.network.as_deref());
-        println!("\n=== {} ===", title);
+        println!("\n=== {title} ===");
 
         let mnemonic = match Mnemonic::parse(vector.mnemonic.trim()) {
             Ok(m) => m,
@@ -358,7 +351,7 @@ fn main() -> Result<(), String> {
             );
             if result.matched != result.total {
                 for mismatch in result.mismatches.iter().take(3) {
-                    println!("    {}", mismatch);
+                    println!("    {mismatch}");
                 }
             }
         }

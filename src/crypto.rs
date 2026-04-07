@@ -106,8 +106,7 @@ fn derive_key(password: &str, salt: &str, version: u8) -> Result<Zeroizing<[u8; 
         2 => (V2_M_COST, V2_T_COST, V2_P_COST),
         _ => {
             return Err(ZincError::EncryptionError(format!(
-                "Unsupported wallet version: {}",
-                version
+                "Unsupported wallet version: {version}"
             )))
         }
     };

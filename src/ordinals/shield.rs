@@ -137,8 +137,7 @@ fn normalize_input_scope(
 
     if let Some(index) = deduped.iter().find(|&&idx| idx >= input_count) {
         return Err(OrdError::RequestFailed(format!(
-            "Ordinal Shield Error: input scope index {} is out of bounds ({} inputs).",
-            index, input_count
+            "Ordinal Shield Error: input scope index {index} is out of bounds ({input_count} inputs)."
         )));
     }
 
@@ -162,16 +161,14 @@ fn input_value_for_audit(
             .map(|output| Some(output.value.to_sat()))
             .ok_or_else(|| {
                 OrdError::RequestFailed(format!(
-                    "Ordinal Shield Error: Input #{} non_witness_utxo found but vout index {} invalid.",
-                    index, vout_idx
+                    "Ordinal Shield Error: Input #{index} non_witness_utxo found but vout index {vout_idx} invalid."
                 ))
             });
     }
 
     if require_metadata {
         return Err(OrdError::RequestFailed(format!(
-            "Ordinal Shield Error: Input #{} missing witness_utxo data. Cannot safely analyze.",
-            index
+            "Ordinal Shield Error: Input #{index} missing witness_utxo data. Cannot safely analyze."
         )));
     }
 
@@ -253,8 +250,7 @@ pub fn analyze_psbt_with_scope(
             if anyone_can_pay {
                 warning_level = WarningLevel::Warn;
                 warnings.push(format!(
-                    "Input #{} uses ANYONECANPAY. Inputs can be added.",
-                    i
+                    "Input #{i} uses ANYONECANPAY. Inputs can be added."
                 ));
             }
 
@@ -263,8 +259,7 @@ pub fn analyze_psbt_with_scope(
                     // SIGHASH_NONE
                     warning_level = WarningLevel::Danger;
                     warnings.push(format!(
-                        "Input #{} uses SIGHASH_NONE. Outputs can be changed!",
-                        i
+                        "Input #{i} uses SIGHASH_NONE. Outputs can be changed!"
                     ));
                 }
                 3 => {
@@ -274,8 +269,7 @@ pub fn analyze_psbt_with_scope(
                         warning_level = WarningLevel::Warn;
                     }
                     warnings.push(format!(
-                        "Input #{} uses SIGHASH_SINGLE. Check output matching.",
-                        i
+                        "Input #{i} uses SIGHASH_SINGLE. Check output matching."
                     ));
                 }
                 _ => {} // ALL (1) or others
@@ -334,15 +328,13 @@ pub fn analyze_psbt_with_scope(
                     i
                 );
                 return Err(OrdError::RequestFailed(format!(
-                    "Ordinal Shield Error: Input #{} non_witness_utxo found but vout index {} invalid.",
-                    i, vout_idx
+                    "Ordinal Shield Error: Input #{i} non_witness_utxo found but vout index {vout_idx} invalid."
                 )));
             }
         } else {
             zinc_log_debug!(target: LOG_TARGET_SHIELD, "analyze_psbt: BLIND SPOT at input #{} - returning error", i);
             return Err(OrdError::RequestFailed(format!(
-                "Ordinal Shield Error: Input #{} missing witness_utxo data. Cannot safely analyze.",
-                i
+                "Ordinal Shield Error: Input #{i} missing witness_utxo data. Cannot safely analyze."
             )));
         };
 
@@ -392,7 +384,7 @@ pub fn analyze_psbt_with_scope(
         });
 
         // Look for Ordinal envelopes in the witness/tap_scripts
-        for (_, (script, _)) in &input.tap_scripts {
+        for (script, _) in input.tap_scripts.values() {
             let script_bytes = script.as_bytes();
             let envelope_marker = [0x00, 0x63, 0x03, 0x6f, 0x72, 0x64];
             let mut search_pos = 0;
@@ -420,25 +412,44 @@ pub fn analyze_psbt_with_scope(
                         break;
                     }
 
-                    if opcode == 0x01 { // Tag Push (OP_PUSHBYTES_1)
-                        if cursor + 1 >= script_bytes.len() { break; }
+                    if opcode == 0x01 {
+                        // Tag Push (OP_PUSHBYTES_1)
+                        if cursor + 1 >= script_bytes.len() {
+                            break;
+                        }
                         let tag = script_bytes[cursor + 1];
                         cursor += 2;
 
-                        if cursor >= script_bytes.len() { break; }
+                        if cursor >= script_bytes.len() {
+                            break;
+                        }
                         let val_opcode = script_bytes[cursor];
                         let (val_len, header_len) = if val_opcode <= 75 {
                             (val_opcode as usize, 1)
                         } else if val_opcode == 0x4c {
-                            if cursor + 2 <= script_bytes.len() { (script_bytes[cursor + 1] as usize, 2) } else { (0, 0) }
+                            if cursor + 2 <= script_bytes.len() {
+                                (script_bytes[cursor + 1] as usize, 2)
+                            } else {
+                                (0, 0)
+                            }
                         } else if val_opcode == 0x4d {
-                            if cursor + 3 <= script_bytes.len() { (u16::from_le_bytes(script_bytes[cursor + 1..cursor + 3].try_into().unwrap()) as usize, 3) } else { (0, 0) }
+                            if cursor + 3 <= script_bytes.len() {
+                                (
+                                    u16::from_le_bytes(
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                    ) as usize,
+                                    3,
+                                )
+                            } else {
+                                (0, 0)
+                            }
                         } else {
                             (0, 0)
                         };
 
                         if header_len > 0 && cursor + header_len + val_len <= script_bytes.len() {
-                            let val_bytes = &script_bytes[cursor + header_len..cursor + header_len + val_len];
+                            let val_bytes =
+                                &script_bytes[cursor + header_len..cursor + header_len + val_len];
                             if tag == 1 {
                                 if let Ok(ct) = String::from_utf8(val_bytes.to_vec()) {
                                     content_type = ct;
@@ -450,14 +461,29 @@ pub fn analyze_psbt_with_scope(
                         }
                     } else {
                         // Skip unknown tags
-                        if cursor >= script_bytes.len() { break; }
+                        if cursor >= script_bytes.len() {
+                            break;
+                        }
                         let op = script_bytes[cursor];
                         let (skip_len, header_len) = if op <= 75 {
                             (op as usize, 1)
                         } else if op == 0x4c {
-                            if cursor + 2 <= script_bytes.len() { (script_bytes[cursor + 1] as usize, 2) } else { (0, 0) }
+                            if cursor + 2 <= script_bytes.len() {
+                                (script_bytes[cursor + 1] as usize, 2)
+                            } else {
+                                (0, 0)
+                            }
                         } else if op == 0x4d {
-                            if cursor + 3 <= script_bytes.len() { (u16::from_le_bytes(script_bytes[cursor + 1..cursor + 3].try_into().unwrap()) as usize, 3) } else { (0, 0) }
+                            if cursor + 3 <= script_bytes.len() {
+                                (
+                                    u16::from_le_bytes(
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                    ) as usize,
+                                    3,
+                                )
+                            } else {
+                                (0, 0)
+                            }
                         } else {
                             (0, 0)
                         };
@@ -469,29 +495,45 @@ pub fn analyze_psbt_with_scope(
                     // Extract body
                     while cursor < script_bytes.len() {
                         let opcode = script_bytes[cursor];
-                        if opcode == 0x68 { // OP_ENDIF
+                        if opcode == 0x68 {
+                            // OP_ENDIF
                             break;
                         }
-                        
+
                         let (val_len, header_len) = if opcode <= 75 {
                             (opcode as usize, 1)
                         } else if opcode == 0x4c {
-                            if cursor + 2 <= script_bytes.len() { (script_bytes[cursor + 1] as usize, 2) } else { (0, 0) }
+                            if cursor + 2 <= script_bytes.len() {
+                                (script_bytes[cursor + 1] as usize, 2)
+                            } else {
+                                (0, 0)
+                            }
                         } else if opcode == 0x4d {
-                            if cursor + 3 <= script_bytes.len() { (u16::from_le_bytes(script_bytes[cursor + 1..cursor + 3].try_into().unwrap()) as usize, 3) } else { (0, 0) }
+                            if cursor + 3 <= script_bytes.len() {
+                                (
+                                    u16::from_le_bytes(
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                    ) as usize,
+                                    3,
+                                )
+                            } else {
+                                (0, 0)
+                            }
                         } else {
                             (0, 0)
                         };
 
                         if header_len > 0 && cursor + header_len + val_len <= script_bytes.len() {
-                            body.extend_from_slice(&script_bytes[cursor + header_len..cursor + header_len + val_len]);
+                            body.extend_from_slice(
+                                &script_bytes[cursor + header_len..cursor + header_len + val_len],
+                            );
                             cursor += header_len + val_len;
                         } else {
                             break;
                         }
                     }
 
-                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
                     new_inscriptions.push(NewInscription {
                         content_type,
                         body_base64: STANDARD.encode(&body),
@@ -529,8 +571,7 @@ pub fn analyze_psbt_with_scope(
                     Ok(v) => v,
                     Err(_) => {
                         return Err(OrdError::RequestFailed(format!(
-                            "Ordinal Shield Error: Output index {} exceeds u32 limit",
-                            vout
+                            "Ordinal Shield Error: Output index {vout} exceeds u32 limit"
                         )));
                     }
                 };

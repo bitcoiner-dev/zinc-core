@@ -5,14 +5,11 @@ const DEMO_MNEMONIC: &str =
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), String> {
-    let esplora_url = match std::env::var("ESPLORA_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!(
-                "Set ESPLORA_URL to run this example (for example: https://mempool.space/api)"
-            );
-            return Ok(());
-        }
+    let esplora_url = if let Ok(url) = std::env::var("ESPLORA_URL") {
+        url
+    } else {
+        eprintln!("Set ESPLORA_URL to run this example (for example: https://mempool.space/api)");
+        return Ok(());
     };
 
     let mnemonic = ZincMnemonic::parse(DEMO_MNEMONIC).map_err(|e| e.to_string())?;

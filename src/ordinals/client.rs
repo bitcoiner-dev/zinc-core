@@ -89,14 +89,12 @@ impl OutputResponse {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 OrdError::RequestFailed(format!(
-                    "Output {} is missing required address field",
-                    requested_outpoint
+                    "Output {requested_outpoint} is missing required address field"
                 ))
             })?;
         let value = self.value.ok_or_else(|| {
             OrdError::RequestFailed(format!(
-                "Output {} is missing required value field",
-                requested_outpoint
+                "Output {requested_outpoint} is missing required value field"
             ))
         })?;
         let outpoint = self
@@ -244,35 +242,36 @@ fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
     match value {
         serde_json::Value::Null => Vec::new(),
         serde_json::Value::Array(items) => {
-            let parsed = items
-                .iter()
-                .filter_map(|item| match item {
-                    serde_json::Value::Array(tuple) if tuple.len() >= 2 => {
-                        let rune = tuple.first().and_then(serde_json::Value::as_str)?.trim();
-                        if rune.is_empty() {
-                            return None;
+            let parsed =
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        serde_json::Value::Array(tuple) if tuple.len() >= 2 => {
+                            let rune = tuple.first().and_then(serde_json::Value::as_str)?.trim();
+                            if rune.is_empty() {
+                                return None;
+                            }
+                            let amount = amount_value_to_string(tuple.get(1)?)?;
+                            let symbol = tuple.get(2).and_then(serde_json::Value::as_str).and_then(
+                                |value| {
+                                    let trimmed = value.trim();
+                                    if trimmed.is_empty() {
+                                        None
+                                    } else {
+                                        Some(trimmed.to_string())
+                                    }
+                                },
+                            );
+                            Some(RuneBalance {
+                                rune: rune.to_string(),
+                                amount,
+                                divisibility: None,
+                                symbol,
+                            })
                         }
-                        let amount = amount_value_to_string(tuple.get(1)?)?;
-                        let symbol = tuple.get(2).and_then(serde_json::Value::as_str).and_then(
-                            |value| {
-                                let trimmed = value.trim();
-                                if trimmed.is_empty() {
-                                    None
-                                } else {
-                                    Some(trimmed.to_string())
-                                }
-                            },
-                        );
-                        Some(RuneBalance {
-                            rune: rune.to_string(),
-                            amount,
-                            divisibility: None,
-                            symbol,
-                        })
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
             merge_rune_balances(parsed)
         }
         serde_json::Value::Object(map) => {
@@ -286,23 +285,22 @@ fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
 
                     match meta {
                         serde_json::Value::Object(obj) => {
-                            let amount =
-                                obj.get("amount").and_then(amount_value_to_string)?;
+                            let amount = obj.get("amount").and_then(amount_value_to_string)?;
                             let divisibility = obj
                                 .get("divisibility")
                                 .and_then(serde_json::Value::as_u64)
                                 .and_then(|value| u8::try_from(value).ok());
-                            let symbol =
-                                obj.get("symbol")
-                                    .and_then(serde_json::Value::as_str)
-                                    .and_then(|value| {
-                                        let trimmed = value.trim();
-                                        if trimmed.is_empty() {
-                                            None
-                                        } else {
-                                            Some(trimmed.to_string())
-                                        }
-                                    });
+                            let symbol = obj
+                                .get("symbol")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|value| {
+                                    let trimmed = value.trim();
+                                    if trimmed.is_empty() {
+                                        None
+                                    } else {
+                                        Some(trimmed.to_string())
+                                    }
+                                });
                             Some(RuneBalance {
                                 rune: rune_name.to_string(),
                                 amount,
@@ -371,7 +369,7 @@ impl OrdClient {
         let data: AddressResponse = response
             .json()
             .await
-            .map_err(|e| OrdError::RequestFailed(format!("Failed to parse Address JSON: {}", e)))?;
+            .map_err(|e| OrdError::RequestFailed(format!("Failed to parse Address JSON: {e}")))?;
 
         Ok(AddressAssetSnapshot {
             inscription_ids: data.inscriptions,
@@ -390,7 +388,7 @@ impl OrdClient {
             .send()
             .await
             .map_err(|e| {
-                OrdError::RequestFailed(format!("Failed to fetch details for {}: {}", id, e))
+                OrdError::RequestFailed(format!("Failed to fetch details for {id}: {e}"))
             })?;
 
         if !details_resp.status().is_success() {
@@ -402,7 +400,7 @@ impl OrdClient {
         }
 
         details_resp.json().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to parse Details JSON for {}: {}", id, e))
+            OrdError::RequestFailed(format!("Failed to parse Details JSON for {id}: {e}"))
         })
     }
 
@@ -410,7 +408,7 @@ impl OrdClient {
     pub async fn get_inscription_content(&self, id: &str) -> Result<InscriptionContent, OrdError> {
         let url = format!("{}/content/{}", self.base_url, id);
         let response = self.http_client.get(&url).send().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to fetch content for {}: {}", id, e))
+            OrdError::RequestFailed(format!("Failed to fetch content for {id}: {e}"))
         })?;
 
         if !response.status().is_success() {
@@ -428,7 +426,7 @@ impl OrdClient {
             .map(ToString::to_string);
 
         let bytes = response.bytes().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to read content body for {}: {}", id, e))
+            OrdError::RequestFailed(format!("Failed to read content body for {id}: {e}"))
         })?;
 
         Ok(InscriptionContent {
@@ -506,7 +504,7 @@ impl OrdClient {
             }
 
             let outpoint = outpoint_str.as_str().parse::<OutPoint>().map_err(|e| {
-                OrdError::RequestFailed(format!("Invalid outpoint {}: {}", outpoint_str, e))
+                OrdError::RequestFailed(format!("Invalid outpoint {outpoint_str}: {e}"))
             })?;
             protected.insert(outpoint);
         }
@@ -544,7 +542,7 @@ impl OrdClient {
             .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
         text.trim()
             .parse::<u32>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid blockheight: {}", e)))
+            .map_err(|e| OrdError::RequestFailed(format!("Invalid blockheight: {e}")))
     }
 
     /// Submit an offer PSBT to an ord-compatible `/offer` endpoint.
@@ -566,7 +564,7 @@ impl OrdClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_else(|_| "".to_string());
+            let text = response.text().await.unwrap_or_else(|_| String::new());
             return Err(OrdError::RequestFailed(format!(
                 "Offer submission failed: {status} {text}"
             )));
@@ -611,8 +609,7 @@ impl OrdClient {
             .await
             .map_err(|e| {
                 OrdError::RequestFailed(format!(
-                    "Failed to fetch output details for {}: {}",
-                    outpoint, e
+                    "Failed to fetch output details for {outpoint}: {e}"
                 ))
             })?;
 
@@ -625,10 +622,7 @@ impl OrdClient {
         }
 
         details_resp.json().await.map_err(|e| {
-            OrdError::RequestFailed(format!(
-                "Failed to parse Output JSON for {}: {}",
-                outpoint, e
-            ))
+            OrdError::RequestFailed(format!("Failed to parse Output JSON for {outpoint}: {e}"))
         })
     }
 }
