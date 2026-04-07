@@ -120,7 +120,7 @@ impl NostrRelayClient {
 
         let event_frame = Self::event_frame(event)?;
         socket
-            .send(Message::Text(event_frame.into()))
+            .send(Message::Text(event_frame))
             .await
             .map_err(|e| ZincError::OfferError(format!("failed to send event frame: {e}")))?;
 
@@ -224,7 +224,7 @@ impl NostrRelayClient {
         );
         let req_frame = Self::req_frame(&subscription_id, options.limit)?;
         socket
-            .send(Message::Text(req_frame.into()))
+            .send(Message::Text(req_frame))
             .await
             .map_err(|e| ZincError::OfferError(format!("failed to send req frame: {e}")))?;
 
@@ -280,7 +280,7 @@ impl NostrRelayClient {
         })??;
 
         let close = Self::close_frame(&subscription_id)?;
-        let _ = socket.send(Message::Text(close.into())).await;
+        let _ = socket.send(Message::Text(close)).await;
         Ok(events)
     }
 

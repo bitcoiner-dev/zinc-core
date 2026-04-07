@@ -101,8 +101,7 @@ pub fn create_offer(
         })?;
     if seller_payout_address.script_pubkey() != expected_seller_payout_address.script_pubkey() {
         return Err(ZincError::OfferError(format!(
-            "seller_payout_address must match wallet main payment address {}",
-            expected_seller_payout_address
+            "seller_payout_address must match wallet main payment address {expected_seller_payout_address}"
         )));
     }
 

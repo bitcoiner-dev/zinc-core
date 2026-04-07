@@ -3,7 +3,7 @@ use bitcoin::{OutPoint, Txid};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::str::FromStr;
 
-/// a unique location for an ordinal, defined by an OutPoint and an offset.
+/// a unique location for an ordinal, defined by an `OutPoint` and an offset.
 /// Format: `txid:vout:offset`
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Satpoint {
@@ -30,20 +30,19 @@ impl FromStr for Satpoint {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() < 3 {
             return Err(OrdError::RequestFailed(format!(
-                "Invalid satpoint format: {}",
-                s
+                "Invalid satpoint format: {s}"
             )));
         }
 
         let txid = parts[0]
             .parse::<Txid>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid txid in satpoint: {}", e)))?;
+            .map_err(|e| OrdError::RequestFailed(format!("Invalid txid in satpoint: {e}")))?;
         let vout = parts[1]
             .parse::<u32>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid vout in satpoint: {}", e)))?;
+            .map_err(|e| OrdError::RequestFailed(format!("Invalid vout in satpoint: {e}")))?;
         let offset = parts[2]
             .parse::<u64>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid offset in satpoint: {}", e)))?;
+            .map_err(|e| OrdError::RequestFailed(format!("Invalid offset in satpoint: {e}")))?;
 
         Ok(Satpoint {
             outpoint: OutPoint { txid, vout },

@@ -7,7 +7,7 @@ mod tests {
     use zinc_core::ordinals::shield::{analyze_psbt_with_scope, audit_psbt, is_safe_to_spend};
 
     fn make_outpoint(i: u8) -> OutPoint {
-        let hash = format!("{:064x}", i);
+        let hash = format!("{i:064x}");
         OutPoint::new(Txid::from_str(&hash).unwrap(), 0)
     }
 
@@ -190,8 +190,7 @@ mod tests {
         let err = result.expect_err("out-of-bounds scope must fail");
         assert!(
             err.to_string().contains("out of bounds"),
-            "unexpected error message: {}",
-            err
+            "unexpected error message: {err}"
         );
     }
 

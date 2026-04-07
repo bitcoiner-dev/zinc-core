@@ -3,15 +3,15 @@
 use bip39::Mnemonic;
 use rand::rngs::OsRng;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
- 
- use crate::error::ZincError;
- 
- /// A wrapper around BIP-39 mnemonic with zeroization.
- #[derive(Zeroize, ZeroizeOnDrop)]
- pub struct ZincMnemonic {
+
+use crate::error::ZincError;
+
+/// A wrapper around BIP-39 mnemonic with zeroization.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct ZincMnemonic {
     #[zeroize(skip)]
-     inner: Mnemonic,
- }
+    inner: Mnemonic,
+}
 
 impl ZincMnemonic {
     /// Generate a new random mnemonic.

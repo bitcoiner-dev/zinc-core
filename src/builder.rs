@@ -34,10 +34,10 @@ pub struct SignOptions {
 }
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
- 
- /// Strongly-typed 64-byte seed material used by canonical constructors.
- #[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
- pub struct Seed64([u8; 64]);
+
+/// Strongly-typed 64-byte seed material used by canonical constructors.
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct Seed64([u8; 64]);
 
 impl Seed64 {
     /// Create a seed wrapper from a 64-byte array.
@@ -131,19 +131,15 @@ pub enum AddressScheme {
 /// Payment address branch type used in dual-scheme mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PaymentAddressType {
     /// BIP84 native segwit (bech32 `bc1q...` / `tb1q...`).
+    #[default]
     NativeSegwit,
     /// BIP49 nested segwit (P2SH `3...` / `2...`).
     NestedSegwit,
     /// BIP44 legacy P2PKH (`1...` / `m|n...`).
     Legacy,
-}
-
-impl Default for PaymentAddressType {
-    fn default() -> Self {
-        Self::NativeSegwit
-    }
 }
 
 impl PaymentAddressType {
@@ -160,17 +156,13 @@ impl PaymentAddressType {
 /// Logical account mapping mode for descriptor derivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum DerivationMode {
     /// Traditional account derivation: account=N, address index=0.
+    #[default]
     Account,
     /// Index-style derivation: account=0, address index=N.
     Index,
-}
-
-impl Default for DerivationMode {
-    fn default() -> Self {
-        Self::Account
-    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -390,14 +382,13 @@ fn payment_descriptor_for_xprv(
     let purpose = address_type.purpose();
     match address_type {
         PaymentAddressType::NativeSegwit => {
-            format!("wpkh({}/{}'/{coin_type}'/{account}'/{chain}/*)", xprv, purpose)
+            format!("wpkh({xprv}/{purpose}'/{coin_type}'/{account}'/{chain}/*)")
         }
-        PaymentAddressType::NestedSegwit => format!(
-            "sh(wpkh({}/{}'/{coin_type}'/{account}'/{chain}/*))",
-            xprv, purpose
-        ),
+        PaymentAddressType::NestedSegwit => {
+            format!("sh(wpkh({xprv}/{purpose}'/{coin_type}'/{account}'/{chain}/*))")
+        }
         PaymentAddressType::Legacy => {
-            format!("pkh({}/{}'/{coin_type}'/{account}'/{chain}/*)", xprv, purpose)
+            format!("pkh({xprv}/{purpose}'/{coin_type}'/{account}'/{chain}/*)")
         }
     }
 }
@@ -408,9 +399,9 @@ fn payment_descriptor_for_xpub(
     chain: u32,
 ) -> String {
     match address_type {
-        PaymentAddressType::NativeSegwit => format!("wpkh({}/{chain}/*)", xpub),
-        PaymentAddressType::NestedSegwit => format!("sh(wpkh({}/{chain}/*))", xpub),
-        PaymentAddressType::Legacy => format!("pkh({}/{chain}/*)", xpub),
+        PaymentAddressType::NativeSegwit => format!("wpkh({xpub}/{chain}/*)"),
+        PaymentAddressType::NestedSegwit => format!("sh(wpkh({xpub}/{chain}/*))"),
+        PaymentAddressType::Legacy => format!("pkh({xpub}/{chain}/*)"),
     }
 }
 
@@ -544,9 +535,10 @@ impl ZincWallet {
     pub fn peek_payment_address(&self, index: u32) -> Option<Address> {
         if self.scheme == AddressScheme::Dual {
             let resolved_index = self.active_receive_index().saturating_add(index);
-            self.payment_wallet
-                .as_ref()
-                .map(|w| w.peek_address(KeychainKind::External, resolved_index).address)
+            self.payment_wallet.as_ref().map(|w| {
+                w.peek_address(KeychainKind::External, resolved_index)
+                    .address
+            })
         } else {
             Some(self.peek_taproot_address(index))
         }
@@ -674,14 +666,14 @@ impl ZincWallet {
             .map_err(|e| e.to_string())?;
 
         for event in vault_events {
-            all_events.push(format!("taproot:{:?}", event));
+            all_events.push(format!("taproot:{event:?}"));
         }
 
         // 2. Apply Payment Update
         if let (Some(w), Some(u)) = (&mut self.payment_wallet, payment_update) {
             let payment_events = w.apply_update_events(u).map_err(|e| e.to_string())?;
             for event in payment_events {
-                all_events.push(format!("payment:{:?}", event));
+                all_events.push(format!("payment:{event:?}"));
             }
         }
 
@@ -709,7 +701,7 @@ impl ZincWallet {
         self.vault_wallet = Wallet::create(vault_desc, vault_change_desc)
             .network(network)
             .create_wallet_no_persist()
-            .map_err(|e| format!("Failed to reset taproot wallet: {}", e))?;
+            .map_err(|e| format!("Failed to reset taproot wallet: {e}"))?;
         self.loaded_vault_changeset = bdk_wallet::ChangeSet::default();
 
         // 2. Reset Payment Wallet (if exists)
@@ -721,7 +713,7 @@ impl ZincWallet {
                 Wallet::create(pay_desc, pay_change_desc)
                     .network(network)
                     .create_wallet_no_persist()
-                    .map_err(|e| format!("Failed to reset payment wallet: {}", e))?,
+                    .map_err(|e| format!("Failed to reset payment wallet: {e}"))?,
             );
             self.loaded_payment_changeset = Some(bdk_wallet::ChangeSet::default());
         }
@@ -738,7 +730,7 @@ impl ZincWallet {
     pub async fn sync(&mut self, esplora_url: &str) -> Result<Vec<String>, String> {
         let client = esplora_client::Builder::new(esplora_url)
             .build_async_with_sleeper::<SyncSleeper>()
-            .map_err(|e| format!("{:?}", e))?;
+            .map_err(|e| format!("{e:?}"))?;
 
         let now = now_unix();
         let active_receive_index = self.active_receive_index();
@@ -861,8 +853,7 @@ impl ZincWallet {
         if ord_height < wallet_height.saturating_sub(1) {
             self.ordinals_verified = false;
             return Err(format!(
-                "Ord Indexer is lagging! Ord: {}, Wallet: {}. Safety lock engaged.",
-                ord_height, wallet_height
+                "Ord Indexer is lagging! Ord: {ord_height}, Wallet: {wallet_height}. Safety lock engaged."
             ));
         }
         Ok(())
@@ -890,14 +881,12 @@ impl ZincWallet {
             let snapshot = client
                 .get_address_asset_snapshot(&addr_str)
                 .await
-                .map_err(|e| format!("Failed to fetch for {}: {}", addr_str, e))?;
+                .map_err(|e| format!("Failed to fetch for {addr_str}: {e}"))?;
 
             let protected = client
                 .get_protected_outpoints_from_outputs(&snapshot.outputs)
                 .await
-                .map_err(|e| {
-                    format!("Failed to fetch protected outputs for {}: {}", addr_str, e)
-                })?;
+                .map_err(|e| format!("Failed to fetch protected outputs for {addr_str}: {e}"))?;
             protected_outpoints.extend(protected);
         }
 
@@ -921,22 +910,20 @@ impl ZincWallet {
         let rune_balances = client
             .get_rune_balances_for_addresses(&addresses)
             .await
-            .map_err(|e| format!("Failed to fetch rune balances: {}", e))?;
+            .map_err(|e| format!("Failed to fetch rune balances: {e}"))?;
 
         let mut all_inscriptions = Vec::new();
         for addr_str in addresses {
             let snapshot = client
                 .get_address_asset_snapshot(&addr_str)
                 .await
-                .map_err(|e| format!("Failed to fetch for {}: {}", addr_str, e))?;
+                .map_err(|e| format!("Failed to fetch for {addr_str}: {e}"))?;
 
             for inscription_id in snapshot.inscription_ids {
                 let inscription = client
                     .get_inscription_details(&inscription_id)
                     .await
-                    .map_err(|e| {
-                        format!("Failed to fetch details for {}: {}", inscription_id, e)
-                    })?;
+                    .map_err(|e| format!("Failed to fetch details for {inscription_id}: {e}"))?;
                 all_inscriptions.push(inscription);
             }
         }
@@ -1063,7 +1050,7 @@ impl ZincWallet {
 
         let mut builder = wallet.build_tx();
         if !self.inscribed_utxos.is_empty() {
-            builder.unspendable(self.inscribed_utxos.iter().cloned().collect());
+            builder.unspendable(self.inscribed_utxos.iter().copied().collect());
         }
 
         builder
@@ -1157,7 +1144,7 @@ impl ZincWallet {
 
         // Prepare BDK SignOptions and Apply Overrides (SIGHASH, etc.)
         // We do this BEFORE audit to ensuring we check the actual state being signed.
-        let should_finalize = options.as_ref().map(|o| o.finalize).unwrap_or(false);
+        let should_finalize = options.as_ref().is_some_and(|o| o.finalize);
         let bdk_options = bdk_wallet::SignOptions {
             // CRITICAL: Enable trust_witness_utxo for batch inscriptions where reveal
             // transactions spend outputs from not-yet-broadcast commit transactions.
@@ -1173,8 +1160,9 @@ impl ZincWallet {
         if let Some(opts) = &options {
             if let Some(sighash_u8) = opts.sighash {
                 // Use PsbtSighashType to match psbt.inputs type
-                let target_sighash = bitcoin::psbt::PsbtSighashType::from_u32(sighash_u8 as u32);
-                for input in psbt.inputs.iter_mut() {
+                let target_sighash =
+                    bitcoin::psbt::PsbtSighashType::from_u32(u32::from(sighash_u8));
+                for input in &mut psbt.inputs {
                     input.sighash_type = Some(target_sighash);
                 }
             }
@@ -1193,15 +1181,13 @@ impl ZincWallet {
                 }
                 if !seen.insert(*index) {
                     return Err(format!(
-                        "Security Violation: sign_inputs index {} is duplicated",
-                        index
+                        "Security Violation: sign_inputs index {index} is duplicated"
                     ));
                 }
                 let input = &psbt.inputs[*index];
                 if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
                     return Err(format!(
-                        "Security Violation: Requested input #{} is missing UTXO metadata",
-                        index
+                        "Security Violation: Requested input #{index} is missing UTXO metadata"
                     ));
                 }
             }
@@ -1216,8 +1202,7 @@ impl ZincWallet {
 
                 if anyone_can_pay || !is_allowed_base {
                     return Err(format!(
-                        "Security Violation: Sighash type is not allowed on input #{} (value={})",
-                        index, value
+                        "Security Violation: Sighash type is not allowed on input #{index} (value={value})"
                     ));
                 }
             }
@@ -1244,7 +1229,7 @@ impl ZincWallet {
             inputs_to_sign.as_deref(),
             self.vault_wallet.network(),
         ) {
-            return Err(format!("Security Violation: {}", e));
+            return Err(format!("Security Violation: {e}"));
         }
 
         // Keep a copy if we need to revert signatures for specific inputs
@@ -1300,28 +1285,13 @@ impl ZincWallet {
 
                 if !signature_changed {
                     return Err(format!(
-                        "Security Violation: Requested input #{} was not signed by this wallet",
-                        index
+                        "Security Violation: Requested input #{index} was not signed by this wallet"
                     ));
                 }
             }
         }
 
-        // POST-SIGNING: Log the signature state for debugging
-        // With try_finalize: false, BDK places signatures in:
-        // - tap_key_sig for Taproot key-path spends
-        // - tap_script_sig for Taproot script-path spends (not used for wallet inputs)
-        // - partial_sigs for SegWit P2WPKH spends
-        for (_i, input) in psbt.inputs.iter().enumerate() {
-            if input.tap_key_sig.is_some() {
-            } else if !input.tap_script_sigs.is_empty() {
-            } else if !input.partial_sigs.is_empty() {
-            } else if input.final_script_witness.is_some() {
-                // This shouldn't happen with try_finalize: false, but log it
-            } else {
-                // Input not signed by this wallet - could be unsigned or signed by another party
-            }
-        }
+        // Validation: Verify all requested inputs were signed
 
         let signed_bytes = psbt.serialize();
         let signed_base64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
@@ -1330,7 +1300,7 @@ impl ZincWallet {
     }
 
     /// Analyzes a PSBT for Ordinal Shield protection.
-    /// Returns a JSON string containing the AnalysisResult.
+    /// Returns a JSON string containing the `AnalysisResult`.
     pub fn analyze_psbt(&self, psbt_base64: &str) -> Result<String, String> {
         // Use explicit path to avoid re-export issues if any
         use crate::ordinals::shield::analyze_psbt;
@@ -1375,7 +1345,6 @@ impl ZincWallet {
             }
         }
 
-        if enriched_count > 0 {}
 
         // Build Known Inscriptions Map from internal state
         // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
@@ -1460,7 +1429,7 @@ impl ZincWallet {
     }
 
     /// Sign a message with the private key corresponding to the given address.
-    /// Supports both Vault (Taproot) and Payment (SegWit) addresses.
+    /// Supports both Vault (Taproot) and Payment (`SegWit`) addresses.
     pub fn sign_message(&self, address: &str, message: &str) -> Result<String, String> {
         use base64::Engine;
         use bitcoin::hashes::Hash;
@@ -1568,11 +1537,7 @@ impl ZincWallet {
     ) -> Result<bitcoin::secp256k1::SecretKey, String> {
         use bitcoin::secp256k1::Secp256k1;
         let secp = Secp256k1::new();
-        let coin_type = if self.vault_wallet.network() == Network::Bitcoin {
-            0
-        } else {
-            1
-        };
+        let coin_type = u32::from(self.vault_wallet.network() != Network::Bitcoin);
 
         let derivation_path = [
             bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
@@ -1592,9 +1557,9 @@ impl ZincWallet {
 
     /// Sign inscription reveal script-path inputs that BDK's standard signer missed.
     ///
-    /// BDK checks tap_key_origins fingerprint to match wallet keys. Since the inscription
+    /// BDK checks `tap_key_origins` fingerprint to match wallet keys. Since the inscription
     /// backend uses empty fingerprints, BDK skips these inputs. This method manually
-    /// signs if the public key in tap_key_origins matches our ordinals key.
+    /// signs if the public key in `tap_key_origins` matches our ordinals key.
     fn sign_inscription_script_paths(
         &self,
         psbt: &mut Psbt,
@@ -1608,11 +1573,7 @@ impl ZincWallet {
         let secp = Secp256k1::new();
 
         // Derive the ordinals key (m/86'/coin'/account'/0/0)
-        let coin_type = if self.vault_wallet.network() == Network::Bitcoin {
-            0
-        } else {
-            1
-        };
+        let coin_type = u32::from(self.vault_wallet.network() != Network::Bitcoin);
         let derivation_path = [
             bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
             bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
@@ -1669,8 +1630,7 @@ impl ZincWallet {
             let has_our_key_origin = input.tap_key_origins.keys().any(|k| *k == ordinals_xonly);
             let has_matching_internal_key = input
                 .tap_internal_key
-                .map(|key| key == ordinals_xonly)
-                .unwrap_or(false);
+                .is_some_and(|key| key == ordinals_xonly);
             if !has_our_key_origin && !has_matching_internal_key {
                 continue;
             }
@@ -1680,7 +1640,7 @@ impl ZincWallet {
                 .tap_scripts
                 .iter()
                 .next()
-                .ok_or_else(|| format!("Input {} has empty tap_scripts", i))?;
+                .ok_or_else(|| format!("Input {i} has empty tap_scripts"))?;
 
             let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
 
@@ -1693,7 +1653,7 @@ impl ZincWallet {
                     leaf_hash,
                     TapSighashType::Default,
                 )
-                .map_err(|e| format!("Failed to compute script sighash for input {}: {e}", i))?;
+                .map_err(|e| format!("Failed to compute script sighash for input {i}: {e}"))?;
 
             // Sign it
             let msg = Message::from_digest_slice(sighash.as_ref())
@@ -1835,7 +1795,7 @@ impl ZincWallet {
         use bitcoin::secp256k1::Secp256k1;
 
         let secp = Secp256k1::new();
-        let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+        let coin_type = u32::from(network != Network::Bitcoin);
         let (derivation_account, receive_index) = match derivation_mode {
             DerivationMode::Account => (logical_account_index, 0),
             DerivationMode::Index => (0, logical_account_index),
@@ -1853,8 +1813,8 @@ impl ZincWallet {
         })?;
         let vault_account_xpub =
             bdk_wallet::bitcoin::bip32::Xpub::from_priv(&secp, &vault_account_xprv);
-        let taproot_descriptor = format!("tr({}/0/*)", vault_account_xpub);
-        let taproot_change_descriptor = format!("tr({}/1/*)", vault_account_xpub);
+        let taproot_descriptor = format!("tr({vault_account_xpub}/0/*)");
+        let taproot_change_descriptor = format!("tr({vault_account_xpub}/1/*)");
 
         let vault_pub_path = [Self::child_normal(0)?, Self::child_normal(receive_index)?];
         let vault_pubkey = vault_account_xpub
@@ -2118,7 +2078,10 @@ impl ZincWallet {
             .build()
     }
 
-    fn build_vault_wallet_for_logical_account(&self, logical_account_index: u32) -> Result<Wallet, String> {
+    fn build_vault_wallet_for_logical_account(
+        &self,
+        logical_account_index: u32,
+    ) -> Result<Wallet, String> {
         let network = self.vault_wallet.network();
         let coin_type = i32::from(network != Network::Bitcoin);
         let (derivation_account, _) = self.logical_account_path(logical_account_index);
@@ -2232,7 +2195,10 @@ impl ZincWallet {
     }
 
     /// Switch payment address type and rebuild payment wallet when dual mode is enabled.
-    pub fn set_payment_address_type(&mut self, address_type: PaymentAddressType) -> Result<(), String> {
+    pub fn set_payment_address_type(
+        &mut self,
+        address_type: PaymentAddressType,
+    ) -> Result<(), String> {
         if self.payment_address_type == address_type {
             return Ok(());
         }
@@ -2382,14 +2348,9 @@ impl WalletBuilder {
         // 1. Vault Wallet (Always BIP-86 Taproot)
         // Manual descriptor construction for dynamic account index support
         // Template: tr(xprv/86'/coin'/account'/0/*)
-        let vault_desc_str = format!(
-            "tr({}/86'/{coin_type}'/{derivation_account}'/0/*)",
-            xprv
-        );
-        let vault_change_desc_str = format!(
-            "tr({}/86'/{coin_type}'/{derivation_account}'/1/*)",
-            xprv
-        );
+        let vault_desc_str = format!("tr({xprv}/86'/{coin_type}'/{derivation_account}'/0/*)");
+        let vault_change_desc_str =
+            format!("tr({xprv}/86'/{coin_type}'/{derivation_account}'/1/*)");
 
         let (vault_wallet, loaded_vault_changeset) = if let Some(p) = &self.persistence {
             let (wallet, changeset) = if let Some(changeset) = &p.taproot {
@@ -2651,12 +2612,14 @@ mod tests {
                 content_length: None,
                 timestamp: None,
             });
-        wallet.rune_balances.push(crate::ordinals::types::RuneBalance {
-            rune: "NO•ORDINARY•KIND".to_string(),
-            amount: "1".to_string(),
-            divisibility: Some(0),
-            symbol: Some("🚪".to_string()),
-        });
+        wallet
+            .rune_balances
+            .push(crate::ordinals::types::RuneBalance {
+                rune: "NO•ORDINARY•KIND".to_string(),
+                amount: "1".to_string(),
+                divisibility: Some(0),
+                symbol: Some("🚪".to_string()),
+            });
         wallet.ordinals_verified = true;
         let original_generation = wallet.account_generation;
 
@@ -2727,12 +2690,14 @@ mod tests {
             .with_scheme(AddressScheme::Dual)
             .build()
             .unwrap();
-        wallet.rune_balances.push(crate::ordinals::types::RuneBalance {
-            rune: "NO•ORDINARY•KIND".to_string(),
-            amount: "99".to_string(),
-            divisibility: Some(0),
-            symbol: Some("🚪".to_string()),
-        });
+        wallet
+            .rune_balances
+            .push(crate::ordinals::types::RuneBalance {
+                rune: "NO•ORDINARY•KIND".to_string(),
+                amount: "99".to_string(),
+                divisibility: Some(0),
+                symbol: Some("🚪".to_string()),
+            });
         wallet.ordinals_verified = true;
         wallet.ordinals_metadata_complete = true;
         let original_generation = wallet.account_generation;
@@ -2756,12 +2721,14 @@ mod tests {
             .with_scheme(AddressScheme::Dual)
             .build()
             .unwrap();
-        wallet.rune_balances.push(crate::ordinals::types::RuneBalance {
-            rune: "NO•ORDINARY•KIND".to_string(),
-            amount: "21".to_string(),
-            divisibility: Some(0),
-            symbol: Some("🚪".to_string()),
-        });
+        wallet
+            .rune_balances
+            .push(crate::ordinals::types::RuneBalance {
+                rune: "NO•ORDINARY•KIND".to_string(),
+                amount: "21".to_string(),
+                divisibility: Some(0),
+                symbol: Some("🚪".to_string()),
+            });
         wallet.ordinals_verified = true;
         wallet.ordinals_metadata_complete = true;
         let original_generation = wallet.account_generation;
@@ -2770,7 +2737,10 @@ mod tests {
             .set_payment_address_type(PaymentAddressType::NestedSegwit)
             .unwrap();
 
-        assert_eq!(wallet.payment_address_type, PaymentAddressType::NestedSegwit);
+        assert_eq!(
+            wallet.payment_address_type,
+            PaymentAddressType::NestedSegwit
+        );
         assert!(wallet.rune_balances.is_empty());
         assert!(!wallet.ordinals_verified);
         assert!(!wallet.ordinals_metadata_complete);

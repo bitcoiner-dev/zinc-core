@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 - No changes yet.
 
+## [0.2.0] - 2026-04-07
+
+### Added
+- High-integrity Sign-Intent system for hardened wallet pairing and signing transport.
+- Initial Runes protocol support including read operations and parser updates.
+- Enhanced WASM bindings including `discoverImportPath` and granular derivation controls.
+
+### Fixed
+- Resolved Ordinal Shield panic risks and enforced stricter "main-address" scan policies.
+
+### Changed
+- Refined core APIs to support explicit derivation mode and payment address type controls.
+
+
 ## [0.1.2] - 2026-03-27
 
 ### Fixed

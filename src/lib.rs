@@ -164,16 +164,16 @@ pub fn decrypt_wallet_internal(
         .map_err(|e| ZincError::SerializationError(e.to_string()))?;
 
     let plaintext = crypto::decrypt_seed(&encrypted, password)?;
- 
+
     let phrase = zeroize::Zeroizing::new(
         String::from_utf8(plaintext.to_vec())
-            .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {}", e)))?,
+            .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {e}")))?,
     );
 
     let mnemonic = ZincMnemonic::parse(&phrase)?;
- 
-     Ok(WalletResult {
-         phrase: mnemonic.phrase(),
+
+    Ok(WalletResult {
+        phrase: mnemonic.phrase(),
         words: mnemonic.words(),
     })
 }
@@ -189,11 +189,11 @@ pub fn encrypt_secret_internal(secret: &str, password: &str) -> Result<String, Z
 /// Decrypt an encrypted secret JSON payload and recover UTF-8 plaintext.
 pub fn decrypt_secret_internal(encrypted_json: &str, password: &str) -> Result<String, ZincError> {
     let encrypted: crypto::EncryptedWallet = serde_json::from_str(encrypted_json)
-         .map_err(|e| ZincError::SerializationError(e.to_string()))?;
+        .map_err(|e| ZincError::SerializationError(e.to_string()))?;
     let plaintext = crypto::decrypt_seed(&encrypted, password)?;
-    Ok(String::from_utf8(plaintext.to_vec())
-        .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {}", e)))?)
- }
+    String::from_utf8(plaintext.to_vec())
+        .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {e}")))
+}
 
 // ============================================================================
 // WASM Bindings
@@ -729,8 +729,7 @@ impl ZincWasmWallet {
                 Ok(())
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy ({}): {}",
-                busy_context, e
+                "Wallet busy ({busy_context}): {e}"
             ))),
         }
     }
@@ -775,8 +774,7 @@ impl ZincWasmWallet {
             Err(e) => {
                 zinc_log_debug!(target: LOG_TARGET_WASM, "export_changeset failed to borrow: {:?}", e);
                 Err(JsValue::from_str(&format!(
-                    "Wallet busy (export_changeset): {}",
-                    e
+                    "Wallet busy (export_changeset): {e}"
                 )))
             }
         };
@@ -1003,20 +1001,22 @@ impl ZincWasmWallet {
 
             let vault_pubkey = zwallet
                 .get_taproot_public_key(0)
-                .unwrap_or_else(|_| "".to_string());
+                .unwrap_or_else(|_| String::new());
 
             let (payment_addr, payment_pubkey) = if scheme == AddressScheme::Dual {
                 (
                     Some(
                         zwallet
                             .peek_payment_address(0)
-                            .ok_or_else(|| JsValue::from_str("Payment wallet missing in dual mode"))?
+                            .ok_or_else(|| {
+                                JsValue::from_str("Payment wallet missing in dual mode")
+                            })?
                             .to_string(),
                     ),
                     Some(
                         zwallet
                             .get_payment_public_key(0)
-                            .unwrap_or_else(|_| "".to_string()),
+                            .unwrap_or_else(|_| String::new()),
                     ),
                 )
             } else {
@@ -1043,12 +1043,10 @@ impl ZincWasmWallet {
     pub fn get_inscriptions(&self) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
         match self.inner.try_borrow() {
-            Ok(inner) => serde_wasm_bindgen::to_value(&inner.inscriptions).map_err(|e| {
-                JsValue::from_str(&format!("Failed to serialize inscriptions: {}", e))
-            }),
+            Ok(inner) => serde_wasm_bindgen::to_value(&inner.inscriptions)
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize inscriptions: {e}"))),
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (get_inscriptions): {}",
-                e
+                "Wallet busy (get_inscriptions): {e}"
             ))),
         }
     }
@@ -1058,12 +1056,10 @@ impl ZincWasmWallet {
     pub fn get_rune_balances(&self) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
         match self.inner.try_borrow() {
-            Ok(inner) => serde_wasm_bindgen::to_value(inner.rune_balances()).map_err(|e| {
-                JsValue::from_str(&format!("Failed to serialize rune balances: {}", e))
-            }),
+            Ok(inner) => serde_wasm_bindgen::to_value(inner.rune_balances())
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize rune balances: {e}"))),
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (get_rune_balances): {}",
-                e
+                "Wallet busy (get_rune_balances): {e}"
             ))),
         }
     }
@@ -1103,8 +1099,7 @@ impl ZincWasmWallet {
                     .map_err(|e| JsValue::from_str(&e.to_string()))
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (get_balance): {}",
-                e
+                "Wallet busy (get_balance): {e}"
             ))),
         }
     }
@@ -1119,8 +1114,7 @@ impl ZincWasmWallet {
                     .map_err(|e| JsValue::from(format!("Failed to serialize transactions: {e}")))
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (get_transactions): {}",
-                e
+                "Wallet busy (get_transactions): {e}"
             ))),
         }
     }
@@ -1136,7 +1130,7 @@ impl ZincWasmWallet {
                 let vault_addr = inner.peek_taproot_address(0);
                 let vault_pubkey = inner
                     .get_taproot_public_key(0)
-                    .unwrap_or_else(|_| "".to_string());
+                    .unwrap_or_else(|_| String::new());
 
                 zinc_log_debug!(
                     target: LOG_TARGET_WASM,
@@ -1154,7 +1148,7 @@ impl ZincWasmWallet {
                         .ok_or_else(|| JsValue::from_str("Payment wallet missing in dual mode"))?;
                     let pubkey = inner
                         .get_payment_public_key(0)
-                        .unwrap_or_else(|_| "".to_string());
+                        .unwrap_or_else(|_| String::new());
                     zinc_log_debug!(target: LOG_TARGET_WASM, "get_addresses - payment: {}", addr);
                     (Some(addr.to_string()), Some(pubkey))
                 };
@@ -1172,8 +1166,7 @@ impl ZincWasmWallet {
                 serde_wasm_bindgen::to_value(&json).map_err(|e| JsValue::from(e.to_string()))
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (get_addresses): {}",
-                e
+                "Wallet busy (get_addresses): {e}"
             ))),
         }
     }
@@ -1467,7 +1460,9 @@ impl ZincWasmWallet {
                         let vault_addr = zwallet.peek_taproot_address(address_index).to_string();
 
                         let payment_addr = if scheme == AddressScheme::Dual {
-                            zwallet.peek_payment_address(address_index).map(|addr| addr.to_string())
+                            zwallet
+                                .peek_payment_address(address_index)
+                                .map(|addr| addr.to_string())
                         } else {
                             None
                         };
@@ -1695,7 +1690,7 @@ impl ZincWasmWallet {
 
         let inscriptions: Vec<crate::ordinals::types::Inscription> =
             serde_wasm_bindgen::from_value(val).map_err(|e| {
-                JsValue::from_str(&format!("Failed to parse inscriptions from JsValue: {}", e))
+                JsValue::from_str(&format!("Failed to parse inscriptions from JsValue: {e}"))
             })?;
 
         zinc_log_debug!(target: LOG_TARGET_WASM,
@@ -1712,8 +1707,7 @@ impl ZincWasmWallet {
             Err(e) => {
                 zinc_log_debug!(target: LOG_TARGET_WASM, "load_inscriptions FAILED to borrow mutable: {}", e);
                 Err(JsValue::from_str(&format!(
-                    "Wallet busy (load_inscriptions): {}",
-                    e
+                    "Wallet busy (load_inscriptions): {e}"
                 )))
             }
         }
@@ -1811,10 +1805,7 @@ impl ZincWasmWallet {
                         "Failed to fetch rune balances: {:?}",
                         e
                     );
-                    ZincWasmWallet::clear_syncing_if_generation_matches(
-                        &inner_rc,
-                        sync_generation,
-                    );
+                    ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
                     if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
                         &inner_rc,
                         sync_generation,
@@ -1907,12 +1898,11 @@ impl ZincWasmWallet {
                         if inner.account_generation() != sync_generation {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
-                        let c = inner
-                            .apply_verified_ordinals_update(
-                                all_inscriptions,
-                                protected_outpoints,
-                                rune_balances,
-                            );
+                        let c = inner.apply_verified_ordinals_update(
+                            all_inscriptions,
+                            protected_outpoints,
+                            rune_balances,
+                        );
                         inner.is_syncing = false; // FINISHED
                         c
                     }
@@ -1943,8 +1933,7 @@ impl ZincWasmWallet {
                 .create_psbt_base64(&request)
                 .map_err(|e| JsValue::from_str(&e.to_string())),
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy ({}): {}",
-                busy_label, e
+                "Wallet busy ({busy_label}): {e}"
             ))),
         }
     }
@@ -2000,7 +1989,7 @@ impl ZincWasmWallet {
             } else {
                 match serde_wasm_bindgen::from_value(options) {
                     Ok(opts) => Some(opts),
-                    Err(e) => return Err(JsValue::from_str(&format!("Invalid options: {}", e))),
+                    Err(e) => return Err(JsValue::from_str(&format!("Invalid options: {e}"))),
                 }
             };
 
@@ -2008,23 +1997,19 @@ impl ZincWasmWallet {
             Ok(mut inner) => inner
                 .sign_psbt(psbt_base64, sign_opts)
                 .map_err(JsValue::from),
-            Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (sign_psbt): {}",
-                e
-            ))),
+            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (sign_psbt): {e}"))),
         }
     }
 
     /// Analyzes a PSBT for Ordinal Shield protection.
-    /// Returns a JSON string containing the AnalysisResult.
+    /// Returns a JSON string containing the `AnalysisResult`.
     #[wasm_bindgen(js_name = analyzePsbt)]
     pub fn analyze_psbt(&self, psbt_base64: &str) -> Result<String, JsValue> {
         self.check_vitality()?;
         match self.inner.try_borrow() {
             Ok(inner) => inner.analyze_psbt(psbt_base64).map_err(JsValue::from),
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (analyze_psbt): {}",
-                e
+                "Wallet busy (analyze_psbt): {e}"
             ))),
         }
     }
@@ -2041,7 +2026,7 @@ impl ZincWasmWallet {
             } else {
                 match serde_wasm_bindgen::from_value(options) {
                     Ok(opts) => Some(opts),
-                    Err(e) => return Err(JsValue::from_str(&format!("Invalid options: {}", e))),
+                    Err(e) => return Err(JsValue::from_str(&format!("Invalid options: {e}"))),
                 }
             };
 
@@ -2050,13 +2035,13 @@ impl ZincWasmWallet {
             .decode(psbt_base64)
             .map_err(|e| JsValue::from_str(&format!("Invalid base64: {e}")))?;
 
-        let psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
+        let mut psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
             .map_err(|e| JsValue::from_str(&format!("Invalid PSBT: {e}")))?;
 
         let inner = self
             .inner
             .try_borrow()
-            .map_err(|e| JsValue::from_str(&format!("Wallet busy (audit_psbt): {}", e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Wallet busy (audit_psbt): {e}")))?;
 
         // 1. Build known_inscriptions map
         let mut known_inscriptions: std::collections::HashMap<
@@ -2091,8 +2076,7 @@ impl ZincWasmWallet {
                 .sign_message(address, message)
                 .map_err(|e| JsValue::from_str(&e)),
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (sign_message): {}",
-                e
+                "Wallet busy (sign_message): {e}"
             ))),
         }
     }
@@ -2144,8 +2128,7 @@ impl ZincWasmWallet {
                     .map_err(|e| JsValue::from_str(&format!("failed to serialize signed ack: {e}")))
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (build_signed_pairing_ack): {}",
-                e
+                "Wallet busy (build_signed_pairing_ack): {e}"
             ))),
         }
     }
@@ -2163,8 +2146,7 @@ impl ZincWasmWallet {
                     .map_err(|e| JsValue::from_str(&e.to_string()))
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (get_pairing_pubkey_hex): {}",
-                e
+                "Wallet busy (get_pairing_pubkey_hex): {e}"
             ))),
         }
     }
@@ -2201,8 +2183,7 @@ impl ZincWasmWallet {
                 })
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (build_signed_sign_intent_rejection_receipt_json): {}",
-                e
+                "Wallet busy (build_signed_sign_intent_rejection_receipt_json): {e}"
             ))),
         }
     }
@@ -2240,8 +2221,7 @@ impl ZincWasmWallet {
                 })
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (build_signed_sign_intent_approved_receipt_json): {}",
-                e
+                "Wallet busy (build_signed_sign_intent_approved_receipt_json): {e}"
             ))),
         }
     }
@@ -2309,8 +2289,7 @@ impl ZincWasmWallet {
                 })
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (build_pairing_transport_event_json): {}",
-                e
+                "Wallet busy (build_pairing_transport_event_json): {e}"
             ))),
         }
     }
@@ -2340,8 +2319,7 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&e.to_string()))
             }
             Err(e) => Err(JsValue::from_str(&format!(
-                "Wallet busy (decode_pairing_transport_event_content_json): {}",
-                e
+                "Wallet busy (decode_pairing_transport_event_content_json): {e}"
             ))),
         }
     }

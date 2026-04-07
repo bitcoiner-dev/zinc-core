@@ -57,8 +57,7 @@ mod tests {
         let external_str = desc.external.to_string();
         assert!(
             external_str.starts_with("tr("),
-            "Expected Taproot descriptor, got: {}",
-            external_str
+            "Expected Taproot descriptor, got: {external_str}"
         );
     }
 

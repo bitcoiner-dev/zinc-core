@@ -148,18 +148,18 @@ mod tests {
         // Since we are using taproot (Unified mode default), we expect tap_key_sig or similar.
 
         // Check if Input 1 is signed
-        let has_sig_1 = !signed_psbt.inputs[1].final_script_witness.is_none()
-            || !signed_psbt.inputs[1].tap_key_sig.is_none();
+        let has_sig_1 = signed_psbt.inputs[1].final_script_witness.is_some()
+            || signed_psbt.inputs[1].tap_key_sig.is_some();
         assert!(has_sig_1, "Input 1 should be signed");
 
         // Check if Input 0 is NOT signed
-        let has_sig_0 = !signed_psbt.inputs[0].final_script_witness.is_none()
-            || !signed_psbt.inputs[0].tap_key_sig.is_none();
+        let has_sig_0 = signed_psbt.inputs[0].final_script_witness.is_some()
+            || signed_psbt.inputs[0].tap_key_sig.is_some();
         assert!(!has_sig_0, "Input 0 should NOT be signed");
 
         // Check if Input 2 is NOT signed
-        let has_sig_2 = !signed_psbt.inputs[2].final_script_witness.is_none()
-            || !signed_psbt.inputs[2].tap_key_sig.is_none();
+        let has_sig_2 = signed_psbt.inputs[2].final_script_witness.is_some()
+            || signed_psbt.inputs[2].tap_key_sig.is_some();
         assert!(!has_sig_2, "Input 2 should NOT be signed");
     }
 

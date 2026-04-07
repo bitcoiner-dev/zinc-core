@@ -10,7 +10,7 @@ use zinc_core::builder::{AddressScheme, CreatePsbtRequest, Seed64, WalletBuilder
 // ============================================================================
 
 /// Test that we can create a PSBT for a basic send.
-/// RED: This test will fail until create_psbt is implemented.
+/// RED: This test will fail until `create_psbt` is implemented.
 #[test]
 fn test_create_psbt_basic() {
     let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -50,7 +50,7 @@ fn test_create_psbt_basic() {
     );
 }
 
-/// Test that create_psbt validates addresses correctly.
+/// Test that `create_psbt` validates addresses correctly.
 #[test]
 fn test_create_psbt_invalid_address() {
     // Invalid address
@@ -68,7 +68,7 @@ fn test_create_psbt_invalid_address() {
     );
 }
 
-/// Test that create_psbt rejects wrong network addresses.
+/// Test that `create_psbt` rejects wrong network addresses.
 #[test]
 fn test_create_psbt_wrong_network() {
     let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -102,7 +102,7 @@ fn test_create_psbt_wrong_network() {
     );
 }
 
-/// Test sign_psbt with a pre-constructed PSBT.
+/// Test `sign_psbt` with a pre-constructed PSBT.
 /// This requires a valid unsigned PSBT to sign.
 #[test]
 fn test_sign_psbt_invalid_base64() {
