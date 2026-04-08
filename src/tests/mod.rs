@@ -6,6 +6,7 @@ pub mod offer_create;
 pub mod offer_nostr;
 pub mod offer_relay;
 pub mod ordinal_shield;
+pub mod profiles;
 pub mod sign_intent;
 pub mod signing;
 pub mod wasm_wallet_state;

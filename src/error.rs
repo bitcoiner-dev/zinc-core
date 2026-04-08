@@ -44,6 +44,10 @@ pub enum ZincError {
     /// Offer envelope creation/validation/signature failure.
     #[error("Offer error: {0}")]
     OfferError(String),
+
+    /// Attempted a signing operation on a read-only (Watch) profile.
+    #[error("Capability missing: This operation requires a Seed-mode profile (private keys).")]
+    CapabilityMissing,
 }
 
 /// Convenience type alias for Results with `ZincError`.
