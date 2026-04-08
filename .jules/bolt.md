@@ -1,0 +1,3 @@
+## 2024-05-16 - Pre-allocate HashMaps when sizing is predictable
+**Learning:** Initializing HashMaps dynamically inside high-volume iteration loops (e.g., when constructing `known_inscriptions` mapping for large wallets) causes continuous reallocation and resizing overhead. While passing references (like `&String` instead of cloning `String`) would be faster, it can break existing API contracts.
+**Action:** Use `HashMap::with_capacity(size)` over `HashMap::new()` when the expected input length is known. This is a very safe, measurable, and contained performance enhancement that does not trigger cascading architectural refactoring.
