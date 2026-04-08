@@ -68,13 +68,6 @@ enum DerivationMode {
 }
 
 impl DerivationMode {
-    fn label(self) -> &'static str {
-        match self {
-            DerivationMode::Account => "account",
-            DerivationMode::Index => "index",
-        }
-    }
-
     fn account_and_index(self, account_number: u32) -> (u32, u32) {
         match self {
             DerivationMode::Account => (account_number, 0),

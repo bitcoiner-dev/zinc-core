@@ -54,10 +54,10 @@ pub mod sign_intent;
 
 // Re-exports for convenience
 pub use builder::{
-    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest, DerivationMode,
-    DiscoveryAccountPlan, DiscoveryContext, PaymentAddressType, Seed64, SignOptions,
-    SyncRequestType, SyncSleeper, WalletBuilder, ZincBalance, ZincPersistence, ZincSyncRequest,
-    ZincWallet,
+    Account, AddressScheme, CoreIdentity, CreatePsbtRequest, CreatePsbtTransportRequest,
+    DerivationMode, DiscoveryAccountPlan, DiscoveryContext, PaymentAddressType, ProfileMode,
+    ScanPolicy, Seed64, SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, ZincBalance,
+    ZincPersistence, ZincSyncRequest, ZincWallet,
 };
 pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
@@ -2035,7 +2035,7 @@ impl ZincWasmWallet {
             .decode(psbt_base64)
             .map_err(|e| JsValue::from_str(&format!("Invalid base64: {e}")))?;
 
-        let mut psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
+        let psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
             .map_err(|e| JsValue::from_str(&format!("Invalid PSBT: {e}")))?;
 
         let inner = self
