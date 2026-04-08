@@ -163,6 +163,10 @@ impl ZincWallet {
         tx: &bitcoin::Transaction,
         txid: bitcoin::Txid,
     ) -> Vec<InscriptionDetails> {
+        if self.inscriptions.is_empty() {
+            return Vec::new();
+        }
+
         let mut results = Vec::new();
         for (i, _) in tx.output.iter().enumerate() {
             let vout = match u32::try_from(i) {
@@ -170,6 +174,12 @@ impl ZincWallet {
                 Err(_) => continue,
             };
             let outpoint = bitcoin::OutPoint::new(txid, vout);
+
+            // O(1) fast-path check
+            if self.ordinals_verified && !self.inscribed_utxos.contains(&outpoint) {
+                continue;
+            }
+
             // Find the inscription that matches this outpoint in our cache
             if let Some(ins) = self
                 .inscriptions
