@@ -51,7 +51,7 @@ impl ZincWallet {
 
         // 3. Deduplicate
         let mut combined: std::collections::HashMap<String, TxItem> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(items.len());
         for item in items {
             combined
                 .entry(item.txid.clone())

@@ -2035,7 +2035,7 @@ impl ZincWasmWallet {
             .decode(psbt_base64)
             .map_err(|e| JsValue::from_str(&format!("Invalid base64: {e}")))?;
 
-        let mut psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
+        let psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes)
             .map_err(|e| JsValue::from_str(&format!("Invalid PSBT: {e}")))?;
 
         let inner = self
