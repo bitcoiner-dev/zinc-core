@@ -1476,7 +1476,9 @@ impl ZincWallet {
         let sig = secp.sign_ecdsa_recoverable(&msg, &priv_key);
         let (rec_id, sig_bytes_compact) = sig.serialize_compact();
 
-        let mut header = 27 + u8::try_from(rec_id.to_i32()).unwrap();
+        let rec_id_u8 = u8::try_from(rec_id.to_i32())
+            .map_err(|e| format!("Invalid recovery ID: {e}"))?;
+        let mut header = 27 + rec_id_u8;
         header += 4; // Always compressed
 
         let mut sig_bytes = Vec::with_capacity(65);
@@ -1540,11 +1542,11 @@ impl ZincWallet {
         let coin_type = u32::from(self.vault_wallet.network() != Network::Bitcoin);
 
         let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+            Self::child_hardened(purpose)?,
+            Self::child_hardened(coin_type)?,
+            Self::child_hardened(account)?,
+            Self::child_normal(chain)?,
+            Self::child_normal(index)?,
         ];
 
         let child_xprv = self
@@ -1575,11 +1577,11 @@ impl ZincWallet {
         // Derive the ordinals key (m/86'/coin'/account'/0/0)
         let coin_type = u32::from(self.vault_wallet.network() != Network::Bitcoin);
         let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(self.account_index).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0).unwrap(), // External chain
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0).unwrap(), // First key
+            Self::child_hardened(86)?,
+            Self::child_hardened(coin_type)?,
+            Self::child_hardened(self.account_index)?,
+            Self::child_normal(0)?, // External chain
+            Self::child_normal(0)?, // First key
         ];
 
         let ordinals_xprv = self
