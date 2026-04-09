@@ -1,0 +1,3 @@
+## 2023-10-24 - [Avoid O(N) in hot paths by using existing O(1) states]
+**Learning:** In transaction processing (`src/history.rs`), O(N) iterative search through `self.inscriptions` caused bottlenecks when checking multiple UTXOs. An existing O(1) state `self.inscribed_utxos` (a `HashSet`) was available but unused for the fast-path check. Also, using `HashMap::with_capacity` when building maps from lists avoids dynamic reallocations during tight loops.
+**Action:** Use `.contains()` on available `HashSet` structures instead of iterating through arrays when possible. Use `with_capacity` to pre-allocate maps when size is bounded.
