@@ -1414,7 +1414,7 @@ impl ZincWasmWallet {
                     break;
                 }
 
-                let mut builder = WalletBuilder::from_seed(network, seed);
+                let mut builder = WalletBuilder::from_seed(network, seed.clone());
                 builder = builder
                     .with_scheme(scheme)
                     .with_derivation_mode(derivation_mode)
@@ -1583,7 +1583,7 @@ impl ZincWasmWallet {
                     break;
                 }
 
-                let mut builder = WalletBuilder::from_seed(network, seed);
+                let mut builder = WalletBuilder::from_seed(network, seed.clone());
                 builder = builder
                     .with_scheme(scheme)
                     .with_derivation_mode(derivation_mode)
