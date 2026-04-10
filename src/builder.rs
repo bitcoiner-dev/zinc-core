@@ -1540,11 +1540,11 @@ impl ZincWallet {
         let coin_type = u32::from(self.vault_wallet.network() != Network::Bitcoin);
 
         let derivation_path = [
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
+            Self::child_hardened(purpose)?,
             bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+            Self::child_hardened(account)?,
+            Self::child_normal(chain)?,
+            Self::child_normal(index)?,
         ];
 
         let child_xprv = self
@@ -1577,7 +1577,7 @@ impl ZincWallet {
         let derivation_path = [
             bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
             bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-            bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(self.account_index).unwrap(),
+            Self::child_hardened(self.account_index)?,
             bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0).unwrap(), // External chain
             bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(0).unwrap(), // First key
         ];
