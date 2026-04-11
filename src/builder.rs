@@ -19,6 +19,27 @@ use std::str::FromStr;
 
 const LOG_TARGET_BUILDER: &str = "zinc_core::builder";
 
+/// Platform-safe current-time-in-seconds for BDK sync request start times.
+///
+/// `FullScanRequest::builder()` (the parameterless variant) calls
+/// `std::time::UNIX_EPOCH.elapsed()` internally, which panics on
+/// `wasm32-unknown-unknown` with "time not implemented on this platform".
+/// This helper provides the same value via `js_sys::Date::now()` on WASM
+/// and the standard library on native targets.
+fn wasm_now_secs() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::UNIX_EPOCH
+            .elapsed()
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
+
 /// Optional controls for PSBT signing behavior.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -923,15 +944,17 @@ impl ZincWallet {
 
     /// Build sync requests for taproot/payment wallets.
     pub fn prepare_requests(&self) -> ZincSyncRequest {
+        let now = wasm_now_secs();
         let vault = SyncRequestType::Full(Self::flexible_full_scan_request(
             &self.vault_wallet,
             self.scan_policy,
+            now,
         ));
 
         let payment = self
             .payment_wallet
             .as_ref()
-            .map(|w| SyncRequestType::Full(Self::flexible_full_scan_request(w, self.scan_policy)));
+            .map(|w| SyncRequestType::Full(Self::flexible_full_scan_request(w, self.scan_policy, now)));
 
         ZincSyncRequest {
             taproot: vault,
@@ -1026,11 +1049,12 @@ impl ZincWallet {
             .build_async_with_sleeper::<SyncSleeper>()
             .map_err(|e| format!("{e:?}"))?;
 
-        let vault_req = Self::flexible_full_scan_request(&self.vault_wallet, self.scan_policy);
+        let now = wasm_now_secs();
+        let vault_req = Self::flexible_full_scan_request(&self.vault_wallet, self.scan_policy, now);
         let payment_req = self
             .payment_wallet
             .as_ref()
-            .map(|w| Self::flexible_full_scan_request(w, self.scan_policy));
+            .map(|w| Self::flexible_full_scan_request(w, self.scan_policy, now));
 
         let stop_gap = self.scan_policy.account_gap_limit as usize;
         let parallel_requests = 5;
@@ -2383,6 +2407,7 @@ impl ZincWallet {
     fn flexible_full_scan_request(
         wallet: &Wallet,
         policy: ScanPolicy,
+        start_time: u64,
     ) -> FullScanRequest<KeychainKind> {
         let depth = policy.address_scan_depth.max(1);
         let external_spks: Vec<_> = (0..depth)
@@ -2397,7 +2422,7 @@ impl ZincWallet {
             })
             .collect();
 
-        FullScanRequest::builder()
+        FullScanRequest::builder_at(start_time)
             .chain_tip(wallet.local_chain().tip())
             .spks_for_keychain(KeychainKind::External, external_spks)
             .build()
@@ -3172,5 +3197,24 @@ mod tests {
             Some(SyncRequestType::Incremental(_)) => panic!("expected full scan request"),
             None => panic!("expected payment request in dual mode"),
         }
+    }
+
+    #[test]
+    fn test_flexible_full_scan_request_keeps_explicit_start_time() {
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(*seed))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+
+        let explicit_start_time = 1_735_689_001u64;
+        let request = ZincWallet::flexible_full_scan_request(
+            &wallet.vault_wallet,
+            wallet.scan_policy,
+            explicit_start_time,
+        );
+
+        assert_eq!(request.start_time(), explicit_start_time);
     }
 }
