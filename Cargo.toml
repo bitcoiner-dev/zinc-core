@@ -64,6 +64,8 @@ console_error_panic_hook = { version = "0.1" }
 wasm-bindgen-futures = "0.4.58"
 tracing = "0.1"
 tracing-wasm = "0.2"
+hex = "0.4.3"
+web-sys = { version = "0.3.95", features = ["console"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bdk_esplora = { version = "0.22.1", default-features = false, features = ["async-https-rustls"] }
