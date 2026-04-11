@@ -366,6 +366,12 @@ pub fn encrypt_wallet(mnemonic: &str, password: &str) -> Result<String, JsValue>
     encrypt_wallet_internal(mnemonic, password).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Encrypt arbitrary secret material with a password.
+#[wasm_bindgen]
+pub fn encrypt_secret(secret: &str, password: &str) -> Result<String, JsValue> {
+    encrypt_secret_internal(secret, password).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 #[derive(Serialize)]
 /// WASM response payload for mnemonic decryption.
 pub struct DecryptResponse {
@@ -417,6 +423,12 @@ pub fn decrypt_wallet(encrypted_json: &str, password: &str) -> Result<JsValue, J
             Err(JsValue::from_str(&e.to_string()))
         }
     }
+}
+
+/// Decrypt encrypted secret material and return plaintext UTF-8.
+#[wasm_bindgen]
+pub fn decrypt_secret(encrypted_json: &str, password: &str) -> Result<String, JsValue> {
+    decrypt_secret_internal(encrypted_json, password).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Validate and verify a signed pairing request payload.
@@ -573,17 +585,121 @@ struct WalletState {
     account_index: u32,
 }
 
+#[derive(Clone)]
+enum WalletMaterial {
+    MnemonicPhrase(String),
+    WatchAddress(String),
+}
+
 #[wasm_bindgen]
 /// WASM-safe stateful wallet handle wrapping the core `ZincWallet`.
 pub struct ZincWasmWallet {
     inner: Rc<RefCell<ZincWallet>>,
-    phrase: String, // Stored for re-building inner wallet on scheme change
+    material: WalletMaterial,
     state: Cell<WalletState>,
     vitality: u32,
 }
 
 #[wasm_bindgen]
 impl ZincWasmWallet {
+    fn parse_network_label(network: &str) -> Result<Network, JsValue> {
+        match network {
+            "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
+            "signet" => Ok(Network::Signet),
+            "testnet" => Ok(Network::Testnet),
+            "regtest" => Ok(Network::Regtest),
+            _ => Err(JsValue::from_str("Invalid network")),
+        }
+    }
+
+    fn build_seed_wallet(
+        network: Network,
+        phrase: &str,
+        scheme: AddressScheme,
+        derivation_mode: DerivationMode,
+        payment_address_type: PaymentAddressType,
+        account_index: u32,
+        persistence_json: Option<&str>,
+    ) -> Result<ZincWallet, JsValue> {
+        let mnemonic = ZincMnemonic::parse(phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mut builder = WalletBuilder::from_mnemonic(network, &mnemonic);
+        builder = builder
+            .with_scheme(scheme)
+            .with_derivation_mode(derivation_mode)
+            .with_payment_address_type(payment_address_type)
+            .with_account_index(account_index);
+
+        if let Some(json) = persistence_json {
+            builder = builder
+                .with_persistence(json)
+                .map_err(|e| JsValue::from_str(&e))?;
+        }
+
+        builder.build().map_err(|e| JsValue::from_str(&e))
+    }
+
+    fn build_watch_wallet(
+        network: Network,
+        watch_address: &str,
+        scheme: AddressScheme,
+        derivation_mode: DerivationMode,
+        payment_address_type: PaymentAddressType,
+        account_index: u32,
+        persistence_json: Option<&str>,
+    ) -> Result<ZincWallet, JsValue> {
+        let mut builder = WalletBuilder::from_watch_only(network)
+            .with_watch_address(watch_address)
+            .map_err(|e| JsValue::from_str(&e))?;
+        builder = builder
+            .with_scheme(scheme)
+            .with_derivation_mode(derivation_mode)
+            .with_payment_address_type(payment_address_type)
+            .with_account_index(account_index);
+
+        if let Some(json) = persistence_json {
+            builder = builder
+                .with_persistence(json)
+                .map_err(|e| JsValue::from_str(&e))?;
+        }
+
+        builder.build().map_err(|e| JsValue::from_str(&e))
+    }
+
+    fn build_wallet_for_state(
+        material: &WalletMaterial,
+        next_state: WalletState,
+    ) -> Result<ZincWallet, JsValue> {
+        match material {
+            WalletMaterial::MnemonicPhrase(phrase) => Self::build_seed_wallet(
+                next_state.network,
+                phrase,
+                next_state.scheme,
+                next_state.derivation_mode,
+                next_state.payment_address_type,
+                next_state.account_index,
+                None,
+            ),
+            WalletMaterial::WatchAddress(address) => Self::build_watch_wallet(
+                next_state.network,
+                address,
+                next_state.scheme,
+                next_state.derivation_mode,
+                next_state.payment_address_type,
+                next_state.account_index,
+                None,
+            ),
+        }
+    }
+
+    fn seed_phrase(&self) -> Result<&str, JsValue> {
+        match &self.material {
+            WalletMaterial::MnemonicPhrase(phrase) => Ok(phrase.as_str()),
+            WalletMaterial::WatchAddress(_) => Err(JsValue::from_str(
+                "Operation is unavailable for watch-address profiles",
+            )),
+        }
+    }
+
     #[wasm_bindgen(constructor)]
     #[allow(clippy::needless_pass_by_value)]
     /// Create a wallet from a plaintext mnemonic phrase.
@@ -596,25 +712,34 @@ impl ZincWasmWallet {
         persistence_json: Option<String>,
         account_index: Option<u32>,
     ) -> Result<ZincWasmWallet, JsValue> {
-        let network_enum = match network {
-            "mainnet" | "bitcoin" => Network::Bitcoin,
-            "signet" => Network::Signet,
-            "testnet" => Network::Testnet,
-            "regtest" => Network::Regtest,
-            _ => return Err(JsValue::from_str("Invalid network")),
+        let network_enum = Self::parse_network_label(network)?;
+        let scheme = match scheme_str.as_deref() {
+            Some("dual") => AddressScheme::Dual,
+            _ => AddressScheme::Unified,
         };
-
-        let mnemonic =
-            ZincMnemonic::parse(phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Self::init_wallet(
+        let active_index = account_index.unwrap_or(0);
+        let wallet = Self::build_seed_wallet(
             network_enum,
             phrase,
-            mnemonic,
-            scheme_str,
-            persistence_json,
-            account_index,
-        )
+            scheme,
+            DerivationMode::Account,
+            PaymentAddressType::NativeSegwit,
+            active_index,
+            persistence_json.as_deref(),
+        )?;
+
+        Ok(ZincWasmWallet {
+            inner: Rc::new(RefCell::new(wallet)),
+            material: WalletMaterial::MnemonicPhrase(phrase.to_string()),
+            state: Cell::new(WalletState {
+                network: network_enum,
+                scheme,
+                derivation_mode: DerivationMode::Account,
+                payment_address_type: PaymentAddressType::NativeSegwit,
+                account_index: active_index,
+            }),
+            vitality: VITALITY_MAGIC,
+        })
     }
 
     /// Initialize wallet from encrypted wallet payload (preferred for security).
@@ -627,67 +752,65 @@ impl ZincWasmWallet {
         persistence_json: Option<String>,
         account_index: Option<u32>,
     ) -> Result<ZincWasmWallet, JsValue> {
-        let network_enum = match network {
-            "mainnet" | "bitcoin" => Network::Bitcoin,
-            "signet" => Network::Signet,
-            "testnet" => Network::Testnet,
-            "regtest" => Network::Regtest,
-            _ => return Err(JsValue::from_str("Invalid network")),
-        };
-
-        let result = decrypt_wallet_internal(encrypted_json, password)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mnemonic =
-            ZincMnemonic::parse(&result.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Self::init_wallet(
-            network_enum,
-            &result.phrase,
-            mnemonic,
-            scheme_str,
-            persistence_json,
-            account_index,
-        )
-    }
-
-    fn init_wallet(
-        network: Network,
-        phrase: &str,
-        mnemonic: ZincMnemonic,
-        scheme_str: Option<String>,
-        persistence_json: Option<String>,
-        account_index: Option<u32>,
-    ) -> Result<ZincWasmWallet, JsValue> {
-        // Default to Unified if not specified
+        let network_enum = Self::parse_network_label(network)?;
         let scheme = match scheme_str.as_deref() {
             Some("dual") => AddressScheme::Dual,
             _ => AddressScheme::Unified,
         };
-
         let active_index = account_index.unwrap_or(0);
 
-        let mut builder = WalletBuilder::from_mnemonic(network, &mnemonic);
-        builder = builder
-            .with_scheme(scheme)
-            .with_derivation_mode(DerivationMode::Account)
-            .with_payment_address_type(PaymentAddressType::NativeSegwit)
-            .with_account_index(active_index);
-
-        if let Some(json) = persistence_json {
-            builder = builder
-                .with_persistence(&json)
-                .map_err(|e| JsValue::from_str(&e))?;
-        }
-
-        let wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        let result = decrypt_wallet_internal(encrypted_json, password)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let wallet = Self::build_seed_wallet(
+            network_enum,
+            &result.phrase,
+            scheme,
+            DerivationMode::Account,
+            PaymentAddressType::NativeSegwit,
+            active_index,
+            persistence_json.as_deref(),
+        )?;
 
         Ok(ZincWasmWallet {
             inner: Rc::new(RefCell::new(wallet)),
-            phrase: phrase.to_string(),
+            material: WalletMaterial::MnemonicPhrase(result.phrase),
             state: Cell::new(WalletState {
-                network,
+                network: network_enum,
                 scheme,
+                derivation_mode: DerivationMode::Account,
+                payment_address_type: PaymentAddressType::NativeSegwit,
+                account_index: active_index,
+            }),
+            vitality: VITALITY_MAGIC,
+        })
+    }
+
+    /// Initialize wallet from a watch-only single-address profile.
+    #[wasm_bindgen]
+    pub fn new_watch_address(
+        network: &str,
+        watch_address: &str,
+        persistence_json: Option<String>,
+        account_index: Option<u32>,
+    ) -> Result<ZincWasmWallet, JsValue> {
+        let network_enum = Self::parse_network_label(network)?;
+        let active_index = account_index.unwrap_or(0);
+        let wallet = Self::build_watch_wallet(
+            network_enum,
+            watch_address,
+            AddressScheme::Unified,
+            DerivationMode::Account,
+            PaymentAddressType::NativeSegwit,
+            active_index,
+            persistence_json.as_deref(),
+        )?;
+
+        Ok(ZincWasmWallet {
+            inner: Rc::new(RefCell::new(wallet)),
+            material: WalletMaterial::WatchAddress(watch_address.to_string()),
+            state: Cell::new(WalletState {
+                network: network_enum,
+                scheme: AddressScheme::Unified,
                 derivation_mode: DerivationMode::Account,
                 payment_address_type: PaymentAddressType::NativeSegwit,
                 account_index: active_index,
@@ -797,23 +920,14 @@ impl ZincWasmWallet {
             return Ok(());
         }
 
-        let mnemonic =
-            ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
-        builder = builder
-            .with_scheme(new_scheme)
-            .with_derivation_mode(state.derivation_mode)
-            .with_payment_address_type(state.payment_address_type)
-            .with_account_index(state.account_index);
-
-        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        let next_state = WalletState {
+            scheme: new_scheme,
+            ..state
+        };
+        let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
         self.replace_wallet(
             next_wallet,
-            WalletState {
-                scheme: new_scheme,
-                ..state
-            },
+            next_state,
             "set_scheme",
         )
     }
@@ -828,23 +942,14 @@ impl ZincWasmWallet {
             return Ok(());
         }
 
-        let mnemonic =
-            ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
-        builder = builder
-            .with_scheme(state.scheme)
-            .with_derivation_mode(state.derivation_mode)
-            .with_payment_address_type(state.payment_address_type)
-            .with_account_index(account_index);
-
-        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        let next_state = WalletState {
+            account_index,
+            ..state
+        };
+        let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
         self.replace_wallet(
             next_wallet,
-            WalletState {
-                account_index,
-                ..state
-            },
+            next_state,
             "set_active_account",
         )
     }
@@ -865,23 +970,14 @@ impl ZincWasmWallet {
             return Ok(());
         }
 
-        let mnemonic =
-            ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mut builder = WalletBuilder::from_mnemonic(new_network, &mnemonic);
-        builder = builder
-            .with_scheme(state.scheme)
-            .with_derivation_mode(state.derivation_mode)
-            .with_payment_address_type(state.payment_address_type)
-            .with_account_index(state.account_index);
-
-        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        let next_state = WalletState {
+            network: new_network,
+            ..state
+        };
+        let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
         self.replace_wallet(
             next_wallet,
-            WalletState {
-                network: new_network,
-                ..state
-            },
+            next_state,
             "set_network",
         )
     }
@@ -899,22 +995,14 @@ impl ZincWasmWallet {
             return Ok(());
         }
 
-        let mnemonic =
-            ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
-        builder = builder
-            .with_scheme(state.scheme)
-            .with_derivation_mode(new_mode)
-            .with_payment_address_type(state.payment_address_type)
-            .with_account_index(state.account_index);
-
-        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        let next_state = WalletState {
+            derivation_mode: new_mode,
+            ..state
+        };
+        let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
         self.replace_wallet(
             next_wallet,
-            WalletState {
-                derivation_mode: new_mode,
-                ..state
-            },
+            next_state,
             "set_derivation_mode",
         )
     }
@@ -941,22 +1029,14 @@ impl ZincWasmWallet {
             return Ok(());
         }
 
-        let mnemonic =
-            ZincMnemonic::parse(&self.phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let mut builder = WalletBuilder::from_mnemonic(state.network, &mnemonic);
-        builder = builder
-            .with_scheme(state.scheme)
-            .with_derivation_mode(state.derivation_mode)
-            .with_payment_address_type(new_type)
-            .with_account_index(state.account_index);
-
-        let next_wallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+        let next_state = WalletState {
+            payment_address_type: new_type,
+            ..state
+        };
+        let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
         self.replace_wallet(
             next_wallet,
-            WalletState {
-                payment_address_type: new_type,
-                ..state
-            },
+            next_state,
             "set_payment_address_type",
         )
     }
@@ -975,8 +1055,33 @@ impl ZincWasmWallet {
     pub fn get_accounts(&self, count: u32) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
 
+        if matches!(self.material, WalletMaterial::WatchAddress(_)) {
+            let inner = self
+                .inner
+                .try_borrow()
+                .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {e}")))?;
+            let taproot_address = inner.peek_taproot_address(0).to_string();
+            let taproot_public_key = inner
+                .get_taproot_public_key(0)
+                .unwrap_or_else(|_| String::new());
+            let payment_address = inner.peek_payment_address(0).map(|address| address.to_string());
+            let payment_public_key = inner.get_payment_public_key(0).ok();
+            let accounts = vec![serde_json::json!({
+                "index": 0,
+                "label": "Account 1",
+                "taprootAddress": taproot_address.clone(),
+                "taprootPublicKey": taproot_public_key.clone(),
+                "paymentAddress": payment_address,
+                "paymentPublicKey": payment_public_key,
+                "vaultAddress": taproot_address,
+                "vaultPublicKey": taproot_public_key,
+            })];
+            return serde_wasm_bindgen::to_value(&accounts)
+                .map_err(|e| JsValue::from_str(&e.to_string()));
+        }
+
         // Optimize: parse mnemonic and derive seed only once
-        let mnemonic = crate::keys::ZincMnemonic::parse(&self.phrase)
+        let mnemonic = crate::keys::ZincMnemonic::parse(self.seed_phrase()?)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let state = self.state_snapshot();
         let network = state.network;
@@ -1368,7 +1473,7 @@ impl ZincWasmWallet {
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
 
-        let mnemonic = crate::keys::ZincMnemonic::parse(&self.phrase)
+        let mnemonic = crate::keys::ZincMnemonic::parse(self.seed_phrase()?)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let seed = crate::builder::Seed64::from_array(*mnemonic.to_seed(""));
         let state = self.state_snapshot();
@@ -1414,7 +1519,7 @@ impl ZincWasmWallet {
                     break;
                 }
 
-                let mut builder = WalletBuilder::from_seed(network, seed);
+                let mut builder = WalletBuilder::from_seed(network, seed.clone());
                 builder = builder
                     .with_scheme(scheme)
                     .with_derivation_mode(derivation_mode)
@@ -1537,7 +1642,7 @@ impl ZincWasmWallet {
             _ => return Err(JsValue::from_str("Invalid import discovery branch")),
         };
 
-        let mnemonic = crate::keys::ZincMnemonic::parse(&self.phrase)
+        let mnemonic = crate::keys::ZincMnemonic::parse(self.seed_phrase()?)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let seed = crate::builder::Seed64::from_array(*mnemonic.to_seed(""));
         let state = self.state_snapshot();
@@ -1583,7 +1688,7 @@ impl ZincWasmWallet {
                     break;
                 }
 
-                let mut builder = WalletBuilder::from_seed(network, seed);
+                let mut builder = WalletBuilder::from_seed(network, seed.clone());
                 builder = builder
                     .with_scheme(scheme)
                     .with_derivation_mode(derivation_mode)

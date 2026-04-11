@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::{AddressScheme, Network, WalletBuilder, ZincMnemonic};
     use crate::ZincWasmWallet;
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen::JsValue;
@@ -18,6 +19,28 @@ mod tests {
             Some(0),
         )
         .expect("wallet should initialize")
+    }
+
+    fn regtest_taproot_watch_address() -> String {
+        let mnemonic = ZincMnemonic::parse(TEST_PHRASE).expect("mnemonic");
+        WalletBuilder::from_mnemonic(Network::Regtest, &mnemonic)
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .expect("seed wallet")
+            .peek_taproot_address(0)
+            .to_string()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn regtest_non_taproot_payment_address() -> String {
+        let mnemonic = ZincMnemonic::parse(TEST_PHRASE).expect("mnemonic");
+        WalletBuilder::from_mnemonic(Network::Regtest, &mnemonic)
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .expect("seed wallet")
+            .peek_payment_address(0)
+            .expect("payment address")
+            .to_string()
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -140,5 +163,75 @@ mod tests {
         assert_eq!(state.account_index, 1);
         assert_eq!(state.network, crate::Network::Signet);
         assert_eq!(state.scheme, crate::AddressScheme::Dual);
+    }
+
+    #[test]
+    fn test_wasm_watch_address_constructor_accepts_matching_network() {
+        let watch_address = regtest_taproot_watch_address();
+        let wallet = ZincWasmWallet::new_watch_address("regtest", &watch_address, None, Some(0))
+            .expect("watch wallet should initialize");
+
+        let inner = wallet.inner.try_borrow().expect("wallet borrow should work");
+        assert_eq!(inner.peek_taproot_address(0).to_string(), watch_address);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn test_wasm_watch_address_rejects_network_mismatch() {
+        let watch_address = regtest_taproot_watch_address();
+        let err = match ZincWasmWallet::new_watch_address("mainnet", &watch_address, None, Some(0)) {
+            Ok(_) => panic!("network mismatch should fail"),
+            Err(err) => err,
+        };
+        let text = err
+            .as_string()
+            .unwrap_or_else(|| format!("non-string error: {err:?}"));
+        assert!(text.contains("Address does not belong to network"));
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn test_wasm_watch_address_rejects_non_taproot() {
+        let non_taproot = regtest_non_taproot_payment_address();
+        let err = match ZincWasmWallet::new_watch_address("regtest", &non_taproot, None, Some(0)) {
+            Ok(_) => panic!("non-taproot should fail"),
+            Err(err) => err,
+        };
+        let text = err
+            .as_string()
+            .unwrap_or_else(|| format!("non-string error: {err:?}"));
+        assert!(text.contains("taproot"));
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn test_wasm_watch_address_cannot_sign() {
+        let watch_address = regtest_taproot_watch_address();
+        let wallet = ZincWasmWallet::new_watch_address("regtest", &watch_address, None, Some(0))
+            .expect("watch wallet should initialize");
+
+        let err = wallet
+            .sign_message(&watch_address, "watch cannot sign")
+            .expect_err("watch mode should not sign");
+        let text = err
+            .as_string()
+            .unwrap_or_else(|| format!("non-string error: {err:?}"));
+        assert!(text.contains("Capability missing"));
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn test_wasm_watch_address_enforces_account_zero() {
+        let watch_address = regtest_taproot_watch_address();
+        let wallet = ZincWasmWallet::new_watch_address("regtest", &watch_address, None, Some(0))
+            .expect("watch wallet should initialize");
+
+        let err = wallet
+            .set_active_account(1)
+            .expect_err("watch mode should reject account index != 0");
+        let text = err
+            .as_string()
+            .unwrap_or_else(|| format!("non-string error: {err:?}"));
+        assert!(text.contains("account index 0 only"));
     }
 }
