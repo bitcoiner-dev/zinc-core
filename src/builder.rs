@@ -2635,6 +2635,118 @@ impl WalletBuilder {
         }
     }
 
+    pub fn build_hardware(
+        network: Network,
+        _fingerprint: [u8; 4], // Not used for Watch identities strictly but reserved for future
+        taproot_external_desc: String,
+        taproot_internal_desc: String,
+        payment_external_desc: Option<String>,
+        payment_internal_desc: Option<String>,
+        account_index: u32,
+        persistence: Option<ZincPersistence>,
+    ) -> Result<ZincWallet, String> {
+        let (vault_wallet, loaded_vault_changeset) = if let Some(p) = &persistence {
+            if let Some(changeset) = &p.taproot {
+                let res = Wallet::load()
+                    .descriptor(KeychainKind::External, Some(taproot_external_desc.to_string()))
+                    .descriptor(KeychainKind::Internal, Some(taproot_internal_desc.to_string()))
+                    .extract_keys()
+                    .load_wallet_no_persist(changeset.clone());
+
+                match res {
+                    Ok(Some(w)) => (w, changeset.clone()),
+                    Ok(None) | Err(_) => {
+                        let w = Wallet::create(taproot_external_desc, taproot_internal_desc)
+                            .network(network)
+                            .create_wallet_no_persist()
+                            .map_err(|e| format!("Failed to create taproot wallet from descriptor: {e}"))?;
+                        (w, bdk_wallet::ChangeSet::default())
+                    }
+                }
+            } else {
+                let w = Wallet::create(taproot_external_desc, taproot_internal_desc)
+                    .network(network)
+                    .create_wallet_no_persist()
+                    .map_err(|e| format!("Failed to create taproot wallet from descriptor: {e}"))?;
+                (w, bdk_wallet::ChangeSet::default())
+            }
+        } else {
+            let w = Wallet::create(taproot_external_desc, taproot_internal_desc)
+                .network(network)
+                .create_wallet_no_persist()
+                .map_err(|e| format!("Failed to create taproot wallet from descriptor: {e}"))?;
+            (w, bdk_wallet::ChangeSet::default())
+        };
+
+        let (payment_wallet, loaded_payment_changeset) =
+            if let (Some(pay_ext), Some(pay_int)) = (payment_external_desc, payment_internal_desc) {
+                let (wallet, changeset) = if let Some(p) = &persistence {
+                    if let Some(changeset) = &p.payment {
+                        let res = Wallet::load()
+                            .descriptor(KeychainKind::External, Some(pay_ext.to_string()))
+                            .descriptor(KeychainKind::Internal, Some(pay_int.to_string()))
+                            .extract_keys()
+                            .load_wallet_no_persist(changeset.clone());
+
+                        match res {
+                            Ok(Some(w)) => (w, Some(changeset.clone())),
+                            Ok(None) | Err(_) => {
+                                let w = Wallet::create(pay_ext, pay_int)
+                                    .network(network)
+                                    .create_wallet_no_persist()
+                                    .map_err(|e| format!("Failed to create payment wallet from descriptor: {e}"))?;
+                                (w, None)
+                            }
+                        }
+                    } else {
+                        let w = Wallet::create(pay_ext, pay_int)
+                            .network(network)
+                            .create_wallet_no_persist()
+                            .map_err(|e| format!("Failed to create payment wallet from descriptor: {e}"))?;
+                        (w, None)
+                    }
+                } else {
+                    let w = Wallet::create(pay_ext, pay_int)
+                        .network(network)
+                        .create_wallet_no_persist()
+                        .map_err(|e| format!("Failed to create payment wallet from descriptor: {e}"))?;
+                    (w, None)
+                };
+                (Some(wallet), changeset)
+            } else {
+                (None, None)
+            };
+
+        let scheme = if payment_wallet.is_some() {
+            AddressScheme::Dual
+        } else {
+            AddressScheme::Unified
+        };
+
+        let watch_address = vault_wallet.peek_address(KeychainKind::External, 0).address;
+
+        Ok(ZincWallet {
+            vault_wallet,
+            payment_wallet,
+            scheme,
+            derivation_mode: DerivationMode::Account,
+            payment_address_type: PaymentAddressType::NativeSegwit,
+            loaded_vault_changeset,
+            loaded_payment_changeset,
+            account_index,
+            inscribed_utxos: std::collections::HashSet::default(),
+            inscriptions: Vec::new(),
+            rune_balances: Vec::new(),
+            ordinals_verified: false,
+            ordinals_metadata_complete: false,
+            identity: CoreIdentity::WatchAddress(watch_address),
+            is_syncing: false,
+            account_generation: 0,
+            mode: ProfileMode::Watch,
+            scan_policy: ScanPolicy::default(),
+        })
+    }
+
     /// Create a new builder from network and a strongly typed 64-byte seed.
     pub fn from_seed(network: Network, seed: Seed64) -> Self {
         Self::new(network, seed.as_ref())

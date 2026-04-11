@@ -638,6 +638,64 @@ impl ZincWasmWallet {
         builder.build().map_err(|e| JsValue::from_str(&e))
     }
 
+    #[wasm_bindgen]
+    pub fn new_hardware(
+        network: &str,
+        fingerprint_hex: &str,
+        taproot_external_desc: &str,
+        taproot_internal_desc: &str,
+        payment_external_desc: Option<String>,
+        payment_internal_desc: Option<String>,
+        account_index: u32,
+        persistence_json: Option<String>,
+    ) -> Result<ZincWasmWallet, JsValue> {
+        let network_enum = match network {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "signet" => Network::Signet,
+            "testnet" => Network::Testnet,
+            "regtest" => Network::Regtest,
+            _ => return Err(JsValue::from_str("Invalid network")),
+        };
+
+        // Parse 4-byte fingerprint from hex or ignore depending on what we configured
+        let mut fingerprint = [0u8; 4];
+        if let Ok(fp_bytes) = hex::decode(fingerprint_hex) {
+            if fp_bytes.len() == 4 {
+                fingerprint.copy_from_slice(&fp_bytes);
+            }
+        }
+
+        let persistence = if let Some(json) = persistence_json {
+            Some(serde_json::from_str::<ZincPersistence>(&json).map_err(|e| JsValue::from_str(&e.to_string()))?)
+        } else {
+            None
+        };
+
+        let wallet = WalletBuilder::build_hardware(
+            network_enum,
+            fingerprint,
+            taproot_external_desc.to_string(),
+            taproot_internal_desc.to_string(),
+            payment_external_desc,
+            payment_internal_desc,
+            account_index,
+            persistence,
+        ).map_err(|e| JsValue::from_str(&e))?;
+        
+        Ok(ZincWasmWallet {
+            inner: std::rc::Rc::new(std::cell::RefCell::new(wallet)),
+            material: WalletMaterial::WatchAddress("hardware_stub".to_string()),
+            state: std::cell::Cell::new(WalletState {
+                network: network_enum,
+                scheme: AddressScheme::Dual,
+                derivation_mode: DerivationMode::Account,
+                payment_address_type: PaymentAddressType::NativeSegwit,
+                account_index,
+            }),
+            vitality: VITALITY_MAGIC,
+        })
+    }
+
     fn build_watch_wallet(
         network: Network,
         watch_address: &str,
