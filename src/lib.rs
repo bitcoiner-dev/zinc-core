@@ -1125,8 +1125,8 @@ impl ZincWasmWallet {
             let payment_address = inner.peek_payment_address(0).map(|address| address.to_string());
             let payment_public_key = inner.get_payment_public_key(0).ok();
             let accounts = vec![serde_json::json!({
-                "index": 0,
-                "label": "Account 1",
+                "index": self.state_snapshot().account_index,
+                "label": format!("Account {}", self.state_snapshot().account_index + 1),
                 "taprootAddress": taproot_address.clone(),
                 "taprootPublicKey": taproot_public_key.clone(),
                 "paymentAddress": payment_address,
