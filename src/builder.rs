@@ -1639,6 +1639,274 @@ impl ZincWallet {
         Ok(signed_base64)
     }
 
+    /// Prepare a PSBT for external signing (e.g. on a hardware wallet).
+    ///
+    /// Performs the pre-sign checks and enrichment that `sign_psbt` does
+    /// (UTXO enrichment, sighash validation, bounds checks, Ordinal Shield),
+    /// then returns the enriched PSBT as base64 for device signing.
+    pub fn prepare_external_sign_psbt(
+        &self,
+        psbt_base64: &str,
+        options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|e| format!("Invalid base64: {e}"))?;
+
+        let mut psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| format!("Invalid PSBT: {e}"))?;
+
+        use std::collections::HashMap;
+        let mut known_utxos = HashMap::new();
+
+        let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
+            for utxo in w.list_unspent() {
+                map.insert(utxo.outpoint, utxo.txout);
+            }
+        };
+
+        collect_utxos(&self.vault_wallet, &mut known_utxos);
+        if let Some(w) = &self.payment_wallet {
+            collect_utxos(w, &mut known_utxos);
+        }
+
+        for (i, input) in psbt.inputs.iter_mut().enumerate() {
+            if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
+                let outpoint = psbt.unsigned_tx.input[i].previous_output;
+                if let Some(txout) = known_utxos.get(&outpoint) {
+                    input.witness_utxo = Some(txout.clone());
+                }
+            }
+        }
+
+        #[allow(deprecated)]
+        let _ = self.vault_wallet.sign(&mut psbt, bdk_wallet::SignOptions::default());
+        if let Some(w) = &self.payment_wallet {
+            #[allow(deprecated)]
+            let _ = w.sign(&mut psbt, bdk_wallet::SignOptions::default());
+        }
+
+        if let Some(opts) = &options {
+            if let Some(sighash_u8) = opts.sighash {
+                let target_sighash = bitcoin::psbt::PsbtSighashType::from_u32(sighash_u8 as u32);
+                for input in psbt.inputs.iter_mut() {
+                    input.sighash_type = Some(target_sighash);
+                }
+            }
+        }
+
+        let inputs_to_sign = options.as_ref().and_then(|o| o.sign_inputs.clone());
+        if let Some(indices) = inputs_to_sign.as_ref() {
+            let mut seen = std::collections::HashSet::new();
+            for index in indices {
+                if *index >= psbt.inputs.len() {
+                    return Err(format!(
+                        "Security Violation: sign_inputs index {} is out of bounds for {} inputs",
+                        index,
+                        psbt.inputs.len()
+                    ));
+                }
+                if !seen.insert(*index) {
+                    return Err(format!(
+                        "Security Violation: sign_inputs index {} is duplicated",
+                        index
+                    ));
+                }
+                let input = &psbt.inputs[*index];
+                if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
+                    return Err(format!(
+                        "Security Violation: Requested input #{} is missing UTXO metadata",
+                        index
+                    ));
+                }
+            }
+        }
+
+        for (index, input) in psbt.inputs.iter().enumerate() {
+            if let Some(sighash) = input.sighash_type {
+                let value = sighash.to_u32();
+                let base_type = value & 0x1f;
+                let anyone_can_pay = (value & 0x80) != 0;
+                let is_allowed_base = base_type == 0 || base_type == 1; // DEFAULT or ALL
+
+                if anyone_can_pay || !is_allowed_base {
+                    return Err(format!(
+                        "Security Violation: Sighash type is not allowed on input #{} (value={})",
+                        index, value
+                    ));
+                }
+            }
+        }
+
+        let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
+            HashMap::new();
+        for ins in &self.inscriptions {
+            known_inscriptions
+                .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
+                .or_default()
+                .push((ins.id.clone(), ins.satpoint.offset));
+        }
+        for items in known_inscriptions.values_mut() {
+            items.sort_by_key(|(_, offset)| *offset);
+        }
+
+        if let Err(e) = crate::ordinals::shield::audit_psbt(
+            &psbt,
+            &known_inscriptions,
+            inputs_to_sign.as_deref(),
+            self.vault_wallet.network(),
+        ) {
+            return Err(format!("Security Violation: {}", e));
+        }
+
+        let prepared_bytes = psbt.serialize();
+        Ok(base64::engine::general_purpose::STANDARD.encode(&prepared_bytes))
+    }
+
+    /// Verify a PSBT that was signed externally (e.g. by a hardware wallet).
+    ///
+    /// Ensures unsigned transaction bytes are unchanged and only expected inputs
+    /// gained signatures, then optionally finalizes and returns base64.
+    pub fn verify_external_signed_psbt(
+        &self,
+        original_psbt_base64: &str,
+        signed_psbt_base64: &str,
+        required_input_indices: Option<&[usize]>,
+        finalize: bool,
+    ) -> Result<String, String> {
+        use base64::Engine;
+        use bitcoin::consensus::Encodable;
+
+        let decode = |b64: &str, label: &str| -> Result<Psbt, String> {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("Invalid base64 in {label}: {e}"))?;
+            Psbt::deserialize(&bytes).map_err(|e| format!("Invalid PSBT in {label}: {e}"))
+        };
+
+        let original = decode(original_psbt_base64, "original")?;
+        let mut signed = decode(signed_psbt_base64, "signed")?;
+
+        let mut orig_tx_bytes = Vec::new();
+        original
+            .unsigned_tx
+            .consensus_encode(&mut orig_tx_bytes)
+            .map_err(|e| format!("Failed to encode original tx: {e}"))?;
+
+        let mut signed_tx_bytes = Vec::new();
+        signed
+            .unsigned_tx
+            .consensus_encode(&mut signed_tx_bytes)
+            .map_err(|e| format!("Failed to encode signed tx: {e}"))?;
+
+        if orig_tx_bytes != signed_tx_bytes {
+            return Err(
+                "Security Violation: Device returned a PSBT with a modified transaction. \
+                 The unsigned_tx bytes do not match the original."
+                    .to_string(),
+            );
+        }
+
+        let check_indices: Vec<usize> = required_input_indices
+            .map(|v| v.to_vec())
+            .unwrap_or_else(|| (0..signed.inputs.len()).collect());
+
+        for &idx in &check_indices {
+            if idx >= signed.inputs.len() {
+                return Err(format!(
+                    "Security Violation: required input index {} is out of bounds",
+                    idx
+                ));
+            }
+
+            let input = &signed.inputs[idx];
+            let has_signature = input.tap_key_sig.is_some()
+                || !input.tap_script_sigs.is_empty()
+                || !input.partial_sigs.is_empty()
+                || input.final_script_witness.is_some();
+
+            if !has_signature {
+                return Err(format!(
+                    "Security Violation: Required input #{} was not signed by the device",
+                    idx
+                ));
+            }
+        }
+
+        if required_input_indices.is_some() {
+            let required_set: std::collections::HashSet<usize> =
+                check_indices.iter().copied().collect();
+
+            for (i, (orig_input, signed_input)) in original
+                .inputs
+                .iter()
+                .zip(signed.inputs.iter())
+                .enumerate()
+            {
+                if required_set.contains(&i) {
+                    continue;
+                }
+
+                let signatures_changed = orig_input.tap_key_sig != signed_input.tap_key_sig
+                    || orig_input.tap_script_sigs != signed_input.tap_script_sigs
+                    || orig_input.partial_sigs != signed_input.partial_sigs
+                    || orig_input.final_script_witness != signed_input.final_script_witness;
+
+                if signatures_changed {
+                    return Err(format!(
+                        "Security Violation: Input #{} received an unauthorized signature \
+                         (not in required_input_indices)",
+                        i
+                    ));
+                }
+            }
+        }
+
+        if !finalize {
+            // External multi-pass hardware signing can reuse the signed PSBT as input
+            // for a subsequent pass (e.g. payment first, then taproot). Some device
+            // SDKs infer "internal" inputs from derivation metadata and can be
+            // confused by derivations added in prior passes. Clearing derivation
+            // metadata here keeps the collected signatures while preventing
+            // cross-pass account-type contamination.
+            for input in signed.inputs.iter_mut() {
+                input.bip32_derivation.clear();
+                input.tap_key_origins.clear();
+            }
+        }
+
+        if finalize {
+            for input in signed.inputs.iter_mut() {
+                if let Some(sig) = input.tap_key_sig {
+                    let mut witness = bitcoin::Witness::new();
+                    witness.push(sig.to_vec());
+                    input.final_script_witness = Some(witness);
+                    input.tap_key_sig = None;
+                    input.tap_internal_key = None;
+                    input.tap_merkle_root = None;
+                    input.tap_key_origins.clear();
+                    input.witness_utxo = None;
+                    input.sighash_type = None;
+                } else if !input.partial_sigs.is_empty() {
+                    if let Some((pubkey, sig)) = input.partial_sigs.iter().next() {
+                        let mut witness = bitcoin::Witness::new();
+                        witness.push(sig.to_vec());
+                        witness.push(pubkey.to_bytes());
+                        input.final_script_witness = Some(witness);
+                        input.partial_sigs.clear();
+                        input.bip32_derivation.clear();
+                        input.witness_utxo = None;
+                        input.sighash_type = None;
+                    }
+                }
+            }
+        }
+
+        let verified_bytes = signed.serialize();
+        Ok(base64::engine::general_purpose::STANDARD.encode(&verified_bytes))
+    }
+
     /// Analyzes a PSBT for Ordinal Shield protection.
     /// Returns a JSON string containing the `AnalysisResult`.
     pub fn analyze_psbt(&self, psbt_base64: &str) -> Result<String, String> {
