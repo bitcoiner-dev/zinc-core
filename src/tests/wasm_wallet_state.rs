@@ -21,6 +21,7 @@ mod tests {
         .expect("wallet should initialize")
     }
 
+    #[cfg(target_arch = "wasm32")]
     fn regtest_taproot_watch_address() -> String {
         let mnemonic = ZincMnemonic::parse(TEST_PHRASE).expect("mnemonic");
         WalletBuilder::from_mnemonic(Network::Regtest, &mnemonic)
@@ -165,7 +166,8 @@ mod tests {
         assert_eq!(state.scheme, crate::AddressScheme::Dual);
     }
 
-    #[test]
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
     fn test_wasm_watch_address_constructor_accepts_matching_network() {
         let watch_address = regtest_taproot_watch_address();
         let wallet = ZincWasmWallet::new_watch_address("regtest", &watch_address, None, Some(0))
