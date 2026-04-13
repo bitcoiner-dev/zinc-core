@@ -54,9 +54,9 @@ pub mod sign_intent;
 
 // Re-exports for convenience
 pub use builder::{
-    Account, AddressScheme, CoreIdentity, CreatePsbtRequest, CreatePsbtTransportRequest,
-    DerivationMode, DiscoveryAccountPlan, DiscoveryContext, PaymentAddressType, ProfileMode,
-    ScanPolicy, Seed64, SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, ZincBalance,
+    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest, DerivationMode,
+    DiscoveryAccountPlan, DiscoveryContext, PaymentAddressType, ProfileMode, ScanPolicy, Seed64,
+    SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, WalletKind, ZincBalance,
     ZincPersistence, ZincSyncRequest, ZincWallet,
 };
 pub use error::{ZincError, ZincResult};
@@ -671,16 +671,29 @@ impl ZincWasmWallet {
             None
         };
 
-        let wallet = WalletBuilder::build_hardware(
-            network_enum,
-            fingerprint,
+        let mut builder = WalletBuilder::new(network_enum)
+            .with_account_index(account_index);
+
+        if let Some(p) = persistence {
+            builder = builder.persistence(p);
+        }
+
+        let wallet = builder.build_hardware(
+            fingerprint_hex,
             taproot_external_desc.to_string(),
             taproot_internal_desc.to_string(),
-            payment_external_desc,
-            payment_internal_desc,
-            account_index,
-            persistence,
+            payment_external_desc.clone(),
+            payment_internal_desc.clone(),
         ).map_err(|e| JsValue::from_str(&e))?;
+
+        zinc_log_debug!(
+            target: LOG_TARGET_WASM,
+            "new_hardware - network: {:?}, fp: {:?}, tap_ext: {}, pay_ext: {:?}",
+            network_enum,
+            fingerprint,
+            taproot_external_desc,
+            payment_external_desc
+        );
         
         Ok(ZincWasmWallet {
             inner: std::rc::Rc::new(std::cell::RefCell::new(wallet)),
@@ -749,6 +762,7 @@ impl ZincWasmWallet {
         }
     }
 
+    #[allow(dead_code)]
     fn seed_phrase(&self) -> Result<&str, JsValue> {
         match &self.material {
             WalletMaterial::MnemonicPhrase(phrase) => Ok(phrase.as_str()),
@@ -1113,93 +1127,12 @@ impl ZincWasmWallet {
     pub fn get_accounts(&self, count: u32) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
 
-        if matches!(self.material, WalletMaterial::WatchAddress(_)) {
-            let inner = self
-                .inner
-                .try_borrow()
-                .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {e}")))?;
-            let taproot_address = inner.peek_taproot_address(0).to_string();
-            let taproot_public_key = inner
-                .get_taproot_public_key(0)
-                .unwrap_or_else(|_| String::new());
-            let payment_address = inner.peek_payment_address(0).map(|address| address.to_string());
-            let payment_public_key = inner.get_payment_public_key(0).ok();
-            let accounts = vec![serde_json::json!({
-                "index": self.state_snapshot().account_index,
-                "label": format!("Account {}", self.state_snapshot().account_index + 1),
-                "taprootAddress": taproot_address.clone(),
-                "taprootPublicKey": taproot_public_key.clone(),
-                "paymentAddress": payment_address,
-                "paymentPublicKey": payment_public_key,
-                "vaultAddress": taproot_address,
-                "vaultPublicKey": taproot_public_key,
-            })];
-            return serde_wasm_bindgen::to_value(&accounts)
-                .map_err(|e| JsValue::from_str(&e.to_string()));
-        }
-
-        // Optimize: parse mnemonic and derive seed only once
-        let mnemonic = crate::keys::ZincMnemonic::parse(self.seed_phrase()?)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let state = self.state_snapshot();
-        let network = state.network;
-        let scheme = state.scheme;
-        let derivation_mode = state.derivation_mode;
-        let payment_address_type = state.payment_address_type;
-
-        let mut accounts = Vec::new();
-        for i in 0..count {
-            let mut builder = WalletBuilder::from_mnemonic(network, &mnemonic);
-            builder = builder
-                .with_scheme(scheme)
-                .with_derivation_mode(derivation_mode)
-                .with_payment_address_type(payment_address_type)
-                .with_account_index(i);
-
-            // Build temporary wallet (no persistence)
-            let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-
-            // Use peek_address for speed (no revealing/saving in memory)
-            let vault_addr = zwallet.peek_taproot_address(0);
-
-            let vault_pubkey = zwallet
-                .get_taproot_public_key(0)
-                .unwrap_or_else(|_| String::new());
-
-            let (payment_addr, payment_pubkey) = if scheme == AddressScheme::Dual {
-                (
-                    Some(
-                        zwallet
-                            .peek_payment_address(0)
-                            .ok_or_else(|| {
-                                JsValue::from_str("Payment wallet missing in dual mode")
-                            })?
-                            .to_string(),
-                    ),
-                    Some(
-                        zwallet
-                            .get_payment_public_key(0)
-                            .unwrap_or_else(|_| String::new()),
-                    ),
-                )
-            } else {
-                (None, None)
-            };
-
-            accounts.push(serde_json::json!({
-                "index": i,
-                "label": format!("Account {}", i),
-                "taprootAddress": vault_addr.to_string(),
-                "taprootPublicKey": vault_pubkey,
-                "paymentAddress": payment_addr,
-                "paymentPublicKey": payment_pubkey,
-                // Backward-compatible aliases for older clients.
-                "vaultAddress": vault_addr.to_string(),
-                "vaultPublicKey": vault_pubkey,
-            }));
-        }
-
-        serde_wasm_bindgen::to_value(&accounts).map_err(|e| JsValue::from_str(&e.to_string()))
+        let inner = self.inner.try_borrow()
+            .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {e}")))?;
+        
+        let accounts = inner.get_accounts(count);
+        serde_wasm_bindgen::to_value(&accounts)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Return cached inscription list currently loaded in wallet state.
@@ -2161,6 +2094,73 @@ impl ZincWasmWallet {
                 .sign_psbt(psbt_base64, sign_opts)
                 .map_err(JsValue::from),
             Err(e) => Err(JsValue::from_str(&format!("Wallet busy (sign_psbt): {e}"))),
+        }
+    }
+
+    /// Prepare a PSBT for external hardware signing.
+    #[wasm_bindgen(js_name = prepareExternalSignPsbt)]
+    pub fn prepare_external_sign_psbt(
+        &self,
+        psbt_base64: &str,
+        options: JsValue,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        let sign_opts: Option<crate::builder::SignOptions> = if options.is_null() || options.is_undefined() {
+            None
+        } else {
+            match serde_wasm_bindgen::from_value(options) {
+                Ok(opts) => Some(opts),
+                Err(e) => return Err(JsValue::from_str(&format!("Invalid options: {e}"))),
+            }
+        };
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .prepare_external_sign_psbt(psbt_base64, sign_opts)
+                .map_err(JsValue::from),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (prepare_external_sign_psbt): {e}"
+            ))),
+        }
+    }
+
+    /// Verify a PSBT signed externally by a hardware wallet.
+    #[wasm_bindgen(js_name = verifyExternalSignedPsbt)]
+    pub fn verify_external_signed_psbt(
+        &self,
+        original_psbt_base64: &str,
+        signed_psbt_base64: &str,
+        required_input_indices: JsValue,
+        finalize: bool,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        let indices: Option<Vec<usize>> = if required_input_indices.is_null() || required_input_indices.is_undefined() {
+            None
+        } else {
+            match serde_wasm_bindgen::from_value(required_input_indices) {
+                Ok(val) => Some(val),
+                Err(e) => {
+                    return Err(JsValue::from_str(&format!(
+                        "Invalid required_input_indices: {e}"
+                    )))
+                }
+            }
+        };
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .verify_external_signed_psbt(
+                    original_psbt_base64,
+                    signed_psbt_base64,
+                    indices.as_deref(),
+                    finalize,
+                )
+                .map_err(JsValue::from),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (verify_external_signed_psbt): {e}"
+            ))),
         }
     }
 

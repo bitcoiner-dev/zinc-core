@@ -42,6 +42,7 @@ fn test_watch_wallet_derivation() {
     let watch_wallet = WalletBuilder::from_watch_only(network)
         .with_xpub(&account_xpub)
         .expect("valid xpub")
+        .with_scheme(AddressScheme::Dual)
         .build()
         .expect("watch wallet");
 
@@ -170,6 +171,7 @@ fn test_watch_wallet_signing_gat() {
     let watch_wallet = WalletBuilder::from_watch_only(network)
         .with_xpub(&account_xpub)
         .expect("valid xpub")
+        .with_scheme(AddressScheme::Dual)
         .build()
         .expect("watch wallet");
 
