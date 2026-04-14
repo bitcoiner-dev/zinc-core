@@ -1,11 +1,13 @@
 pub mod balance;
 pub mod discovery_scan;
+pub mod dual_send_signing;
 pub mod offer;
 pub mod offer_accept;
 pub mod offer_create;
 pub mod offer_nostr;
 pub mod offer_relay;
 pub mod ordinal_shield;
+pub mod persistence_scope;
 pub mod profiles;
 pub mod sign_intent;
 pub mod signing;

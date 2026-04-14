@@ -506,26 +506,19 @@ fn payment_descriptor_for_xprv(
     account: u32,
     chain: u32,
 ) -> String {
-    use bitcoin::secp256k1::Secp256k1;
-
-    let secp = Secp256k1::new();
     let pay_purpose = address_type.purpose();
-    let pay_account_xprv = xprv
-        .derive_priv(
-            &secp,
-            &[
-                bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(pay_purpose)
-                    .expect("payment purpose index must be valid"),
-                bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type)
-                    .expect("coin type index must be valid"),
-                bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account)
-                    .expect("account index must be valid"),
-            ],
-        )
-        .expect("payment account derivation path must be valid");
-    let pay_account_xpub = bdk_wallet::bitcoin::bip32::Xpub::from_priv(&secp, &pay_account_xprv);
 
-    payment_descriptor_for_xpub(&pay_account_xpub, address_type, chain)
+    match address_type {
+        PaymentAddressType::NativeSegwit => {
+            format!("wpkh({xprv}/{pay_purpose}'/{coin_type}'/{account}'/{chain}/*)")
+        }
+        PaymentAddressType::NestedSegwit => {
+            format!("sh(wpkh({xprv}/{pay_purpose}'/{coin_type}'/{account}'/{chain}/*))")
+        }
+        PaymentAddressType::Legacy => {
+            format!("pkh({xprv}/{pay_purpose}'/{coin_type}'/{account}'/{chain}/*)")
+        }
+    }
 }
 
 fn payment_descriptor_for_xpub(
