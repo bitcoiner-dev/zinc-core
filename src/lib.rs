@@ -1127,14 +1127,14 @@ impl ZincWasmWallet {
     pub fn get_accounts(&self, count: u32) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
 
-        let inner = self.inner.try_borrow()
-            .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {e}")))?;
-        
-        let accounts = inner.get_accounts(count);
-        serde_wasm_bindgen::to_value(&accounts)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {}", e)))?;
 
+        let accounts = inner.get_accounts(count);
+        Ok(serde_wasm_bindgen::to_value(&accounts)?)
+    }
     /// Return cached inscription list currently loaded in wallet state.
     pub fn get_inscriptions(&self) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
