@@ -693,9 +693,9 @@ impl ZincWallet {
                 };
 
                 // Find the first slash indicating the derivation path start from the xpub.
-                // If no slash, use the whole string (it might be a plain xpub).
+                // If no slash, use the whole string (it might be a plain xpub or have trailing descriptor syntax).
                 let xpub_end_pos = xpub_start_part.find('/').unwrap_or(xpub_start_part.len());
-                let xpub_str = &xpub_start_part[..xpub_end_pos];
+                let xpub_str = xpub_start_part[..xpub_end_pos].trim_end_matches(')');
 
                 // 2. Parse and derive.
                 use bitcoin::bip32::{ChildNumber, Xpub};
