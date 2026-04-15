@@ -21,7 +21,7 @@
 //! Additional examples are available in `examples/`:
 //! `wallet_setup`, `sync_and_balance`, and `psbt_sign_audit`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(any(target_arch = "wasm32", test))]
 use std::future::Future;
 use wasm_bindgen::prelude::*;
@@ -203,6 +203,172 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 const LOG_TARGET_WASM: &str = "zinc_core::wasm";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountDiscoveryReport {
+    pub index: u32,
+    pub path_type: String, // "standard" | "legacy"
+    pub balance_sats: u64,
+    pub inscription_count: u32,
+    pub taproot_external: String,
+    pub taproot_internal: String,
+    pub payment_external: Option<String>,
+    pub payment_internal: Option<String>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+async fn probe_single_account(
+    client: &reqwest::Client,
+    esplora_url: &str,
+    ord_url: &str,
+    network: Network,
+    fingerprint_hex: &str,
+    index: u32,
+    taproot_xpub: &str,
+    payment_xpub: Option<&String>,
+    path_type: &str,
+) -> Option<AccountDiscoveryReport> {
+    // 1. Build descriptors for this specific index
+    let (t_ext, t_int) = if path_type == "legacy" {
+        let path = format!("86'/{}'/0'", if network == Network::Bitcoin { 0 } else { 1 });
+        (
+            format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/0/{index})"),
+            format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/1/{index})"),
+        )
+    } else {
+        let path = format!("86'/{}'/{index}'", if network == Network::Bitcoin { 0 } else { 1 });
+        (
+            format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/0/*)"),
+            format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/1/*)"),
+        )
+    };
+
+    let (p_ext, p_int) = if let Some(xpub) = payment_xpub {
+        if path_type == "legacy" {
+            let path = format!("84'/{}'/0'", if network == Network::Bitcoin { 0 } else { 1 });
+            (
+                Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/0/{index})")),
+                Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/1/{index})")),
+            )
+        } else {
+            let path = format!("84'/{}'/{index}'", if network == Network::Bitcoin { 0 } else { 1 });
+            (
+                Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/0/*)")),
+                Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/1/*)")),
+            )
+        }
+    } else {
+        (None, None)
+    };
+
+    // 2. Initialize a temporary wallet to derive addresses
+    if path_type == "standard" && index > 0 {
+        return None;
+    }
+
+    let mut builder = WalletBuilder::new(network);
+    let wallet = match builder.build_hardware(
+        fingerprint_hex,
+        t_ext.clone(),
+        t_int.clone(),
+        p_ext.clone(),
+        p_int.clone(),
+    ) {
+        Ok(w) => w,
+        Err(_) => return None,
+    };
+
+    let vault_addr = wallet.peek_taproot_address(0).to_string();
+    let payment_addr = wallet.peek_payment_address(0).map(|a| a.to_string());
+
+    // 3. Probing
+    let mut total_balance = 0u64;
+    let mut total_inscriptions = 0u32;
+    let mut has_activity = false;
+
+    // Check Vault Address
+    if let Some((bal, ins, active)) = fetch_addr_stats(client, esplora_url, ord_url, &vault_addr).await {
+        total_balance += bal;
+        total_inscriptions += ins;
+        if active { has_activity = true; }
+    }
+
+    // Check Payment Address
+    if let Some(p_addr) = payment_addr {
+        if let Some((bal, ins, active)) = fetch_addr_stats(client, esplora_url, ord_url, &p_addr).await {
+            total_balance += bal;
+            total_inscriptions += ins;
+            if active { has_activity = true; }
+        }
+    }
+
+    // Index 0 is always returned to ensure at least one account exists
+    if has_activity || index == 0 {
+        Some(AccountDiscoveryReport {
+            index,
+            path_type: path_type.to_string(),
+            balance_sats: total_balance,
+            inscription_count: total_inscriptions,
+            taproot_external: t_ext,
+            taproot_internal: t_int,
+            payment_external: p_ext,
+            payment_internal: p_int,
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+async fn fetch_addr_stats(
+    client: &reqwest::Client,
+    esplora_url: &str,
+    ord_url: &str,
+    address: &str,
+) -> Option<(u64, u32, bool)> {
+    // 1. Get Balance from Esplora
+    let url = format!("{}/address/{}", esplora_url, address);
+    let mut balance = 0u64;
+    let mut has_history = false;
+
+    if let Ok(resp) = client.get(&url).send().await {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            let chain_stats = &json["chain_stats"];
+            let mempool_stats = &json["mempool_stats"];
+
+            let chain_funded = chain_stats["funded_txo_sum"].as_u64().unwrap_or(0);
+            let chain_spent = chain_stats["spent_txo_sum"].as_u64().unwrap_or(0);
+            let chain_sats = chain_funded.saturating_sub(chain_spent);
+
+            let mempool_funded = mempool_stats["funded_txo_sum"].as_u64().unwrap_or(0);
+            let mempool_spent = mempool_stats["spent_txo_sum"].as_u64().unwrap_or(0);
+            let mempool_sats = mempool_funded.saturating_sub(mempool_spent);
+            
+            balance = chain_sats.saturating_add(mempool_sats);
+            
+            let tx_count = chain_stats["tx_count"].as_u64().unwrap_or(0)
+                + mempool_stats["tx_count"].as_u64().unwrap_or(0);
+            if tx_count > 0 { has_history = true; }
+        }
+    }
+
+    // 2. Get Inscriptions from Ord
+    let mut inscriptions = 0u32;
+    let ord_addr_url = format!("{}/address/{}", ord_url, address);
+    if let Ok(resp) = client.get(&ord_addr_url).header("Accept", "application/json").send().await {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(list) = json["inscriptions"].as_array() {
+                inscriptions = list.len() as u32;
+            }
+        }
+    }
+
+    if has_history || balance > 0 || inscriptions > 0 {
+        Some((balance, inscriptions, true))
+    } else {
+        Some((0, 0, false))
+    }
+}
 
 #[cfg(any(target_arch = "wasm32", test))]
 async fn first_active_receive_index_from_scan<F, Fut>(
@@ -589,6 +755,7 @@ struct WalletState {
 enum WalletMaterial {
     MnemonicPhrase(String),
     WatchAddress(String),
+    Hardware { fingerprint: [u8; 4] },
 }
 
 #[wasm_bindgen]
@@ -697,7 +864,7 @@ impl ZincWasmWallet {
         
         Ok(ZincWasmWallet {
             inner: std::rc::Rc::new(std::cell::RefCell::new(wallet)),
-            material: WalletMaterial::WatchAddress("hardware_stub".to_string()),
+            material: WalletMaterial::Hardware { fingerprint },
             state: std::cell::Cell::new(WalletState {
                 network: network_enum,
                 scheme: AddressScheme::Dual,
@@ -759,6 +926,9 @@ impl ZincWasmWallet {
                 next_state.account_index,
                 None,
             ),
+            WalletMaterial::Hardware { .. } => Err(JsValue::from_str(
+                "Dynamic state updates are not yet supported for hardware wallets in this handle",
+            )),
         }
     }
 
@@ -766,8 +936,8 @@ impl ZincWasmWallet {
     fn seed_phrase(&self) -> Result<&str, JsValue> {
         match &self.material {
             WalletMaterial::MnemonicPhrase(phrase) => Ok(phrase.as_str()),
-            WalletMaterial::WatchAddress(_) => Err(JsValue::from_str(
-                "Operation is unavailable for watch-address profiles",
+            WalletMaterial::WatchAddress(_) | WalletMaterial::Hardware { .. } => Err(JsValue::from_str(
+                "Operation is unavailable for watch-address and hardware profiles",
             )),
         }
     }
@@ -1135,6 +1305,77 @@ impl ZincWasmWallet {
         let accounts = inner.get_accounts(count);
         Ok(serde_wasm_bindgen::to_value(&accounts)?)
     }
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = probeHardwareAccounts)]
+    /// High-performance parallel probing of hardware account ranges.
+    /// Checks both Standard and Legacy paths for balances and inscriptions.
+    pub fn probe_hardware_accounts(
+        network: String,
+        fingerprint_hex: String,
+        esplora_url: String,
+        ord_url: String,
+        standard_taproot_xpub: String,
+        standard_payment_xpub: String,
+        legacy_taproot_xpub: String,
+        legacy_payment_xpub: String,
+        start_index: u32,
+        end_index: u32,
+    ) -> Result<js_sys::Promise, JsValue> {
+        let network_enum = match network.as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "signet" => Network::Signet,
+            "testnet" => Network::Testnet,
+            "regtest" => Network::Regtest,
+            _ => return Err(JsValue::from_str("Invalid network")),
+        };
+
+        Ok(wasm_bindgen_futures::future_to_promise(async move {
+            let client = reqwest::Client::new();
+            let mut reports = Vec::new();
+            
+            // Parallelism configuration
+            const ACCOUNT_BATCH_SIZE: usize = 5;
+            
+            for batch_start in (start_index..=end_index).step_by(ACCOUNT_BATCH_SIZE) {
+                let batch_end = (batch_start + ACCOUNT_BATCH_SIZE as u32).min(end_index + 1);
+                let mut batch_futures = Vec::new();
+
+                for idx in batch_start..batch_end {
+                    let client = client.clone();
+                    let esplora = esplora_url.clone();
+                    let ord = ord_url.clone();
+                    let s_t_xpub = standard_taproot_xpub.clone();
+                    let s_p_xpub = standard_payment_xpub.clone();
+                    let l_t_xpub = legacy_taproot_xpub.clone();
+                    let l_p_xpub = legacy_payment_xpub.clone();
+                    let fp = fingerprint_hex.clone();
+
+                    batch_futures.push(async move {
+                        // 1. Probe Standard Path (m/86'/0'/idx' and m/84'/0'/idx')
+                        let standard_report = probe_single_account(
+                            &client, &esplora, &ord, network_enum, &fp, idx, &s_t_xpub, Some(&s_p_xpub), "standard"
+                        ).await;
+
+                        // 2. Probe Legacy Path (m/86'/0'/0'/0/idx and m/84'/0'/0'/0/idx)
+                        let legacy_report = probe_single_account(
+                            &client, &esplora, &ord, network_enum, &fp, idx, &l_t_xpub, Some(&l_p_xpub), "legacy"
+                        ).await;
+
+                        (standard_report, legacy_report)
+                    });
+                }
+
+                let batch_results = futures_util::future::join_all(batch_futures).await;
+                for (s, l) in batch_results {
+                    if let Some(r) = s { reports.push(r); }
+                    if let Some(r) = l { reports.push(r); }
+                }
+            }
+
+            Ok(serde_wasm_bindgen::to_value(&reports)?)
+        }))
+    }
+
     /// Return cached inscription list currently loaded in wallet state.
     pub fn get_inscriptions(&self) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
