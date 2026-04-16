@@ -195,7 +195,8 @@ pub fn analyze_psbt_with_scope(
     });
 
     let mut analysis_psbt = psbt.clone();
-    let mut scoped_known_inscriptions: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::new();
+    // Optimization: Pre-allocate capacity based on the provided map size to avoid expensive reallocations
+    let mut scoped_known_inscriptions: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::with_capacity(known_inscriptions.len());
     let mut scope_has_unknown_inputs = false;
 
     if let Some(scope_indices) = normalized_scope.as_ref() {
