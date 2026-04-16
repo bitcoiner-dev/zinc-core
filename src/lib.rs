@@ -205,11 +205,20 @@ static INIT: Once = Once::new();
 const LOG_TARGET_WASM: &str = "zinc_core::wasm";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InscriptionPreview {
+    pub id: String,
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountDiscoveryReport {
     pub index: u32,
     pub path_type: String, // "standard" | "legacy"
-    pub balance_sats: u64,
+    pub primary_address: String,
+    pub spendable_sats: u64,
+    pub postage_sats: u64,
     pub inscription_count: u32,
+    pub inscriptions: Vec<InscriptionPreview>,
     pub taproot_external: String,
     pub taproot_internal: String,
     pub payment_external: Option<String>,
@@ -282,22 +291,26 @@ async fn probe_single_account(
     let payment_addr = wallet.peek_payment_address(0).map(|a| a.to_string());
 
     // 3. Probing
-    let mut total_balance = 0u64;
+    let mut spendable_sats = 0u64;
+    let mut postage_sats = 0u64;
     let mut total_inscriptions = 0u32;
+    let mut inscriptions = Vec::new();
     let mut has_activity = false;
 
-    // Check Vault Address
-    if let Some((bal, ins, active)) = fetch_addr_stats(client, esplora_url, ord_url, &vault_addr).await {
-        total_balance += bal;
-        total_inscriptions += ins;
+    // Check Vault Address (Postage + Inscriptions)
+    if let Some((bal, ins_list, active)) = fetch_addr_stats(client, esplora_url, ord_url, &vault_addr).await {
+        postage_sats += bal;
+        total_inscriptions += ins_list.len() as u32;
+        inscriptions.extend(ins_list);
         if active { has_activity = true; }
     }
 
-    // Check Payment Address
+    // Check Payment Address (Spendable BTC)
     if let Some(p_addr) = payment_addr {
-        if let Some((bal, ins, active)) = fetch_addr_stats(client, esplora_url, ord_url, &p_addr).await {
-            total_balance += bal;
-            total_inscriptions += ins;
+        if let Some((bal, ins_list, active)) = fetch_addr_stats(client, esplora_url, ord_url, &p_addr).await {
+            spendable_sats += bal;
+            total_inscriptions += ins_list.len() as u32;
+            inscriptions.extend(ins_list);
             if active { has_activity = true; }
         }
     }
@@ -307,8 +320,11 @@ async fn probe_single_account(
         Some(AccountDiscoveryReport {
             index,
             path_type: path_type.to_string(),
-            balance_sats: total_balance,
+            primary_address: vault_addr,
+            spendable_sats,
+            postage_sats,
             inscription_count: total_inscriptions,
+            inscriptions,
             taproot_external: t_ext,
             taproot_internal: t_int,
             payment_external: p_ext,
@@ -325,7 +341,7 @@ async fn fetch_addr_stats(
     esplora_url: &str,
     ord_url: &str,
     address: &str,
-) -> Option<(u64, u32, bool)> {
+) -> Option<(u64, Vec<InscriptionPreview>, bool)> {
     // 1. Get Balance from Esplora
     let url = format!("{}/address/{}", esplora_url, address);
     let mut balance = 0u64;
@@ -353,20 +369,46 @@ async fn fetch_addr_stats(
     }
 
     // 2. Get Inscriptions from Ord
-    let mut inscriptions = 0u32;
+    let mut inscriptions = Vec::new();
     let ord_addr_url = format!("{}/address/{}", ord_url, address);
     if let Ok(resp) = client.get(&ord_addr_url).header("Accept", "application/json").send().await {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(list) = json["inscriptions"].as_array() {
-                inscriptions = list.len() as u32;
+            // Handle different JSON structures: { "inscriptions": [...] } or direct array [...]
+            let list_opt = if let Some(list) = json["inscriptions"].as_array() {
+                Some(list)
+            } else if let Some(list) = json.as_array() {
+                Some(list)
+            } else {
+                None
+            };
+
+            if let Some(list) = list_opt {
+                for item in list.iter().take(10) {
+                    if let Some(id) = item.as_str() {
+                        inscriptions.push(InscriptionPreview {
+                            id: id.to_string(),
+                            content_type: None,
+                        });
+                    } else if let Some(obj) = item.as_object() {
+                        // Extract ID from object (handle various field names)
+                        let id_opt = obj.get("id").or(obj.get("inscription_id")).or(obj.get("inscriptionId"));
+                        if let Some(id) = id_opt.and_then(|v| v.as_str()) {
+                            let ct = obj.get("content_type").or(obj.get("contentType")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                            inscriptions.push(InscriptionPreview {
+                                id: id.to_string(),
+                                content_type: ct,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
 
-    if has_history || balance > 0 || inscriptions > 0 {
+    if has_history || balance > 0 || !inscriptions.is_empty() {
         Some((balance, inscriptions, true))
     } else {
-        Some((0, 0, false))
+        Some((0, Vec::new(), false))
     }
 }
 
