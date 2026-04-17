@@ -1414,7 +1414,7 @@ impl ZincWasmWallet {
                     break;
                 }
 
-                let mut builder = WalletBuilder::from_seed(network, seed);
+                let mut builder = WalletBuilder::from_seed(network, seed.clone());
                 builder = builder
                     .with_scheme(scheme)
                     .with_derivation_mode(derivation_mode)
@@ -1583,7 +1583,7 @@ impl ZincWasmWallet {
                     break;
                 }
 
-                let mut builder = WalletBuilder::from_seed(network, seed);
+                let mut builder = WalletBuilder::from_seed(network, seed.clone());
                 builder = builder
                     .with_scheme(scheme)
                     .with_derivation_mode(derivation_mode)
@@ -2047,7 +2047,7 @@ impl ZincWasmWallet {
         let mut known_inscriptions: std::collections::HashMap<
             (bitcoin::Txid, u32),
             Vec<(String, u64)>,
-        > = std::collections::HashMap::new();
+        > = std::collections::HashMap::with_capacity(inner.inscriptions.len());
         for ins in &inner.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
