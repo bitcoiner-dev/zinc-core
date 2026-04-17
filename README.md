@@ -7,29 +7,30 @@
 `zinc-core` is a Rust wallet engine for Bitcoin + Ordinals use cases.
 
 Key capabilities:
-- deterministic account/key derivation on top of BDK,
-- taproot-first public API naming,
-- transaction creation/signing/broadcast helpers,
-- Ordinal Shield PSBT analysis (burn/movement risk detection),
-- optional WASM bindings for browser and extension hosts.
+- **Ledger Hardware Wallet Integration**: Full signing and verification flow for external hardware devices.
+- **Watch-Only Identity**: Track and monitor any Taproot address without requiring private keys.
+- **Parallel Account Probing**: High-performance battery-efficient probing of multiple account paths via WASM.
+- **Deterministic Derivation**: Robust account/key derivation built on top of BDK.
+- **Ordinal Shield Integration**: Integrated PSBT analysis for burn and movement risk detection.
+- **Unified & Dual Schemes**: Flexible support for both unified taproot and distinct SegWit payment branches.
 
 ## Installation
 
 ```toml
 [dependencies]
-zinc-core = "0.1"
+zinc-core = "0.3.0"
 ```
 
 ## What You Get
 
-- BIP-39 mnemonic generation, validation, and seed derivation
-- Explicit-network wallet constructors (`from_mnemonic`, `from_seed`)
-- Taproot descriptor-based wallet construction
-- Unified and dual-account address schemes
-- Native sync with Esplora backends
-- Ordinals protection + metadata sync and PSBT analysis
-- Typed core request/error surfaces (`CreatePsbtRequest`, `ZincError`)
-- WASM exports for wallet lifecycle and runtime log controls
+- BIP-39 mnemonic generation, validation, and encryption/decryption
+- **Hardware Integration**: Support for Ledger and other hardware signatures via PSBT preparation and verification
+- **Watch-Only Support**: Initialize wallets from public addresses for tracking-only functionality
+- **Discovery Engine**: High-performance parallel probing for accounts across standard and legacy paths
+- Taproot descriptor-based wallet construction with unified and dual-account address schemes
+- Native sync with Esplora and Ordinals protection/analysis
+- Typed surface for PSBT analysis and Ordinal Shield safeguards
+- Extensible WASM exports for both stateless helpers and stateful wallet lifecycle
 
 ## Quick Start (Native Rust)
 
@@ -84,11 +85,12 @@ ESPLORA_URL=https://mempool.space/api \
 ## WASM Integration Notes
 
 WASM exports include:
-- stateless helpers: `generate_wallet`, `validate_mnemonic`, `derive_address`, `encrypt_wallet`, `decrypt_wallet`
-- stateful wallet wrapper: `ZincWasmWallet`
-- runtime logging controls: `set_log_level`, `set_logging_enabled`, `get_log_level`
-
-WASM payloads are canonicalized to `taproot*` keys.
+- **Stateless helpers**: `generate_wallet`, `validate_mnemonic`, `derive_address`, `encrypt_wallet`, `decrypt_wallet`
+- **Stateful handles**: `ZincWasmWallet` (supports Mnemonic, Watch, and **Hardware** profiles)
+- **Discovery**: `probeHardwareAccounts` for ultra-fast parallel account scanning
+- **Hardware Signing**: `prepareExternalSignPsbt` and `verifyExternalSignedPsbt`
+- **Analytics**: `analyzePsbt` for integrated Ordinal Shield protection
+- **Logging**: `set_log_level`, `set_logging_enabled`, `get_log_level`
 
 `init()` installs panic hooks only. Host applications should configure their own log subscriber/sink.
 
