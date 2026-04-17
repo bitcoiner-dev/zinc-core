@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "wasm32")]
     use crate::{AddressScheme, Network, WalletBuilder, ZincMnemonic};
     use crate::ZincWasmWallet;
     #[cfg(target_arch = "wasm32")]
