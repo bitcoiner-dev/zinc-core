@@ -2,9 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-04-17
 
-- No changes yet.
+### Added
+- Ledger Hardware Wallet integration including `prepareExternalSignPsbt` and `verifyExternalSignedPsbt` WASM APIs.
+- Watch-only address support via `new_watch_address`, enabling monitoring of any Taproot address without private keys.
+- High-performance parallel account probing WASM API (`probeHardwareAccounts`) for rapid hardware wallet discovery.
+- Support for "Dual" address schemes and comprehensive legacy path discovery.
+
+### Fixed
+- Resolved hardware wallet hydration and descriptor parsing inconsistencies.
+- Fixed dual payment signing descriptors for Segwit applications.
+- Eliminated various compilation warnings related to dead code and unnecessary mutability.
+- Gated architecture-specific test imports to resolve unused import warnings.
+
+### Changed
+- Unified internal wallet material handling across Seed, Watch, and Hardware profiles.
+- Upgraded core BDK dependencies to improve PSBT enrichment and derivation handling.
 
 ## [0.2.0] - 2026-04-07
 

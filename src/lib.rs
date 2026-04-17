@@ -226,6 +226,7 @@ pub struct AccountDiscoveryReport {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+#[allow(dead_code)]
 async fn probe_single_account(
     client: &reqwest::Client,
     esplora_url: &str,
@@ -275,7 +276,7 @@ async fn probe_single_account(
         return None;
     }
 
-    let mut builder = WalletBuilder::new(network);
+    let builder = WalletBuilder::new(network);
     let wallet = match builder.build_hardware(
         fingerprint_hex,
         t_ext.clone(),
@@ -336,6 +337,7 @@ async fn probe_single_account(
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+#[allow(dead_code)]
 async fn fetch_addr_stats(
     client: &reqwest::Client,
     esplora_url: &str,
@@ -797,7 +799,7 @@ struct WalletState {
 enum WalletMaterial {
     MnemonicPhrase(String),
     WatchAddress(String),
-    Hardware { fingerprint: [u8; 4] },
+    Hardware { _fingerprint: [u8; 4] },
 }
 
 #[wasm_bindgen]
@@ -906,7 +908,7 @@ impl ZincWasmWallet {
         
         Ok(ZincWasmWallet {
             inner: std::rc::Rc::new(std::cell::RefCell::new(wallet)),
-            material: WalletMaterial::Hardware { fingerprint },
+            material: WalletMaterial::Hardware { _fingerprint: fingerprint },
             state: std::cell::Cell::new(WalletState {
                 network: network_enum,
                 scheme: AddressScheme::Dual,
