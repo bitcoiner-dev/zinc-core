@@ -170,17 +170,24 @@ impl ZincWallet {
                 Err(_) => continue,
             };
             let outpoint = bitcoin::OutPoint::new(txid, vout);
-            // Find the inscription that matches this outpoint in our cache
-            if let Some(ins) = self
-                .inscriptions
-                .iter()
-                .find(|ins| ins.satpoint.outpoint == outpoint)
-            {
-                results.push(InscriptionDetails {
-                    id: ins.id.clone(),
-                    number: ins.number,
-                    content_type: ins.content_type.clone(),
-                });
+
+            // ⚡ Bolt: Fast-path optimization (O(1) lookup vs O(N*M) linear scan)
+            // When ordinals are verified, we can skip searching if the outpoint isn't in inscribed_utxos.
+            let needs_check = !self.ordinals_verified || self.inscribed_utxos.contains(&outpoint);
+
+            if needs_check {
+                // Find the inscription that matches this outpoint in our cache
+                if let Some(ins) = self
+                    .inscriptions
+                    .iter()
+                    .find(|ins| ins.satpoint.outpoint == outpoint)
+                {
+                    results.push(InscriptionDetails {
+                        id: ins.id.clone(),
+                        number: ins.number,
+                        content_type: ins.content_type.clone(),
+                    });
+                }
             }
         }
         results
