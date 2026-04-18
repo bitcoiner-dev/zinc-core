@@ -1,4 +1,5 @@
-## 2024-05-30 - [Panic Risk from unwrap on type conversions]
-**Vulnerability:** Found uses of `.unwrap()` on `u32::try_from(vout)` when converting from `usize` in PSBT and transaction output parsing. This can cause the application (and particularly the WASM runtime) to panic and crash if the index exceeds `u32::MAX`, leading to a Denial of Service (DoS).
-**Learning:** Type conversions, especially from `usize` to narrower types like `u32` when handling potentially large or external inputs (like PSBT inputs/outputs), are prone to panic if unhandled.
-**Prevention:** Avoid using `.unwrap()` or `.expect()` on `TryFrom` conversions in parsing and handling user-provided data. Use safe fallbacks or map errors (e.g. `OrdError::RequestFailed` or returning an error `Result`) instead to fail securely.
+## 2024-05-16 - Prevent Panic DoS from Unbound Child Derivation Index
+
+**Vulnerability:** Core builder operations like `derive_public_key_internal` called `.unwrap()` directly on `ChildNumber::from_hardened_idx` and `from_normal_idx`. These calls panic if provided an integer `u32` value greater than `0x80000000` (the hardened boundary marker limit).
+**Learning:** Even internal API inputs must be thoroughly bounds-checked if they influence the derivation tree boundaries, otherwise it opens up Denial of Service attacks when consuming downstream libraries that surface this to untrusted users or configuration paths.
+**Prevention:** Always use safe wrapper methods to convert bounds errors into expected `Result` strings and use `?` operator over `unwrap()` when dynamically determining key derivation paths.
