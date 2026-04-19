@@ -27,6 +27,16 @@ const LOG_TARGET_BUILDER: &str = "zinc_core::builder";
 /// `wasm32-unknown-unknown` with "time not implemented on this platform".
 /// This helper provides the same value via `js_sys::Date::now()` on WASM
 /// and the standard library on native targets.
+fn child_hardened(idx: u32) -> Result<bdk_wallet::bitcoin::bip32::ChildNumber, String> {
+    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(idx)
+        .map_err(|e| format!("Invalid hardened derivation index {}: {}", idx, e))
+}
+
+fn child_normal(idx: u32) -> Result<bdk_wallet::bitcoin::bip32::ChildNumber, String> {
+    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(idx)
+        .map_err(|e| format!("Invalid normal derivation index {}: {}", idx, e))
+}
+
 fn wasm_now_secs() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -644,11 +654,11 @@ impl ZincWallet {
                 let chain = 0; // External
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    child_hardened(purpose)?,
+                    child_hardened(coin_type)?,
+                    child_hardened(account)?,
+                    child_normal(chain)?,
+                    child_normal(index)?,
                 ];
 
                 let child_xprv = master_xprv
@@ -2251,11 +2261,11 @@ impl ZincWallet {
                 let coin_type = u32::from(network != Network::Bitcoin);
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    child_hardened(purpose)?,
+                    child_hardened(coin_type)?,
+                    child_hardened(account)?,
+                    child_normal(chain)?,
+                    child_normal(index)?,
                 ];
 
                 let child_xprv = master_xprv
