@@ -605,6 +605,16 @@ fn taproot_watch_descriptor(address: &Address) -> Result<String, String> {
     Ok(format!("tr({output_key})"))
 }
 
+fn child_hardened(idx: u32) -> Result<bdk_wallet::bitcoin::bip32::ChildNumber, String> {
+    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(idx)
+        .map_err(|_| format!("Invalid hardened derivation index: {}", idx))
+}
+
+fn child_normal(idx: u32) -> Result<bdk_wallet::bitcoin::bip32::ChildNumber, String> {
+    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(idx)
+        .map_err(|_| format!("Invalid normal derivation index: {}", idx))
+}
+
 /// Builder for constructing a `ZincWallet` from identity, network, and options.
 #[derive(Clone)]
 pub struct WalletBuilder {
@@ -644,11 +654,11 @@ impl ZincWallet {
                 let chain = 0; // External
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    child_hardened(purpose)?,
+                    child_hardened(coin_type)?,
+                    child_hardened(account)?,
+                    child_normal(chain)?,
+                    child_normal(index)?,
                 ];
 
                 let child_xprv = master_xprv
@@ -698,7 +708,7 @@ impl ZincWallet {
                 let xpub_str = xpub_start_part[..xpub_end_pos].trim_end_matches(')');
 
                 // 2. Parse and derive.
-                use bitcoin::bip32::{ChildNumber, Xpub};
+                use bitcoin::bip32::Xpub;
                 use std::str::FromStr;
                 let xpub = Xpub::from_str(xpub_str)
                     .map_err(|e| format!("Failed to parse xpub from descriptor (part: {}): {}", xpub_str, e))?;
@@ -708,8 +718,8 @@ impl ZincWallet {
                     .derive_pub(
                         &secp,
                         &[
-                            ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            child_normal(0)?,
+                            child_normal(index)?,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
@@ -2251,11 +2261,11 @@ impl ZincWallet {
                 let coin_type = u32::from(network != Network::Bitcoin);
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    child_hardened(purpose)?,
+                    child_hardened(coin_type)?,
+                    child_hardened(account)?,
+                    child_normal(chain)?,
+                    child_normal(index)?,
                 ];
 
                 let child_xprv = master_xprv
