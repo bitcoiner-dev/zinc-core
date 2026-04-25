@@ -1649,8 +1649,10 @@ impl ZincWallet {
 
         // Ordinal Shield Audit: BEFORE signing!
         // We must build the known_inscriptions map to check for BURNS (sophisticated check)
+        // Optimization: Pre-allocate capacity to prevent expensive dynamic memory reallocations
+        // during map population, especially for wallets with many inscriptions.
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -1838,8 +1840,10 @@ impl ZincWallet {
             }
         }
 
+        // Optimization: Pre-allocate capacity to prevent expensive dynamic memory reallocations
+        // during map population, especially for wallets with many inscriptions.
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -2052,8 +2056,10 @@ impl ZincWallet {
 
         // Build Known Inscriptions Map from internal state
         // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
+        // Optimization: Pre-allocate capacity to prevent expensive dynamic memory reallocations
+        // during map population, especially for wallets with many inscriptions.
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
 
         // We also need a way to map offsets back to Inscription IDs for the result?
         // The `analyze_psbt` function currently generates keys like "Inscription {N}".
