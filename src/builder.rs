@@ -643,12 +643,18 @@ impl ZincWallet {
                 let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
                 let chain = 0; // External
 
+                let purpose_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose index: {}", e))?;
+                let coin_type_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| format!("Invalid coin_type index: {}", e))?;
+                let account_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account index: {}", e))?;
+                let chain_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| format!("Invalid chain index: {}", e))?;
+                let index_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid child index: {}", e))?;
+
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    purpose_cn,
+                    coin_type_cn,
+                    account_cn,
+                    chain_cn,
+                    index_cn,
                 ];
 
                 let child_xprv = master_xprv
@@ -703,13 +709,16 @@ impl ZincWallet {
                 let xpub = Xpub::from_str(xpub_str)
                     .map_err(|e| format!("Failed to parse xpub from descriptor (part: {}): {}", xpub_str, e))?;
 
+                let chain_cn = ChildNumber::from_normal_idx(0).map_err(|e| format!("Invalid chain index: {}", e))?;
+                let index_cn = ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid child index: {}", e))?;
+
                 // Derive /0/index (assuming external chain '0' matches our descriptors)
                 let derived_xpub = xpub
                     .derive_pub(
                         &secp,
                         &[
-                            ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            chain_cn,
+                            index_cn,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
@@ -2250,12 +2259,18 @@ impl ZincWallet {
                 let network = self.vault_wallet.network();
                 let coin_type = u32::from(network != Network::Bitcoin);
 
+                let purpose_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose index: {}", e))?;
+                let coin_type_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| format!("Invalid coin_type index: {}", e))?;
+                let account_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account index: {}", e))?;
+                let chain_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| format!("Invalid chain index: {}", e))?;
+                let index_cn = bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid child index: {}", e))?;
+
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    purpose_cn,
+                    coin_type_cn,
+                    account_cn,
+                    chain_cn,
+                    index_cn,
                 ];
 
                 let child_xprv = master_xprv
