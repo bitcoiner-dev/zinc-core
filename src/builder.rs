@@ -958,8 +958,8 @@ impl ZincWallet {
 
     /// Check whether the configured Esplora endpoint is reachable.
     pub async fn check_connection(esplora_url: &str) -> bool {
-        let client =
-            esplora_client::Builder::new(esplora_url).build_async_with_sleeper::<SyncSleeper>();
+        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
+            .build_async_with_sleeper::<SyncSleeper>();
 
         match client {
             Ok(c) => c.get_height().await.is_ok(),
@@ -1070,7 +1070,7 @@ impl ZincWallet {
 
     /// Run a full sync against Esplora for taproot and optional payment wallets.
     pub async fn sync(&mut self, esplora_url: &str) -> Result<Vec<String>, String> {
-        let client = esplora_client::Builder::new(esplora_url)
+        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
             .build_async_with_sleeper::<SyncSleeper>()
             .map_err(|e| format!("{e:?}"))?;
 
@@ -2121,7 +2121,7 @@ impl ZincWallet {
             .map_err(|e| format!("Failed to extract tx: {e}"))?;
 
         // Broadcast via Esplora
-        let client = esplora_client::Builder::new(esplora_url)
+        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
             .build_async_with_sleeper::<SyncSleeper>()
             .map_err(|e| format!("Failed to create client: {e:?}"))?;
 
@@ -2595,11 +2595,16 @@ impl WalletBuilder {
             scheme = AddressScheme::Unified;
         }
 
+        let derivation_account = match self.derivation_mode {
+            DerivationMode::Account => self.account_index,
+            DerivationMode::Index => 0,
+        };
+
         let (vault_ext, vault_int, payment_ext, payment_int) = kind.derive_descriptors(
             scheme,
             self.payment_address_type,
             self.network,
-            self.account_index,
+            derivation_account,
         );
 
         // 1. Vault (Taproot) wallet
