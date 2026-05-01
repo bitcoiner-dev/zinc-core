@@ -1,0 +1,3 @@
+## 2025-05-01 - HashMap Pre-allocation for Known Inscriptions
+**Learning:** In the PSBT builder (`src/builder.rs`), the codebase frequently creates a `known_inscriptions` map by iterating over `self.inscriptions`. Previously, this map was initialized with `HashMap::new()`, causing dynamic reallocations during large loops.
+**Action:** When populating a `HashMap` strictly from an existing slice or collection (like `self.inscriptions`), always initialize it with `HashMap::with_capacity(len)` using the source collection's length. This provides an O(1) fast-path avoiding memory reallocation. Note: Ensure the `len` corresponds exactly to the items being inserted, and not items from a different collection (like `w.list_unspent()`).
