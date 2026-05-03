@@ -361,9 +361,9 @@ async fn fetch_addr_stats(
             let mempool_funded = mempool_stats["funded_txo_sum"].as_u64().unwrap_or(0);
             let mempool_spent = mempool_stats["spent_txo_sum"].as_u64().unwrap_or(0);
             let mempool_sats = mempool_funded.saturating_sub(mempool_spent);
-            
+
             balance = chain_sats.saturating_add(mempool_sats);
-            
+
             let tx_count = chain_stats["tx_count"].as_u64().unwrap_or(0)
                 + mempool_stats["tx_count"].as_u64().unwrap_or(0);
             if tx_count > 0 { has_history = true; }
@@ -905,7 +905,7 @@ impl ZincWasmWallet {
             taproot_external_desc,
             payment_external_desc
         );
-        
+
         Ok(ZincWasmWallet {
             inner: std::rc::Rc::new(std::cell::RefCell::new(wallet)),
             material: WalletMaterial::Hardware { _fingerprint: fingerprint },
@@ -1376,10 +1376,10 @@ impl ZincWasmWallet {
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             let client = reqwest::Client::new();
             let mut reports = Vec::new();
-            
+
             // Parallelism configuration
             const ACCOUNT_BATCH_SIZE: usize = 5;
-            
+
             for batch_start in (start_index..=end_index).step_by(ACCOUNT_BATCH_SIZE) {
                 let batch_end = (batch_start + ACCOUNT_BATCH_SIZE as u32).min(end_index + 1);
                 let mut batch_futures = Vec::new();
@@ -2495,7 +2495,7 @@ impl ZincWasmWallet {
         let mut known_inscriptions: std::collections::HashMap<
             (bitcoin::Txid, u32),
             Vec<(String, u64)>,
-        > = std::collections::HashMap::with_capacity(inner.inscriptions.len());
+        > = std::collections::HashMap::new();
         for ins in &inner.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))

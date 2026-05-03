@@ -1650,7 +1650,7 @@ impl ZincWallet {
         // Ordinal Shield Audit: BEFORE signing!
         // We must build the known_inscriptions map to check for BURNS (sophisticated check)
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::with_capacity(self.inscriptions.len());
+            HashMap::new();
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -1839,7 +1839,7 @@ impl ZincWallet {
         }
 
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::with_capacity(self.inscriptions.len());
+            HashMap::new();
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -2053,7 +2053,7 @@ impl ZincWallet {
         // Build Known Inscriptions Map from internal state
         // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::with_capacity(self.inscriptions.len());
+            HashMap::new();
 
         // We also need a way to map offsets back to Inscription IDs for the result?
         // The `analyze_psbt` function currently generates keys like "Inscription {N}".
@@ -2318,10 +2318,10 @@ impl ZincWallet {
                         if pubkey.to_string() == derived_pubkey_hex {
                             // MATCH! Sign it.
                             let priv_key = self.derive_private_key(86, 0, 0)?;
-                            
+
                             let mut cache = SighashCache::new(&psbt.unsigned_tx);
                             let sighash_type = input.sighash_type.unwrap_or(bitcoin::psbt::PsbtSighashType::from_u32(0)); // DEFAULT
-                            
+
                             // For reveal, we sign the script path.
                             for (_control_block, (script, _)) in &input.tap_scripts {
                                 let leaf_hash = bitcoin::taproot::TapLeafHash::from_script(script, bitcoin::taproot::LeafVersion::TapScript);
@@ -2349,12 +2349,12 @@ impl ZincWallet {
 
                                 let msg = Message::from_digest(sighash.to_byte_array());
                                 let sig = secp.sign_schnorr(&msg, &priv_key.keypair(&secp));
-                                
+
                                 let mut final_sig = sig.as_ref().to_vec();
                                 if tap_sighash_type != bitcoin::sighash::TapSighashType::Default {
                                     final_sig.push(tap_sighash_type as u8);
                                 }
-                                
+
                                 input.tap_script_sigs.insert((*pubkey, leaf_hash), bitcoin::taproot::Signature::from_slice(&final_sig).unwrap());
                                 key_found = true;
                             }
@@ -2483,7 +2483,7 @@ impl WalletBuilder {
     pub fn with_taproot_xpub(mut self, xpub: &str) -> Result<Self, String> {
         let parsed = parse_extended_public_key(xpub)?;
         let taproot_desc = format!("tr({parsed}/0/*)");
-        
+
         let mut kind = self.kind.take().unwrap_or(WalletKind::Hardware {
             fingerprint: [0, 0, 0, 0],
             taproot_external: String::new(),
@@ -2493,7 +2493,7 @@ impl WalletBuilder {
         if let WalletKind::Hardware { ref mut taproot_external, .. } = kind {
             *taproot_external = taproot_desc;
         }
-        
+
         self.kind = Some(kind);
         Ok(self)
     }
@@ -2502,7 +2502,7 @@ impl WalletBuilder {
     pub fn with_payment_xpub(mut self, xpub: &str) -> Result<Self, String> {
         let parsed = parse_extended_public_key(xpub)?;
         let payment_desc = payment_descriptor_for_xpub(&parsed, self.payment_address_type, 0);
-        
+
         let mut kind = self.kind.take().unwrap_or(WalletKind::Hardware {
             fingerprint: [0, 0, 0, 0],
             taproot_external: String::new(),
@@ -2512,7 +2512,7 @@ impl WalletBuilder {
         if let WalletKind::Hardware { ref mut payment_external, .. } = kind {
             *payment_external = Some(payment_desc);
         }
-        
+
         self.kind = Some(kind);
         Ok(self)
     }
@@ -2607,7 +2607,7 @@ impl WalletBuilder {
             if let Some(changeset) = &p.taproot {
                 let mut loader = Wallet::load()
                     .descriptor(KeychainKind::External, Some(vault_ext.clone()));
-                
+
                 if !matches!(kind, WalletKind::WatchAddress(_)) {
                     loader = loader.descriptor(KeychainKind::Internal, Some(vault_int.clone()));
                 }
@@ -2833,7 +2833,7 @@ impl WalletBuilder {
             rune_balances: Vec::new(),
             ordinals_verified: false,
             ordinals_metadata_complete: false,
-            kind: WalletKind::Hardware { 
+            kind: WalletKind::Hardware {
                 fingerprint,
                 taproot_external: taproot_external_desc,
                 payment_external: payment_external_desc,
@@ -2873,7 +2873,7 @@ mod tests {
         let mnemonic = ZincMnemonic::generate(12).unwrap();
         let seed = mnemonic.to_seed("");
         let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
-        
+
         let wallet = WalletBuilder::new(Network::Signet)
             .kind(WalletKind::Seed { master_xprv })
             .build()
