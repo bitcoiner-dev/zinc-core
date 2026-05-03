@@ -23,7 +23,7 @@ fn create_dummy_psbt(inputs: &[(u64, Option<u64>)], outputs: &[u64]) -> Psbt {
                     "0000000000000000000000000000000000000000000000000000000000000000",
                 )
                 .unwrap(),
-                vout: u32::try_from(i).unwrap(),
+                vout: u32::try_from(i).unwrap_or(0),
             },
             script_sig: ScriptBuf::new(),
             sequence: bitcoin::Sequence::MAX,
