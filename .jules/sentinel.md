@@ -2,3 +2,8 @@
 **Vulnerability:** Found uses of `.unwrap()` on `u32::try_from(vout)` when converting from `usize` in PSBT and transaction output parsing. This can cause the application (and particularly the WASM runtime) to panic and crash if the index exceeds `u32::MAX`, leading to a Denial of Service (DoS).
 **Learning:** Type conversions, especially from `usize` to narrower types like `u32` when handling potentially large or external inputs (like PSBT inputs/outputs), are prone to panic if unhandled.
 **Prevention:** Avoid using `.unwrap()` or `.expect()` on `TryFrom` conversions in parsing and handling user-provided data. Use safe fallbacks or map errors (e.g. `OrdError::RequestFailed` or returning an error `Result`) instead to fail securely.
+
+## 2024-05-30 - [Panic Risk in Dynamic BIP32 ChildNumber Creation]
+**Vulnerability:** Found uses of `.unwrap()` on `bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx` and `from_normal_idx` inside `derive_public_key_internal` and `derive_private_key_internal` when passing dynamic user-provided inputs (`purpose`, `account`, `index`, `chain`). If a dynamic input value exceeds `u32::MAX / 2` (or simply violates the library's `2^31` boundary for normal/hardened indices), the application or WASM runtime would panic and crash, leading to a Denial of Service (DoS) vulnerability.
+**Learning:** External or user-controlled inputs passed to BIP32 derivation index builders must never use `.unwrap()`, as the bounds are strict and panics are guaranteed on overflow.
+**Prevention:** Always validate dynamic derivation indices by handling the `Result` securely, such as using `.map_err(|e| format!("...", e))?`. Use `.expect()` strictly and only for statically-known, hardcoded valid values (like `coin_type`).
