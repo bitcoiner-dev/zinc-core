@@ -36,6 +36,8 @@ pub mod error;
 /// Transaction history models and wallet history helpers.
 pub mod history;
 pub mod keys;
+/// Fixed-price listing and sale PSBT validation helpers.
+pub mod listing;
 /// Offer envelope models and deterministic offer hashing/signature helpers.
 pub mod offer;
 /// Offer acceptance safety checks and signing plan derivation.
@@ -62,6 +64,14 @@ pub use builder::{
 pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
+pub use listing::{
+    create_listing, create_listing_purchase, finalize_listing_purchase, finalize_listing_sale,
+    passthrough_script_pubkey, passthrough_tapscript, prepare_listing_sale_signature,
+    sign_listing_coordinator_psbt, sign_listing_sale_psbt, CreateListingPurchaseRequest,
+    CreateListingPurchaseResultV1, CreateListingRequest, CreateListingResultV1,
+    FinalizeListingPurchaseRequest, FinalizeListingPurchaseResultV1, FinalizedListingSaleResultV1,
+    ListingBuyerFundingInput, ListingEnvelopeV1, ListingSaleSigningPlanV1, LISTING_SALE_SIGHASH_U8,
+};
 pub use offer::OfferEnvelopeV1;
 pub use offer_accept::{prepare_offer_acceptance, OfferAcceptancePlanV1};
 pub use offer_create::{CreateOfferRequest, OfferCreateResultV1};
@@ -747,6 +757,134 @@ pub fn validate_signed_sign_intent_receipt_json(payload_json: &str) -> Result<St
         "receiptId": receipt_id
     })
     .to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateListingTransportRequest {
+    pub seller_pubkey_hex: String,
+    pub coordinator_pubkey_hex: String,
+    pub network: String,
+    pub inscription_id: String,
+    pub seller_outpoint: String,
+    pub seller_prevout_value_sats: u64,
+    pub seller_prevout_script_pubkey_hex: String,
+    pub seller_payout_script_pubkey_hex: String,
+    pub recovery_script_pubkey_hex: String,
+    pub ask_sats: u64,
+    pub fee_rate_sat_vb: u64,
+    pub created_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub nonce: u64,
+}
+
+impl TryFrom<CreateListingTransportRequest> for listing::CreateListingRequest {
+    type Error = ZincError;
+
+    fn try_from(value: CreateListingTransportRequest) -> Result<Self, Self::Error> {
+        let seller_outpoint = value.seller_outpoint.parse().map_err(|e| {
+            ZincError::OfferError(format!(
+                "invalid seller_outpoint `{}`: {e}",
+                value.seller_outpoint
+            ))
+        })?;
+        let script_from_hex = |label: &str, hex_script: &str| {
+            let bytes = hex::decode(hex_script)
+                .map_err(|e| ZincError::OfferError(format!("invalid {label}: {e}")))?;
+            Ok(bitcoin::ScriptBuf::from_bytes(bytes))
+        };
+
+        Ok(Self {
+            seller_pubkey_hex: value.seller_pubkey_hex,
+            coordinator_pubkey_hex: value.coordinator_pubkey_hex,
+            network: value.network,
+            inscription_id: value.inscription_id,
+            seller_outpoint,
+            seller_prevout: bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(value.seller_prevout_value_sats),
+                script_pubkey: script_from_hex(
+                    "seller_prevout_script_pubkey_hex",
+                    &value.seller_prevout_script_pubkey_hex,
+                )?,
+            },
+            seller_payout_script_pubkey: script_from_hex(
+                "seller_payout_script_pubkey_hex",
+                &value.seller_payout_script_pubkey_hex,
+            )?,
+            recovery_script_pubkey: script_from_hex(
+                "recovery_script_pubkey_hex",
+                &value.recovery_script_pubkey_hex,
+            )?,
+            ask_sats: value.ask_sats,
+            fee_rate_sat_vb: value.fee_rate_sat_vb,
+            created_at_unix: value.created_at_unix,
+            expires_at_unix: value.expires_at_unix,
+            nonce: value.nonce,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListingEnvelopeTransportRequest {
+    pub listing: listing::ListingEnvelopeV1,
+    pub now_unix: i64,
+}
+
+#[wasm_bindgen(js_name = createListing)]
+pub fn create_listing_js(request: JsValue) -> Result<JsValue, JsValue> {
+    let transport: CreateListingTransportRequest = serde_wasm_bindgen::from_value(request)
+        .map_err(|e| JsValue::from_str(&format!("Invalid listing request: {e}")))?;
+    let request = listing::CreateListingRequest::try_from(transport)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let created =
+        listing::create_listing(&request).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_wasm_bindgen::to_value(&created)
+        .map_err(|e| JsValue::from_str(&format!("failed to serialize listing result: {e}")))
+}
+
+#[wasm_bindgen(js_name = prepareListingSaleSignature)]
+pub fn prepare_listing_sale_signature_js(request: JsValue) -> Result<JsValue, JsValue> {
+    let request: ListingEnvelopeTransportRequest = serde_wasm_bindgen::from_value(request)
+        .map_err(|e| JsValue::from_str(&format!("Invalid listing request: {e}")))?;
+    let plan = listing::prepare_listing_sale_signature(&request.listing, request.now_unix)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_wasm_bindgen::to_value(&plan)
+        .map_err(|e| JsValue::from_str(&format!("failed to serialize listing plan: {e}")))
+}
+
+#[wasm_bindgen(js_name = signListingSalePsbt)]
+pub fn sign_listing_sale_psbt_js(
+    listing: JsValue,
+    seller_secret_key_hex: &str,
+    now_unix: i64,
+) -> Result<String, JsValue> {
+    let listing: listing::ListingEnvelopeV1 = serde_wasm_bindgen::from_value(listing)
+        .map_err(|e| JsValue::from_str(&format!("Invalid listing: {e}")))?;
+    listing::sign_listing_sale_psbt(&listing, seller_secret_key_hex, now_unix)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = signListingCoordinatorPsbt)]
+pub fn sign_listing_coordinator_psbt_js(
+    listing: JsValue,
+    coordinator_secret_key_hex: &str,
+    now_unix: i64,
+) -> Result<String, JsValue> {
+    let listing: listing::ListingEnvelopeV1 = serde_wasm_bindgen::from_value(listing)
+        .map_err(|e| JsValue::from_str(&format!("Invalid listing: {e}")))?;
+    listing::sign_listing_coordinator_psbt(&listing, coordinator_secret_key_hex, now_unix)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = finalizeListingSale)]
+pub fn finalize_listing_sale_js(request: JsValue) -> Result<JsValue, JsValue> {
+    let request: ListingEnvelopeTransportRequest = serde_wasm_bindgen::from_value(request)
+        .map_err(|e| JsValue::from_str(&format!("Invalid listing request: {e}")))?;
+    let finalized = listing::finalize_listing_sale(&request.listing, request.now_unix)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_wasm_bindgen::to_value(&finalized)
+        .map_err(|e| JsValue::from_str(&format!("failed to serialize finalized sale: {e}")))
 }
 
 /// Verify a signed pairing request + signed pairing ack bundle at a given unix timestamp.
@@ -2334,6 +2472,30 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Invalid request: {e}")))?;
 
         self.create_psbt_with_transport(transport, "createPsbt")
+    }
+
+    /// Create a buyer-funded, buyer-signed listing purchase PSBT.
+    #[wasm_bindgen(js_name = createListingPurchase)]
+    pub fn create_listing_purchase_request(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+
+        let request: crate::listing::CreateListingPurchaseRequest =
+            serde_wasm_bindgen::from_value(request)
+                .map_err(|e| JsValue::from_str(&format!("Invalid request: {e}")))?;
+
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                let result = inner
+                    .create_listing_purchase(&request)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                serde_wasm_bindgen::to_value(&result).map_err(|e| {
+                    JsValue::from_str(&format!("failed to serialize listing purchase: {e}"))
+                })
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (createListingPurchase): {e}"
+            ))),
+        }
     }
 
     /// Create an unsigned PSBT for sending BTC from positional args.
