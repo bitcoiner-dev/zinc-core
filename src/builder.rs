@@ -1516,6 +1516,14 @@ impl ZincWallet {
         crate::offer_create::create_offer(self, request)
     }
 
+    /// Create a buyer-funded listing purchase PSBT and sign buyer inputs.
+    pub fn create_listing_purchase(
+        &mut self,
+        request: &crate::listing::CreateListingPurchaseRequest,
+    ) -> Result<crate::listing::CreateListingPurchaseResultV1, ZincError> {
+        crate::listing::create_listing_purchase(self, request)
+    }
+
     /// Create an unsigned PSBT for sending BTC from transport-friendly inputs.
     ///
     /// This method is a migration wrapper for app-boundary callers. New native
