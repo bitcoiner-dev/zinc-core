@@ -1,0 +1,3 @@
+## 2024-05-14 - HashMap Optimization
+**Learning:** `HashMap::with_capacity` works well when populating known collections, preventing reallocation.
+**Action:** Always verify the length source matches the exact data source populating the map. In `src/builder.rs`, `HashMap::new()` was used to construct `known_inscriptions` maps that are subsequently populated by iterating over `&self.inscriptions`. Pre-allocating `HashMap::with_capacity(self.inscriptions.len())` prevents dynamic resizing within these loops. Note: We must NOT do this for `known_utxos` maps which are populated from `w.list_unspent()`, because `list_unspent()` returns an iterator, and calling `.count()` on it to preallocate would consume the iterator and require fetching the list twice, hurting performance.
