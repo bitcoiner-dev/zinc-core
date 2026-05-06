@@ -644,11 +644,11 @@ impl ZincWallet {
                 let chain = 0; // External
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| e.to_string())?,
                 ];
 
                 let child_xprv = master_xprv
@@ -709,7 +709,7 @@ impl ZincWallet {
                         &secp,
                         &[
                             ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            ChildNumber::from_normal_idx(index).map_err(|e| e.to_string())?,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
@@ -2188,7 +2188,7 @@ impl ZincWallet {
         let sig = secp.sign_ecdsa_recoverable(&msg, &priv_key);
         let (rec_id, sig_bytes_compact) = sig.serialize_compact();
 
-        let mut header = 27 + u8::try_from(rec_id.to_i32()).unwrap();
+        let mut header = 27 + u8::try_from(rec_id.to_i32()).map_err(|e| e.to_string())?;
         header += 4; // Always compressed
 
         let mut sig_bytes = Vec::with_capacity(65);
@@ -2251,11 +2251,11 @@ impl ZincWallet {
                 let coin_type = u32::from(network != Network::Bitcoin);
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| e.to_string())?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| e.to_string())?,
                 ];
 
                 let child_xprv = master_xprv
