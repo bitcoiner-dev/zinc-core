@@ -325,7 +325,9 @@ impl WalletKind {
         let coin_type = u32::from(network != Network::Bitcoin);
 
         match self {
-            Self::Seed { master_xprv: master } => {
+            Self::Seed {
+                master_xprv: master,
+            } => {
                 let vault_ext = format!("tr({master}/86'/{coin_type}'/{account}'/0/*)");
                 let vault_int = format!("tr({master}/86'/{coin_type}'/{account}'/1/*)");
 
@@ -677,9 +679,9 @@ impl ZincWallet {
                 let desc_str = if purpose == 86 {
                     taproot_external
                 } else {
-                    payment_external
-                        .as_ref()
-                        .ok_or_else(|| "Payment descriptor missing for this hardware wallet".to_string())?
+                    payment_external.as_ref().ok_or_else(|| {
+                        "Payment descriptor missing for this hardware wallet".to_string()
+                    })?
                 };
 
                 // 1. Extract the Xpub string from the descriptor.
@@ -700,8 +702,12 @@ impl ZincWallet {
                 // 2. Parse and derive.
                 use bitcoin::bip32::{ChildNumber, Xpub};
                 use std::str::FromStr;
-                let xpub = Xpub::from_str(xpub_str)
-                    .map_err(|e| format!("Failed to parse xpub from descriptor (part: {}): {}", xpub_str, e))?;
+                let xpub = Xpub::from_str(xpub_str).map_err(|e| {
+                    format!(
+                        "Failed to parse xpub from descriptor (part: {}): {}",
+                        xpub_str, e
+                    )
+                })?;
 
                 // Derive /0/index (assuming external chain '0' matches our descriptors)
                 let derived_xpub = xpub
@@ -976,10 +982,9 @@ impl ZincWallet {
             now,
         ));
 
-        let payment = self
-            .payment_wallet
-            .as_ref()
-            .map(|w| SyncRequestType::Full(Self::flexible_full_scan_request(w, self.scan_policy, now)));
+        let payment = self.payment_wallet.as_ref().map(|w| {
+            SyncRequestType::Full(Self::flexible_full_scan_request(w, self.scan_policy, now))
+        });
 
         ZincSyncRequest {
             taproot: vault,
@@ -1330,7 +1335,10 @@ impl ZincWallet {
                         self.get_payment_public_key(0).ok(),
                     )
                 } else {
-                    (Some(taproot_address.clone()), Some(taproot_public_key.clone()))
+                    (
+                        Some(taproot_address.clone()),
+                        Some(taproot_public_key.clone()),
+                    )
                 };
                 vec![Account {
                     index: self.account_index,
@@ -1356,15 +1364,20 @@ impl ZincWallet {
 
                     if let Ok(zwallet) = builder.build() {
                         let taproot_address = zwallet.peek_taproot_address(0).to_string();
-                        let taproot_public_key = zwallet.get_taproot_public_key(0).unwrap_or_default();
-                        let (payment_address, payment_public_key) = if self.scheme == AddressScheme::Dual {
-                            (
-                                zwallet.peek_payment_address(0).map(|a| a.to_string()),
-                                zwallet.get_payment_public_key(0).ok(),
-                            )
-                        } else {
-                            (Some(taproot_address.clone()), Some(taproot_public_key.clone()))
-                        };
+                        let taproot_public_key =
+                            zwallet.get_taproot_public_key(0).unwrap_or_default();
+                        let (payment_address, payment_public_key) =
+                            if self.scheme == AddressScheme::Dual {
+                                (
+                                    zwallet.peek_payment_address(0).map(|a| a.to_string()),
+                                    zwallet.get_payment_public_key(0).ok(),
+                                )
+                            } else {
+                                (
+                                    Some(taproot_address.clone()),
+                                    Some(taproot_public_key.clone()),
+                                )
+                            };
                         accounts.push(Account {
                             index: i,
                             label: format!("Account {}", i + 1),
@@ -1649,8 +1662,10 @@ impl ZincWallet {
 
         // Ordinal Shield Audit: BEFORE signing!
         // We must build the known_inscriptions map to check for BURNS (sophisticated check)
+        // PERFORMANCE OPTIMIZATION (Bolt):
+        // Pre-allocate HashMap using self.inscriptions.len() to prevent expensive dynamic memory reallocations inside the loop.
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -1780,7 +1795,9 @@ impl ZincWallet {
         }
 
         #[allow(deprecated)]
-        let _ = self.vault_wallet.sign(&mut psbt, bdk_wallet::SignOptions::default());
+        let _ = self
+            .vault_wallet
+            .sign(&mut psbt, bdk_wallet::SignOptions::default());
         if let Some(w) = &self.payment_wallet {
             #[allow(deprecated)]
             let _ = w.sign(&mut psbt, bdk_wallet::SignOptions::default());
@@ -1838,8 +1855,10 @@ impl ZincWallet {
             }
         }
 
+        // PERFORMANCE OPTIMIZATION (Bolt):
+        // Pre-allocate HashMap using self.inscriptions.len() to prevent expensive dynamic memory reallocations inside the loop.
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -1937,11 +1956,8 @@ impl ZincWallet {
             let required_set: std::collections::HashSet<usize> =
                 check_indices.iter().copied().collect();
 
-            for (i, (orig_input, signed_input)) in original
-                .inputs
-                .iter()
-                .zip(signed.inputs.iter())
-                .enumerate()
+            for (i, (orig_input, signed_input)) in
+                original.inputs.iter().zip(signed.inputs.iter()).enumerate()
             {
                 if required_set.contains(&i) {
                     continue;
@@ -2052,8 +2068,10 @@ impl ZincWallet {
 
         // Build Known Inscriptions Map from internal state
         // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
+        // PERFORMANCE OPTIMIZATION (Bolt):
+        // Pre-allocate HashMap using self.inscriptions.len() to prevent expensive dynamic memory reallocations inside the loop.
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
 
         // We also need a way to map offsets back to Inscription IDs for the result?
         // The `analyze_psbt` function currently generates keys like "Inscription {N}".
@@ -2178,7 +2196,8 @@ impl ZincWallet {
         } else {
             (self.dual_payment_purpose(), 0)
         };
-        let priv_key = self.derive_private_key(purpose, chain, 0)
+        let priv_key = self
+            .derive_private_key(purpose, chain, 0)
             .map_err(|_| ZincError::CapabilityMissing.to_string())?;
 
         // 3. Sign Message
@@ -2226,10 +2245,20 @@ impl ZincWallet {
     fn derive_public_key(&self, purpose: u32, index: u32) -> Result<String, String> {
         let account = self.active_derivation_account();
         let effective_index = self.active_receive_index().saturating_add(index);
-        self.derive_public_key_internal(purpose, self.vault_wallet.network(), account, effective_index)
+        self.derive_public_key_internal(
+            purpose,
+            self.vault_wallet.network(),
+            account,
+            effective_index,
+        )
     }
 
-    fn derive_private_key(&self, purpose: u32, chain: u32, index: u32) -> Result<bitcoin::secp256k1::SecretKey, String> {
+    fn derive_private_key(
+        &self,
+        purpose: u32,
+        chain: u32,
+        index: u32,
+    ) -> Result<bitcoin::secp256k1::SecretKey, String> {
         let account = self.active_derivation_account();
         let effective_index = self.active_receive_index().saturating_add(index);
         self.derive_private_key_internal(purpose, account, chain, effective_index)
@@ -2286,7 +2315,12 @@ impl ZincWallet {
             let utxo = input
                 .witness_utxo
                 .as_ref()
-                .or_else(|| input.non_witness_utxo.as_ref().and_then(|tx| tx.output.get(psbt.unsigned_tx.input[i].previous_output.vout as usize)))
+                .or_else(|| {
+                    input.non_witness_utxo.as_ref().and_then(|tx| {
+                        tx.output
+                            .get(psbt.unsigned_tx.input[i].previous_output.vout as usize)
+                    })
+                })
                 .ok_or_else(|| format!("Missing witness_utxo for input #{i}"))?;
             prevouts.push(utxo.clone());
         }
@@ -2314,17 +2348,24 @@ impl ZincWallet {
                     // Try to derive the ordinals key (m/86'/coin'/account'/0/0)
                     let account = self.active_derivation_account();
                     let effective_index = self.active_receive_index();
-                    if let Ok(derived_pubkey_hex) = self.derive_public_key_internal(86, network, account, effective_index) {
+                    if let Ok(derived_pubkey_hex) =
+                        self.derive_public_key_internal(86, network, account, effective_index)
+                    {
                         if pubkey.to_string() == derived_pubkey_hex {
                             // MATCH! Sign it.
                             let priv_key = self.derive_private_key(86, 0, 0)?;
-                            
+
                             let mut cache = SighashCache::new(&psbt.unsigned_tx);
-                            let sighash_type = input.sighash_type.unwrap_or(bitcoin::psbt::PsbtSighashType::from_u32(0)); // DEFAULT
-                            
+                            let sighash_type = input
+                                .sighash_type
+                                .unwrap_or(bitcoin::psbt::PsbtSighashType::from_u32(0)); // DEFAULT
+
                             // For reveal, we sign the script path.
                             for (_control_block, (script, _)) in &input.tap_scripts {
-                                let leaf_hash = bitcoin::taproot::TapLeafHash::from_script(script, bitcoin::taproot::LeafVersion::TapScript);
+                                let leaf_hash = bitcoin::taproot::TapLeafHash::from_script(
+                                    script,
+                                    bitcoin::taproot::LeafVersion::TapScript,
+                                );
 
                                 // Convert PsbtSighashType to TapSighashType
                                 let tap_sighash_type = match sighash_type.to_u32() {
@@ -2334,7 +2375,9 @@ impl ZincWallet {
                                     3 => bitcoin::sighash::TapSighashType::Single,
                                     0x81 => bitcoin::sighash::TapSighashType::AllPlusAnyoneCanPay,
                                     0x82 => bitcoin::sighash::TapSighashType::NonePlusAnyoneCanPay,
-                                    0x83 => bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay,
+                                    0x83 => {
+                                        bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay
+                                    }
                                     _ => bitcoin::sighash::TapSighashType::Default,
                                 };
 
@@ -2349,13 +2392,16 @@ impl ZincWallet {
 
                                 let msg = Message::from_digest(sighash.to_byte_array());
                                 let sig = secp.sign_schnorr(&msg, &priv_key.keypair(&secp));
-                                
+
                                 let mut final_sig = sig.as_ref().to_vec();
                                 if tap_sighash_type != bitcoin::sighash::TapSighashType::Default {
                                     final_sig.push(tap_sighash_type as u8);
                                 }
-                                
-                                input.tap_script_sigs.insert((*pubkey, leaf_hash), bitcoin::taproot::Signature::from_slice(&final_sig).unwrap());
+
+                                input.tap_script_sigs.insert(
+                                    (*pubkey, leaf_hash),
+                                    bitcoin::taproot::Signature::from_slice(&final_sig).unwrap(),
+                                );
                                 key_found = true;
                             }
                         }
@@ -2483,17 +2529,21 @@ impl WalletBuilder {
     pub fn with_taproot_xpub(mut self, xpub: &str) -> Result<Self, String> {
         let parsed = parse_extended_public_key(xpub)?;
         let taproot_desc = format!("tr({parsed}/0/*)");
-        
+
         let mut kind = self.kind.take().unwrap_or(WalletKind::Hardware {
             fingerprint: [0, 0, 0, 0],
             taproot_external: String::new(),
             payment_external: None,
         });
 
-        if let WalletKind::Hardware { ref mut taproot_external, .. } = kind {
+        if let WalletKind::Hardware {
+            ref mut taproot_external,
+            ..
+        } = kind
+        {
             *taproot_external = taproot_desc;
         }
-        
+
         self.kind = Some(kind);
         Ok(self)
     }
@@ -2502,17 +2552,21 @@ impl WalletBuilder {
     pub fn with_payment_xpub(mut self, xpub: &str) -> Result<Self, String> {
         let parsed = parse_extended_public_key(xpub)?;
         let payment_desc = payment_descriptor_for_xpub(&parsed, self.payment_address_type, 0);
-        
+
         let mut kind = self.kind.take().unwrap_or(WalletKind::Hardware {
             fingerprint: [0, 0, 0, 0],
             taproot_external: String::new(),
             payment_external: None,
         });
 
-        if let WalletKind::Hardware { ref mut payment_external, .. } = kind {
+        if let WalletKind::Hardware {
+            ref mut payment_external,
+            ..
+        } = kind
+        {
             *payment_external = Some(payment_desc);
         }
-        
+
         self.kind = Some(kind);
         Ok(self)
     }
@@ -2605,9 +2659,9 @@ impl WalletBuilder {
         // 1. Vault (Taproot) wallet
         let (vault_wallet, loaded_vault_changeset) = if let Some(p) = &self.persistence {
             if let Some(changeset) = &p.taproot {
-                let mut loader = Wallet::load()
-                    .descriptor(KeychainKind::External, Some(vault_ext.clone()));
-                
+                let mut loader =
+                    Wallet::load().descriptor(KeychainKind::External, Some(vault_ext.clone()));
+
                 if !matches!(kind, WalletKind::WatchAddress(_)) {
                     loader = loader.descriptor(KeychainKind::Internal, Some(vault_int.clone()));
                 }
@@ -2727,8 +2781,8 @@ impl WalletBuilder {
         payment_external_desc: Option<String>,
         payment_internal_desc: Option<String>,
     ) -> Result<ZincWallet, String> {
-        let fingerprint_vec = hex::decode(fingerprint_hex)
-            .map_err(|e| format!("Invalid fingerprint hex: {e}"))?;
+        let fingerprint_vec =
+            hex::decode(fingerprint_hex).map_err(|e| format!("Invalid fingerprint hex: {e}"))?;
         let fingerprint: [u8; 4] = fingerprint_vec
             .try_into()
             .map_err(|_| "Fingerprint must be 4 bytes".to_string())?;
@@ -2755,18 +2809,26 @@ impl WalletBuilder {
                 match res {
                     Ok(Some(w)) => (w, changeset.clone()),
                     Ok(None) | Err(_) => {
-                        let w = Wallet::create(taproot_external_desc.clone(), taproot_internal_desc.clone())
-                            .network(network)
-                            .create_wallet_no_persist()
-                            .map_err(|e| format!("Failed to create taproot wallet from descriptor: {e}"))?;
+                        let w = Wallet::create(
+                            taproot_external_desc.clone(),
+                            taproot_internal_desc.clone(),
+                        )
+                        .network(network)
+                        .create_wallet_no_persist()
+                        .map_err(|e| {
+                            format!("Failed to create taproot wallet from descriptor: {e}")
+                        })?;
                         (w, bdk_wallet::ChangeSet::default())
                     }
                 }
             } else {
-                let w = Wallet::create(taproot_external_desc.clone(), taproot_internal_desc.clone())
-                    .network(network)
-                    .create_wallet_no_persist()
-                    .map_err(|e| format!("Failed to create taproot wallet from descriptor: {e}"))?;
+                let w =
+                    Wallet::create(taproot_external_desc.clone(), taproot_internal_desc.clone())
+                        .network(network)
+                        .create_wallet_no_persist()
+                        .map_err(|e| {
+                            format!("Failed to create taproot wallet from descriptor: {e}")
+                        })?;
                 (w, bdk_wallet::ChangeSet::default())
             }
         } else {
@@ -2778,44 +2840,49 @@ impl WalletBuilder {
         };
 
         // 2. Payment wallet (optional, for dual-scheme)
-        let (payment_wallet, loaded_payment_changeset) =
-            if let (Some(pay_ext), Some(pay_int)) = (&payment_external_desc, &payment_internal_desc) {
-                let (wallet, changeset) = if let Some(p) = &persistence {
-                    if let Some(changeset) = &p.payment {
-                        let res = Wallet::load()
-                            .descriptor(KeychainKind::External, Some(pay_ext.clone()))
-                            .descriptor(KeychainKind::Internal, Some(pay_int.clone()))
-                            .extract_keys()
-                            .load_wallet_no_persist(changeset.clone());
+        let (payment_wallet, loaded_payment_changeset) = if let (Some(pay_ext), Some(pay_int)) =
+            (&payment_external_desc, &payment_internal_desc)
+        {
+            let (wallet, changeset) = if let Some(p) = &persistence {
+                if let Some(changeset) = &p.payment {
+                    let res = Wallet::load()
+                        .descriptor(KeychainKind::External, Some(pay_ext.clone()))
+                        .descriptor(KeychainKind::Internal, Some(pay_int.clone()))
+                        .extract_keys()
+                        .load_wallet_no_persist(changeset.clone());
 
-                        match res {
-                            Ok(Some(w)) => (w, Some(changeset.clone())),
-                            Ok(None) | Err(_) => {
-                                let w = Wallet::create(pay_ext.clone(), pay_int.clone())
-                                    .network(network)
-                                    .create_wallet_no_persist()
-                                    .map_err(|e| format!("Failed to create payment wallet from descriptor: {e}"))?;
-                                (w, None)
-                            }
+                    match res {
+                        Ok(Some(w)) => (w, Some(changeset.clone())),
+                        Ok(None) | Err(_) => {
+                            let w = Wallet::create(pay_ext.clone(), pay_int.clone())
+                                .network(network)
+                                .create_wallet_no_persist()
+                                .map_err(|e| {
+                                    format!("Failed to create payment wallet from descriptor: {e}")
+                                })?;
+                            (w, None)
                         }
-                    } else {
-                        let w = Wallet::create(pay_ext.clone(), pay_int.clone())
-                            .network(network)
-                            .create_wallet_no_persist()
-                            .map_err(|e| format!("Failed to create payment wallet from descriptor: {e}"))?;
-                        (w, None)
                     }
                 } else {
                     let w = Wallet::create(pay_ext.clone(), pay_int.clone())
                         .network(network)
                         .create_wallet_no_persist()
-                        .map_err(|e| format!("Failed to create payment wallet from descriptor: {e}"))?;
+                        .map_err(|e| {
+                            format!("Failed to create payment wallet from descriptor: {e}")
+                        })?;
                     (w, None)
-                };
-                (Some(wallet), changeset)
+                }
             } else {
-                (None, None)
+                let w = Wallet::create(pay_ext.clone(), pay_int.clone())
+                    .network(network)
+                    .create_wallet_no_persist()
+                    .map_err(|e| format!("Failed to create payment wallet from descriptor: {e}"))?;
+                (w, None)
             };
+            (Some(wallet), changeset)
+        } else {
+            (None, None)
+        };
 
         Ok(ZincWallet {
             vault_wallet,
@@ -2833,7 +2900,7 @@ impl WalletBuilder {
             rune_balances: Vec::new(),
             ordinals_verified: false,
             ordinals_metadata_complete: false,
-            kind: WalletKind::Hardware { 
+            kind: WalletKind::Hardware {
                 fingerprint,
                 taproot_external: taproot_external_desc,
                 payment_external: payment_external_desc,
@@ -2873,7 +2940,7 @@ mod tests {
         let mnemonic = ZincMnemonic::generate(12).unwrap();
         let seed = mnemonic.to_seed("");
         let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
-        
+
         let wallet = WalletBuilder::new(Network::Signet)
             .kind(WalletKind::Seed { master_xprv })
             .build()
