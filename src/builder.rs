@@ -644,11 +644,12 @@ impl ZincWallet {
                 let chain = 0; // External
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    // SECURITY: Safely handle derivation paths to prevent panics on indices >= 2^31.
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| format!("Invalid coin_type index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| format!("Invalid chain index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {e}"))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -2188,7 +2189,7 @@ impl ZincWallet {
         let sig = secp.sign_ecdsa_recoverable(&msg, &priv_key);
         let (rec_id, sig_bytes_compact) = sig.serialize_compact();
 
-        let mut header = 27 + u8::try_from(rec_id.to_i32()).unwrap();
+        let mut header = 27 + u8::try_from(rec_id.to_i32()).map_err(|e| format!("Invalid recovery ID: {e}"))?;
         header += 4; // Always compressed
 
         let mut sig_bytes = Vec::with_capacity(65);
@@ -2251,11 +2252,12 @@ impl ZincWallet {
                 let coin_type = u32::from(network != Network::Bitcoin);
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    // SECURITY: Safely handle derivation paths to prevent panics on indices >= 2^31.
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| format!("Invalid coin_type index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| format!("Invalid chain index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {e}"))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -2355,7 +2357,9 @@ impl ZincWallet {
                                     final_sig.push(tap_sighash_type as u8);
                                 }
                                 
-                                input.tap_script_sigs.insert((*pubkey, leaf_hash), bitcoin::taproot::Signature::from_slice(&final_sig).unwrap());
+                                // SECURITY: Avoid panic by returning an error if taproot signature parsing fails.
+                                let tap_sig = bitcoin::taproot::Signature::from_slice(&final_sig).map_err(|e| format!("Invalid taproot signature: {e}"))?;
+                                input.tap_script_sigs.insert((*pubkey, leaf_hash), tap_sig);
                                 key_found = true;
                             }
                         }
