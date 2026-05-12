@@ -38,6 +38,11 @@ pub mod history;
 pub mod keys;
 /// Fixed-price listing and sale PSBT validation helpers.
 pub mod listing;
+/// Nostr event models and signing/verification helpers for decentralized listings.
+pub mod listing_nostr;
+/// Native Nostr relay publish/discovery transport for listing events.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod listing_relay;
 /// Offer envelope models and deterministic offer hashing/signature helpers.
 pub mod offer;
 /// Offer acceptance safety checks and signing plan derivation.
@@ -71,6 +76,11 @@ pub use listing::{
     CreateListingPurchaseResultV1, CreateListingRequest, CreateListingResultV1,
     FinalizeListingPurchaseRequest, FinalizeListingPurchaseResultV1, FinalizedListingSaleResultV1,
     ListingBuyerFundingInput, ListingEnvelopeV1, ListingSaleSigningPlanV1, LISTING_SALE_SIGHASH_U8,
+};
+pub use listing_nostr::{NostrListingEvent, LISTING_EVENT_KIND};
+#[cfg(not(target_arch = "wasm32"))]
+pub use listing_relay::{
+    ListingRelayPublishResult, ListingRelayQueryOptions, NostrListingRelayClient,
 };
 pub use offer::OfferEnvelopeV1;
 pub use offer_accept::{prepare_offer_acceptance, OfferAcceptancePlanV1};
@@ -250,13 +260,19 @@ async fn probe_single_account(
 ) -> Option<AccountDiscoveryReport> {
     // 1. Build descriptors for this specific index
     let (t_ext, t_int) = if path_type == "legacy" {
-        let path = format!("86'/{}'/0'", if network == Network::Bitcoin { 0 } else { 1 });
+        let path = format!(
+            "86'/{}'/0'",
+            if network == Network::Bitcoin { 0 } else { 1 }
+        );
         (
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/0/{index})"),
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/1/{index})"),
         )
     } else {
-        let path = format!("86'/{}'/{index}'", if network == Network::Bitcoin { 0 } else { 1 });
+        let path = format!(
+            "86'/{}'/{index}'",
+            if network == Network::Bitcoin { 0 } else { 1 }
+        );
         (
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/0/*)"),
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/1/*)"),
@@ -265,13 +281,19 @@ async fn probe_single_account(
 
     let (p_ext, p_int) = if let Some(xpub) = payment_xpub {
         if path_type == "legacy" {
-            let path = format!("84'/{}'/0'", if network == Network::Bitcoin { 0 } else { 1 });
+            let path = format!(
+                "84'/{}'/0'",
+                if network == Network::Bitcoin { 0 } else { 1 }
+            );
             (
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/0/{index})")),
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/1/{index})")),
             )
         } else {
-            let path = format!("84'/{}'/{index}'", if network == Network::Bitcoin { 0 } else { 1 });
+            let path = format!(
+                "84'/{}'/{index}'",
+                if network == Network::Bitcoin { 0 } else { 1 }
+            );
             (
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/0/*)")),
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/1/*)")),
@@ -309,20 +331,28 @@ async fn probe_single_account(
     let mut has_activity = false;
 
     // Check Vault Address (Postage + Inscriptions)
-    if let Some((bal, ins_list, active)) = fetch_addr_stats(client, esplora_url, ord_url, &vault_addr).await {
+    if let Some((bal, ins_list, active)) =
+        fetch_addr_stats(client, esplora_url, ord_url, &vault_addr).await
+    {
         postage_sats += bal;
         total_inscriptions += ins_list.len() as u32;
         inscriptions.extend(ins_list);
-        if active { has_activity = true; }
+        if active {
+            has_activity = true;
+        }
     }
 
     // Check Payment Address (Spendable BTC)
     if let Some(p_addr) = payment_addr {
-        if let Some((bal, ins_list, active)) = fetch_addr_stats(client, esplora_url, ord_url, &p_addr).await {
+        if let Some((bal, ins_list, active)) =
+            fetch_addr_stats(client, esplora_url, ord_url, &p_addr).await
+        {
             spendable_sats += bal;
             total_inscriptions += ins_list.len() as u32;
             inscriptions.extend(ins_list);
-            if active { has_activity = true; }
+            if active {
+                has_activity = true;
+            }
         }
     }
 
@@ -371,19 +401,26 @@ async fn fetch_addr_stats(
             let mempool_funded = mempool_stats["funded_txo_sum"].as_u64().unwrap_or(0);
             let mempool_spent = mempool_stats["spent_txo_sum"].as_u64().unwrap_or(0);
             let mempool_sats = mempool_funded.saturating_sub(mempool_spent);
-            
+
             balance = chain_sats.saturating_add(mempool_sats);
-            
+
             let tx_count = chain_stats["tx_count"].as_u64().unwrap_or(0)
                 + mempool_stats["tx_count"].as_u64().unwrap_or(0);
-            if tx_count > 0 { has_history = true; }
+            if tx_count > 0 {
+                has_history = true;
+            }
         }
     }
 
     // 2. Get Inscriptions from Ord
     let mut inscriptions = Vec::new();
     let ord_addr_url = format!("{}/address/{}", ord_url, address);
-    if let Ok(resp) = client.get(&ord_addr_url).header("Accept", "application/json").send().await {
+    if let Ok(resp) = client
+        .get(&ord_addr_url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+    {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             // Handle different JSON structures: { "inscriptions": [...] } or direct array [...]
             let list_opt = if let Some(list) = json["inscriptions"].as_array() {
@@ -403,9 +440,16 @@ async fn fetch_addr_stats(
                         });
                     } else if let Some(obj) = item.as_object() {
                         // Extract ID from object (handle various field names)
-                        let id_opt = obj.get("id").or(obj.get("inscription_id")).or(obj.get("inscriptionId"));
+                        let id_opt = obj
+                            .get("id")
+                            .or(obj.get("inscription_id"))
+                            .or(obj.get("inscriptionId"));
                         if let Some(id) = id_opt.and_then(|v| v.as_str()) {
-                            let ct = obj.get("content_type").or(obj.get("contentType")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let ct = obj
+                                .get("content_type")
+                                .or(obj.get("contentType"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                             inscriptions.push(InscriptionPreview {
                                 id: id.to_string(),
                                 content_type: ct,
@@ -970,7 +1014,8 @@ impl ZincWasmWallet {
         account_index: u32,
         persistence_json: Option<&str>,
     ) -> Result<ZincWallet, JsValue> {
-        let mnemonic = ZincMnemonic::parse(phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mnemonic =
+            ZincMnemonic::parse(phrase).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let mut builder = WalletBuilder::from_mnemonic(network, &mnemonic);
         builder = builder
             .with_scheme(scheme)
@@ -1015,25 +1060,29 @@ impl ZincWasmWallet {
         }
 
         let persistence = if let Some(json) = persistence_json {
-            Some(serde_json::from_str::<ZincPersistence>(&json).map_err(|e| JsValue::from_str(&e.to_string()))?)
+            Some(
+                serde_json::from_str::<ZincPersistence>(&json)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            )
         } else {
             None
         };
 
-        let mut builder = WalletBuilder::new(network_enum)
-            .with_account_index(account_index);
+        let mut builder = WalletBuilder::new(network_enum).with_account_index(account_index);
 
         if let Some(p) = persistence {
             builder = builder.persistence(p);
         }
 
-        let wallet = builder.build_hardware(
-            fingerprint_hex,
-            taproot_external_desc.to_string(),
-            taproot_internal_desc.to_string(),
-            payment_external_desc.clone(),
-            payment_internal_desc.clone(),
-        ).map_err(|e| JsValue::from_str(&e))?;
+        let wallet = builder
+            .build_hardware(
+                fingerprint_hex,
+                taproot_external_desc.to_string(),
+                taproot_internal_desc.to_string(),
+                payment_external_desc.clone(),
+                payment_internal_desc.clone(),
+            )
+            .map_err(|e| JsValue::from_str(&e))?;
 
         zinc_log_debug!(
             target: LOG_TARGET_WASM,
@@ -1043,10 +1092,12 @@ impl ZincWasmWallet {
             taproot_external_desc,
             payment_external_desc
         );
-        
+
         Ok(ZincWasmWallet {
             inner: std::rc::Rc::new(std::cell::RefCell::new(wallet)),
-            material: WalletMaterial::Hardware { _fingerprint: fingerprint },
+            material: WalletMaterial::Hardware {
+                _fingerprint: fingerprint,
+            },
             state: std::cell::Cell::new(WalletState {
                 network: network_enum,
                 scheme: AddressScheme::Dual,
@@ -1118,9 +1169,11 @@ impl ZincWasmWallet {
     fn seed_phrase(&self) -> Result<&str, JsValue> {
         match &self.material {
             WalletMaterial::MnemonicPhrase(phrase) => Ok(phrase.as_str()),
-            WalletMaterial::WatchAddress(_) | WalletMaterial::Hardware { .. } => Err(JsValue::from_str(
-                "Operation is unavailable for watch-address and hardware profiles",
-            )),
+            WalletMaterial::WatchAddress(_) | WalletMaterial::Hardware { .. } => {
+                Err(JsValue::from_str(
+                    "Operation is unavailable for watch-address and hardware profiles",
+                ))
+            }
         }
     }
 
@@ -1349,11 +1402,7 @@ impl ZincWasmWallet {
             ..state
         };
         let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
-        self.replace_wallet(
-            next_wallet,
-            next_state,
-            "set_scheme",
-        )
+        self.replace_wallet(next_wallet, next_state, "set_scheme")
     }
 
     /// Switch the active account index.
@@ -1371,11 +1420,7 @@ impl ZincWasmWallet {
             ..state
         };
         let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
-        self.replace_wallet(
-            next_wallet,
-            next_state,
-            "set_active_account",
-        )
+        self.replace_wallet(next_wallet, next_state, "set_active_account")
     }
 
     /// Change the network on the fly.
@@ -1399,11 +1444,7 @@ impl ZincWasmWallet {
             ..state
         };
         let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
-        self.replace_wallet(
-            next_wallet,
-            next_state,
-            "set_network",
-        )
+        self.replace_wallet(next_wallet, next_state, "set_network")
     }
 
     /// Switch logical account derivation mode.
@@ -1424,11 +1465,7 @@ impl ZincWasmWallet {
             ..state
         };
         let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
-        self.replace_wallet(
-            next_wallet,
-            next_state,
-            "set_derivation_mode",
-        )
+        self.replace_wallet(next_wallet, next_state, "set_derivation_mode")
     }
 
     /// Get the current derivation mode label.
@@ -1458,11 +1495,7 @@ impl ZincWasmWallet {
             ..state
         };
         let next_wallet = Self::build_wallet_for_state(&self.material, next_state)?;
-        self.replace_wallet(
-            next_wallet,
-            next_state,
-            "set_payment_address_type",
-        )
+        self.replace_wallet(next_wallet, next_state, "set_payment_address_type")
     }
 
     /// Get the current payment address type label.
@@ -1514,10 +1547,10 @@ impl ZincWasmWallet {
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             let client = reqwest::Client::new();
             let mut reports = Vec::new();
-            
+
             // Parallelism configuration
             const ACCOUNT_BATCH_SIZE: usize = 5;
-            
+
             for batch_start in (start_index..=end_index).step_by(ACCOUNT_BATCH_SIZE) {
                 let batch_end = (batch_start + ACCOUNT_BATCH_SIZE as u32).min(end_index + 1);
                 let mut batch_futures = Vec::new();
@@ -1535,13 +1568,31 @@ impl ZincWasmWallet {
                     batch_futures.push(async move {
                         // 1. Probe Standard Path (m/86'/0'/idx' and m/84'/0'/idx')
                         let standard_report = probe_single_account(
-                            &client, &esplora, &ord, network_enum, &fp, idx, &s_t_xpub, Some(&s_p_xpub), "standard"
-                        ).await;
+                            &client,
+                            &esplora,
+                            &ord,
+                            network_enum,
+                            &fp,
+                            idx,
+                            &s_t_xpub,
+                            Some(&s_p_xpub),
+                            "standard",
+                        )
+                        .await;
 
                         // 2. Probe Legacy Path (m/86'/0'/0'/0/idx and m/84'/0'/0'/0/idx)
                         let legacy_report = probe_single_account(
-                            &client, &esplora, &ord, network_enum, &fp, idx, &l_t_xpub, Some(&l_p_xpub), "legacy"
-                        ).await;
+                            &client,
+                            &esplora,
+                            &ord,
+                            network_enum,
+                            &fp,
+                            idx,
+                            &l_t_xpub,
+                            Some(&l_p_xpub),
+                            "legacy",
+                        )
+                        .await;
 
                         (standard_report, legacy_report)
                     });
@@ -1549,8 +1600,12 @@ impl ZincWasmWallet {
 
                 let batch_results = futures_util::future::join_all(batch_futures).await;
                 for (s, l) in batch_results {
-                    if let Some(r) = s { reports.push(r); }
-                    if let Some(r) = l { reports.push(r); }
+                    if let Some(r) = s {
+                        reports.push(r);
+                    }
+                    if let Some(r) = l {
+                        reports.push(r);
+                    }
                 }
             }
 
@@ -2553,14 +2608,15 @@ impl ZincWasmWallet {
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
 
-        let sign_opts: Option<crate::builder::SignOptions> = if options.is_null() || options.is_undefined() {
-            None
-        } else {
-            match serde_wasm_bindgen::from_value(options) {
-                Ok(opts) => Some(opts),
-                Err(e) => return Err(JsValue::from_str(&format!("Invalid options: {e}"))),
-            }
-        };
+        let sign_opts: Option<crate::builder::SignOptions> =
+            if options.is_null() || options.is_undefined() {
+                None
+            } else {
+                match serde_wasm_bindgen::from_value(options) {
+                    Ok(opts) => Some(opts),
+                    Err(e) => return Err(JsValue::from_str(&format!("Invalid options: {e}"))),
+                }
+            };
 
         match self.inner.try_borrow() {
             Ok(inner) => inner
@@ -2583,18 +2639,19 @@ impl ZincWasmWallet {
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
 
-        let indices: Option<Vec<usize>> = if required_input_indices.is_null() || required_input_indices.is_undefined() {
-            None
-        } else {
-            match serde_wasm_bindgen::from_value(required_input_indices) {
-                Ok(val) => Some(val),
-                Err(e) => {
-                    return Err(JsValue::from_str(&format!(
-                        "Invalid required_input_indices: {e}"
-                    )))
+        let indices: Option<Vec<usize>> =
+            if required_input_indices.is_null() || required_input_indices.is_undefined() {
+                None
+            } else {
+                match serde_wasm_bindgen::from_value(required_input_indices) {
+                    Ok(val) => Some(val),
+                    Err(e) => {
+                        return Err(JsValue::from_str(&format!(
+                            "Invalid required_input_indices: {e}"
+                        )))
+                    }
                 }
-            }
-        };
+            };
 
         match self.inner.try_borrow() {
             Ok(inner) => inner

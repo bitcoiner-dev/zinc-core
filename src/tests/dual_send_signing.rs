@@ -1,4 +1,6 @@
-use crate::builder::{AddressScheme, CreatePsbtRequest, PaymentAddressType, Seed64, SignOptions, WalletBuilder};
+use crate::builder::{
+    AddressScheme, CreatePsbtRequest, PaymentAddressType, Seed64, SignOptions, WalletBuilder,
+};
 use base64::Engine;
 use bdk_wallet::bitcoin::hashes::{hash160, Hash};
 use bdk_wallet::bitcoin::{Amount, Network, ScriptBuf, Transaction, TxOut, Txid};
@@ -96,7 +98,11 @@ fn finalized_pubkey_matches_nested_witness(
     }
 
     let script_sig_bytes = script_sig.as_bytes();
-    if script_sig_bytes.len() != 23 || script_sig_bytes[0] != 0x16 || script_sig_bytes[1] != 0x00 || script_sig_bytes[2] != 0x14 {
+    if script_sig_bytes.len() != 23
+        || script_sig_bytes[0] != 0x16
+        || script_sig_bytes[1] != 0x00
+        || script_sig_bytes[2] != 0x14
+    {
         return false;
     }
 
@@ -135,7 +141,9 @@ fn assert_payment_send_finalizes_correctly(payment_type: PaymentAddressType) {
         .to_string();
 
     let request = CreatePsbtRequest::from_parts(&recipient, 40_000, 1).expect("request");
-    let unsigned_psbt = wallet.create_psbt_base64(&request).expect("create send psbt");
+    let unsigned_psbt = wallet
+        .create_psbt_base64(&request)
+        .expect("create send psbt");
     let signed_psbt = wallet
         .sign_psbt(
             &unsigned_psbt,

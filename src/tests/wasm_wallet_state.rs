@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
+    use crate::ZincWasmWallet;
     #[cfg(target_arch = "wasm32")]
     use crate::{AddressScheme, Network, WalletBuilder, ZincMnemonic};
-    use crate::ZincWasmWallet;
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen::JsValue;
     #[cfg(target_arch = "wasm32")]
@@ -174,7 +174,10 @@ mod tests {
         let wallet = ZincWasmWallet::new_watch_address("regtest", &watch_address, None, Some(0))
             .expect("watch wallet should initialize");
 
-        let inner = wallet.inner.try_borrow().expect("wallet borrow should work");
+        let inner = wallet
+            .inner
+            .try_borrow()
+            .expect("wallet borrow should work");
         assert_eq!(inner.peek_taproot_address(0).to_string(), watch_address);
     }
 
@@ -182,7 +185,8 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_wasm_watch_address_rejects_network_mismatch() {
         let watch_address = regtest_taproot_watch_address();
-        let err = match ZincWasmWallet::new_watch_address("mainnet", &watch_address, None, Some(0)) {
+        let err = match ZincWasmWallet::new_watch_address("mainnet", &watch_address, None, Some(0))
+        {
             Ok(_) => panic!("network mismatch should fail"),
             Err(err) => err,
         };

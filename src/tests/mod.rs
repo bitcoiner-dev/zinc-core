@@ -2,6 +2,8 @@ pub mod balance;
 pub mod discovery_scan;
 pub mod dual_send_signing;
 pub mod listing;
+pub mod listing_nostr;
+pub mod listing_relay;
 pub mod offer;
 pub mod offer_accept;
 pub mod offer_create;
