@@ -56,6 +56,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 # Encoding & WASM serialization
 base64 = "0.22"
+bip322 = "0.0.10"
 serde-wasm-bindgen = "0.6"
 nostr = { version = "0.44.2", default-features = false, features = ["std", "nip44"] }
 
@@ -105,9 +106,9 @@ lto = true
 unsafe_code = "deny"
 
 [lints.clippy]
-all = { level = "warn", priority = -1 }
-correctness = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+all = "warn"
+correctness = "deny"
+pedantic = "warn"
 # Suppress noisy/low-value lints
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
