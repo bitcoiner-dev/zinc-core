@@ -436,7 +436,7 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -477,7 +477,7 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -512,7 +512,7 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -603,7 +603,8 @@ pub fn analyze_psbt_with_scope(
         }
 
         outputs_info.push(OutputInfo {
-            vout: vout as u32,
+            // SECURITY: Safe integer cast to prevent truncation or panic on out-of-bounds vout.
+            vout: u32::try_from(vout).map_err(|e| OrdError::RequestFailed(format!("Invalid vout index: {e}")))?,
             value: output_value,
             script_pubkey: output.script_pubkey.to_hex_string(),
             address,
