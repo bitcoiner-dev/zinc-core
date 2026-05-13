@@ -645,12 +645,13 @@ impl ZincWallet {
                 let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
                 let chain = 0; // External
 
+                // SECURITY: Avoid panic by returning an error if indices exceed maximum BIP32 bounds (e.g. 2^31)
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose index: {}", e))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(), // Safe: explicitly 0 or 1
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account index: {}", e))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(), // Safe: explicitly 0
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {}", e))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -714,8 +715,8 @@ impl ZincWallet {
                     .derive_pub(
                         &secp,
                         &[
-                            ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            ChildNumber::from_normal_idx(0).unwrap(), // Safe: explicitly 0
+                            ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {}", e))?,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
@@ -2339,12 +2340,13 @@ impl ZincWallet {
                 let network = self.vault_wallet.network();
                 let coin_type = u32::from(network != Network::Bitcoin);
 
+                // SECURITY: Avoid panic by returning an error if indices exceed maximum BIP32 bounds (e.g. 2^31)
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose index: {}", e))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(), // Safe: evaluated as 0 or 1
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account index: {}", e))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| format!("Invalid chain index: {}", e))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {}", e))?,
                 ];
 
                 let child_xprv = master_xprv
