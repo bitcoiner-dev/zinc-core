@@ -195,7 +195,7 @@ pub fn analyze_psbt_with_scope(
     });
 
     let mut analysis_psbt = psbt.clone();
-    let mut scoped_known_inscriptions: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::new();
+    let mut scoped_known_inscriptions: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::with_capacity(known_inscriptions.len());
     let mut scope_has_unknown_inputs = false;
 
     if let Some(scope_indices) = normalized_scope.as_ref() {
@@ -223,7 +223,7 @@ pub fn analyze_psbt_with_scope(
 
     let mut warning_level = WarningLevel::Safe;
     let mut inscriptions_burned = Vec::new();
-    let mut inscription_destinations = HashMap::new();
+    let mut inscription_destinations = HashMap::with_capacity(known_inscriptions.len());
     let mut fee_sats = 0;
     let mut warnings = Vec::new();
 
