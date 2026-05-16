@@ -645,12 +645,13 @@ impl ZincWallet {
                 let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
                 let chain = 0; // External
 
+                // SECURITY: Avoid panic by returning an error if derivation indices exceed bounds (2^31)
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose: {e}"))?,
                     bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(), // Statically 0
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {e}"))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -710,12 +711,13 @@ impl ZincWallet {
                 })?;
 
                 // Derive /0/index (assuming external chain '0' matches our descriptors)
+                // SECURITY: Avoid panic by returning an error if derivation index exceeds bounds (2^31)
                 let derived_xpub = xpub
                     .derive_pub(
                         &secp,
                         &[
                             ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {e}"))?,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
