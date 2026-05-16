@@ -2714,7 +2714,8 @@ impl ZincWasmWallet {
         let mut known_inscriptions: std::collections::HashMap<
             (bitcoin::Txid, u32),
             Vec<(String, u64)>,
-        > = std::collections::HashMap::new();
+        > = std::collections::HashMap::with_capacity(inner.inscriptions.len());
+        // PERFORMANCE OPTIMIZATION (Bolt): Pre-allocated HashMap based on the upper bound of inscriptions.
         for ins in &inner.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
