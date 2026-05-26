@@ -283,7 +283,12 @@ pub fn analyze_psbt_with_scope(
 
     // Store absolute offsets of all inscriptions being moved
     // (InscriptionID/Key, AbsoluteOffset, OriginalInputValue)
-    let mut active_inscriptions: Vec<(String, u64, u64)> = Vec::new();
+    // PERFORMANCE OPTIMIZATION (Bolt): `known_inscriptions` provides an exact maximum number of
+    // possible active inscriptions without needing a separate count iteration.
+    // Pre-allocating `active_inscriptions` capacity based on the total values in the HashMap
+    // avoids multiple dynamic resizing re-allocations during the inputs processing loop.
+    let estimated_inscriptions: usize = known_inscriptions.values().map(|v| v.len()).sum();
+    let mut active_inscriptions: Vec<(String, u64, u64)> = Vec::with_capacity(estimated_inscriptions);
 
     zinc_log_debug!(target: LOG_TARGET_SHIELD, "analyze_psbt core: Processing {} inputs", analysis_psbt.inputs.len());
 
