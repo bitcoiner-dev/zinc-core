@@ -435,10 +435,9 @@ pub fn analyze_psbt_with_scope(
                         } else if val_opcode == 0x4d {
                             if cursor + 3 <= script_bytes.len() {
                                 (
-                                    script_bytes[cursor + 1..cursor + 3]
-                                        .try_into()
-                                        .map(|b| u16::from_le_bytes(b) as usize)
-                                        .unwrap_or(0),
+                                    u16::from_le_bytes(
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                    ) as usize,
                                     3,
                                 )
                             } else {
@@ -477,10 +476,9 @@ pub fn analyze_psbt_with_scope(
                         } else if op == 0x4d {
                             if cursor + 3 <= script_bytes.len() {
                                 (
-                                    script_bytes[cursor + 1..cursor + 3]
-                                        .try_into()
-                                        .map(|b| u16::from_le_bytes(b) as usize)
-                                        .unwrap_or(0),
+                                    u16::from_le_bytes(
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                    ) as usize,
                                     3,
                                 )
                             } else {
@@ -513,10 +511,9 @@ pub fn analyze_psbt_with_scope(
                         } else if opcode == 0x4d {
                             if cursor + 3 <= script_bytes.len() {
                                 (
-                                    script_bytes[cursor + 1..cursor + 3]
-                                        .try_into()
-                                        .map(|b| u16::from_le_bytes(b) as usize)
-                                        .unwrap_or(0),
+                                    u16::from_le_bytes(
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                    ) as usize,
                                     3,
                                 )
                             } else {
@@ -598,7 +595,7 @@ pub fn analyze_psbt_with_scope(
                 if output_value != *original_input_value {
                     warning_level = WarningLevel::Warn;
                     warnings.push(format!(
-                        "Inscription {} UTXO size changed ({} -> {} sats). Verify this is intended.", 
+                        "Inscription {} UTXO size changed ({} -> {} sats). Verify this is intended.",
                         shorten_id(key), original_input_value, output_value
                     ));
                 }
