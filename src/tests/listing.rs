@@ -539,6 +539,7 @@ fn finalize_listing_purchase_builds_buyer_funded_psbt_preserving_seller_signatur
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: Some(seller_payout_script()),
         change_sats: 5_000,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect("buyer finalization");
@@ -600,6 +601,7 @@ fn finalized_listing_purchase_can_be_pinned_by_coordinator_default_signature() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect("buyer finalization");
@@ -656,6 +658,7 @@ fn finalize_listing_purchase_rejects_missing_seller_signature() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect_err("unsigned listing rejected");
@@ -683,6 +686,7 @@ fn finalize_listing_purchase_rejects_duplicate_passthrough_buyer_input() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect_err("duplicate passthrough rejected");
@@ -699,6 +703,7 @@ fn finalize_listing_purchase_rejects_insufficient_funding_and_zero_fee() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect_err("insufficient funding rejected");
@@ -710,6 +715,7 @@ fn finalize_listing_purchase_rejects_insufficient_funding_and_zero_fee() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect_err("zero fee rejected");
@@ -725,6 +731,7 @@ fn finalize_listing_purchase_rejects_missing_receive_or_change_script() {
         buyer_receive_script_pubkey: ScriptBuf::new(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect_err("empty receive script rejected");
@@ -736,6 +743,7 @@ fn finalize_listing_purchase_rejects_missing_receive_or_change_script() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 1,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect_err("missing change script rejected");
@@ -758,6 +766,7 @@ fn finalize_listing_purchase_rejects_already_coordinator_signed_psbt() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 3,
     })
     .expect_err("already coordinator signed rejected");
@@ -878,6 +887,7 @@ fn finalize_listing_sale_builds_passthrough_witness_and_extracts_tx() {
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
+        anchor_output: None,
         now_unix: request.created_at_unix + 2,
     })
     .expect("buyer finalization");
@@ -1387,4 +1397,251 @@ fn listing_envelope_rejects_malformed_pubkeys_and_expiration() {
         .listing_id_hex()
         .expect_err("non-increasing expiration rejected");
     assert!(err.to_string().contains("expiration must be greater"));
+}
+
+#[test]
+fn test_input_and_output_shift_maintains_valid_signature_and_secures_payout() {
+    // Tests that an attacker CAN shift the seller's input/output to a different index
+    // because Taproot SIGHASH_SINGLE|ANYONECANPAY does not commit to the input index.
+    // However, the output at that new index MUST perfectly match the seller's payout.
+    let (_request, listing) = signed_sale_listing();
+    let mut psbt = decode_psbt(&listing.sale_psbt_base64);
+
+    // Shift seller input and output to index 1
+    let dummy_input = TxIn {
+        previous_output: OutPoint::new(sample_txid(0x99), 0),
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        witness: Witness::new(),
+    };
+    let dummy_output = TxOut {
+        value: Amount::from_sat(1000),
+        script_pubkey: ScriptBuf::new(),
+    };
+
+    psbt.unsigned_tx.input.insert(0, dummy_input);
+    psbt.unsigned_tx.output.insert(0, dummy_output);
+
+    let mut dummy_psbt_input = bdk_wallet::bitcoin::psbt::Input::default();
+    dummy_psbt_input.witness_utxo = Some(TxOut {
+        value: Amount::from_sat(1000),
+        script_pubkey: ScriptBuf::new(),
+    });
+    psbt.inputs.insert(0, dummy_psbt_input);
+    psbt.outputs.insert(0, bdk_wallet::bitcoin::psbt::Output::default());
+
+    let seller = XOnlyPublicKey::from_str(SELLER_PUBKEY_HEX).expect("seller pubkey");
+    let (_control_block, (script, leaf_version)) = psbt.inputs[1]
+        .tap_scripts
+        .iter()
+        .next()
+        .expect("tap script");
+    let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
+    let seller_sig = psbt.inputs[1]
+        .tap_script_sigs
+        .get(&(seller, leaf_hash))
+        .expect("seller sig");
+
+    let prevouts: Vec<TxOut> = psbt
+        .inputs
+        .iter()
+        .map(|input| input.witness_utxo.clone().expect("witness utxo"))
+        .collect();
+
+    let sighash = SighashCache::new(&psbt.unsigned_tx)
+        .taproot_script_spend_signature_hash(
+            1, // Verify for index 1
+            &Prevouts::One(1, &prevouts[1]), // ANYONECANPAY
+            leaf_hash,
+            TapSighashType::SinglePlusAnyoneCanPay,
+        )
+        .expect("sighash");
+
+    let message = Message::from_digest(sighash.to_byte_array());
+    let secp = Secp256k1::verification_only();
+    assert!(
+        secp.verify_schnorr(&seller_sig.signature, &message, &seller)
+            .is_ok(),
+        "Seller signature must REMAIN VALID if input/output index is shifted but output is intact"
+    );
+
+    // BUT, if the attacker mutates the output at that new index, the signature MUST break.
+    psbt.unsigned_tx.output[1].value = Amount::from_sat(ASK_SATS + POSTAGE_SATS - 1);
+    let mutated_sighash = SighashCache::new(&psbt.unsigned_tx)
+        .taproot_script_spend_signature_hash(
+            1,
+            &Prevouts::One(1, &prevouts[1]),
+            leaf_hash,
+            TapSighashType::SinglePlusAnyoneCanPay,
+        )
+        .expect("sighash");
+    let mutated_message = Message::from_digest(mutated_sighash.to_byte_array());
+    assert!(
+        secp.verify_schnorr(&seller_sig.signature, &mutated_message, &seller)
+            .is_err(),
+        "Seller signature must BECOME INVALID if output amount is mutated"
+    );
+}
+
+#[test]
+fn test_prevent_replay_attack_on_different_utxo() {
+    // Tests that the seller's signature cannot be replayed on a different passthrough UTXO.
+    let (_request, listing) = signed_sale_listing();
+    let mut psbt = decode_psbt(&listing.sale_psbt_base64);
+
+    // Attacker tries to replay the signature on a different UTXO
+    psbt.unsigned_tx.input[0].previous_output = OutPoint::new(sample_txid(0x88), 0);
+    // Even if they keep the same value/script in witness_utxo, the signature commits to the prevout TXID/VOUT.
+    
+    let seller = XOnlyPublicKey::from_str(SELLER_PUBKEY_HEX).expect("seller pubkey");
+    let (_control_block, (script, leaf_version)) = psbt.inputs[0]
+        .tap_scripts
+        .iter()
+        .next()
+        .expect("tap script");
+    let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
+    let seller_sig = psbt.inputs[0]
+        .tap_script_sigs
+        .get(&(seller, leaf_hash))
+        .expect("seller sig");
+
+    let prevouts: Vec<TxOut> = psbt
+        .inputs
+        .iter()
+        .map(|input| input.witness_utxo.clone().expect("witness utxo"))
+        .collect();
+
+    let sighash = SighashCache::new(&psbt.unsigned_tx)
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::One(0, &prevouts[0]), // ANYONECANPAY
+            leaf_hash,
+            TapSighashType::SinglePlusAnyoneCanPay,
+        )
+        .expect("sighash");
+
+    let message = Message::from_digest(sighash.to_byte_array());
+    let secp = Secp256k1::verification_only();
+    assert!(
+        secp.verify_schnorr(&seller_sig.signature, &message, &seller)
+            .is_err(),
+        "Seller signature must be tied to the specific passthrough outpoint"
+    );
+}
+
+#[test]
+fn test_prevent_payout_script_substitution_attack() {
+    // Tests that the seller's SIGHASH_SINGLE signature commits to the payout script,
+    // so an attacker cannot redirect funds to a different address.
+    let (_request, listing) = signed_sale_listing();
+    let mut psbt = decode_psbt(&listing.sale_psbt_base64);
+
+    let seller = XOnlyPublicKey::from_str(SELLER_PUBKEY_HEX).expect("seller pubkey");
+    let (_control_block, (script, leaf_version)) = psbt.inputs[0]
+        .tap_scripts
+        .iter()
+        .next()
+        .expect("tap script");
+    let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
+    let seller_sig = psbt.inputs[0]
+        .tap_script_sigs
+        .get(&(seller, leaf_hash))
+        .expect("seller sig");
+
+    // First verify the original signature is valid
+    let prevouts: Vec<TxOut> = psbt
+        .inputs
+        .iter()
+        .map(|input| input.witness_utxo.clone().expect("witness utxo"))
+        .collect();
+    let sighash = SighashCache::new(&psbt.unsigned_tx)
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::One(0, &prevouts[0]),
+            leaf_hash,
+            TapSighashType::SinglePlusAnyoneCanPay,
+        )
+        .expect("sighash");
+    let message = Message::from_digest(sighash.to_byte_array());
+    let secp = Secp256k1::verification_only();
+    assert!(
+        secp.verify_schnorr(&seller_sig.signature, &message, &seller)
+            .is_ok(),
+        "Original signature must be valid"
+    );
+
+    // Now substitute the payout script with an attacker's script
+    let attacker_script = ScriptBuf::from_hex(
+        "5120f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    )
+    .expect("attacker script");
+    psbt.unsigned_tx.output[0].script_pubkey = attacker_script;
+
+    let mutated_sighash = SighashCache::new(&psbt.unsigned_tx)
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::One(0, &prevouts[0]),
+            leaf_hash,
+            TapSighashType::SinglePlusAnyoneCanPay,
+        )
+        .expect("sighash");
+    let mutated_message = Message::from_digest(mutated_sighash.to_byte_array());
+    assert!(
+        secp.verify_schnorr(&seller_sig.signature, &mutated_message, &seller)
+            .is_err(),
+        "Seller signature must BECOME INVALID if payout script is substituted"
+    );
+}
+
+#[test]
+fn finalize_listing_purchase_adds_cpfp_anchor_output_when_requested() {
+    let (request, listing) = signed_sale_listing();
+    let anchor_script = buyer_receive_script(); // Buyer-controlled script for CPFP spending
+    let anchor_sats = 330u64; // Dust limit anchor
+    let buyer_input_value = ASK_SATS + POSTAGE_SATS + anchor_sats + 5_000 + 500;
+
+    let finalized = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
+        listing,
+        buyer_inputs: vec![buyer_funding_input(buyer_input_value)],
+        buyer_receive_script_pubkey: buyer_receive_script(),
+        change_script_pubkey: Some(seller_payout_script()),
+        change_sats: 5_000,
+        anchor_output: Some(crate::listing::AnchorOutput {
+            script_pubkey: anchor_script.clone(),
+            value_sats: anchor_sats,
+        }),
+        now_unix: request.created_at_unix + 2,
+    })
+    .expect("buyer finalization with anchor");
+    let psbt = decode_psbt(&finalized.psbt_base64);
+
+    // Outputs: [0] seller payout, [1] buyer receive, [2] change, [3] anchor
+    assert_eq!(psbt.unsigned_tx.output.len(), 4);
+    assert_eq!(finalized.anchor_output_index, Some(3));
+
+    let anchor_out = &psbt.unsigned_tx.output[3];
+    assert_eq!(anchor_out.value, Amount::from_sat(anchor_sats));
+    assert_eq!(anchor_out.script_pubkey, anchor_script);
+}
+
+#[test]
+fn finalize_listing_purchase_omits_anchor_when_not_requested() {
+    let (request, listing) = signed_sale_listing();
+    let buyer_input_value = ASK_SATS + POSTAGE_SATS + 500;
+
+    let finalized = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
+        listing,
+        buyer_inputs: vec![buyer_funding_input(buyer_input_value)],
+        buyer_receive_script_pubkey: buyer_receive_script(),
+        change_script_pubkey: None,
+        change_sats: 0,
+        anchor_output: None,
+        now_unix: request.created_at_unix + 2,
+    })
+    .expect("buyer finalization without anchor");
+    let psbt = decode_psbt(&finalized.psbt_base64);
+
+    // Outputs: [0] seller payout, [1] buyer receive
+    assert_eq!(psbt.unsigned_tx.output.len(), 2);
+    assert_eq!(finalized.anchor_output_index, None);
 }

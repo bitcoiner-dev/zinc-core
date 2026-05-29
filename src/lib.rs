@@ -72,10 +72,11 @@ pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use listing::{
     create_listing, create_listing_purchase, finalize_listing_purchase, finalize_listing_sale,
     passthrough_script_pubkey, passthrough_tapscript, prepare_listing_sale_signature,
-    sign_listing_coordinator_psbt, sign_listing_sale_psbt, CreateListingPurchaseRequest,
-    CreateListingPurchaseResultV1, CreateListingRequest, CreateListingResultV1,
-    FinalizeListingPurchaseRequest, FinalizeListingPurchaseResultV1, FinalizedListingSaleResultV1,
-    ListingBuyerFundingInput, ListingEnvelopeV1, ListingSaleSigningPlanV1, LISTING_SALE_SIGHASH_U8,
+    sign_listing_coordinator_psbt, sign_listing_sale_psbt, AnchorOutput,
+    CreateListingPurchaseRequest, CreateListingPurchaseResultV1, CreateListingRequest,
+    CreateListingResultV1, FinalizeListingPurchaseRequest, FinalizeListingPurchaseResultV1,
+    FinalizedListingSaleResultV1, ListingBuyerFundingInput, ListingEnvelopeV1,
+    ListingSaleSigningPlanV1, LISTING_SALE_SIGHASH_U8,
 };
 pub use listing_nostr::{NostrListingEvent, LISTING_EVENT_KIND};
 #[cfg(not(target_arch = "wasm32"))]
