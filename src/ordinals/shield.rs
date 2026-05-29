@@ -436,7 +436,8 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        // SECURITY: Handle unexpected slice lengths gracefully without panicking
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -477,7 +478,8 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        // SECURITY: Handle unexpected slice lengths gracefully without panicking
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -512,7 +514,8 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        // SECURITY: Handle unexpected slice lengths gracefully without panicking
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
