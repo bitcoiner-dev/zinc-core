@@ -1671,7 +1671,7 @@ impl ZincWallet {
         // Ordinal Shield Audit: BEFORE signing!
         // We must build the known_inscriptions map to check for BURNS (sophisticated check)
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -1862,7 +1862,7 @@ impl ZincWallet {
         }
 
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -2073,7 +2073,7 @@ impl ZincWallet {
         // Build Known Inscriptions Map from internal state
         // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
 
         // We also need a way to map offsets back to Inscription IDs for the result?
         // The `analyze_psbt` function currently generates keys like "Inscription {N}".
@@ -2282,7 +2282,7 @@ impl ZincWallet {
     /// Uses the first taproot external key path: `m/86'/coin'/account'/0/0`.
     pub fn get_pairing_secret_key_hex(&self) -> Result<String, String> {
         let key = self.derive_private_key(86, 0, 0)?;
-        Ok(bytes_to_lower_hex(&key.secret_bytes()))
+        Ok(hex::encode(key.secret_bytes()))
     }
     /// Derive the taproot public key for this account at `index`.
     pub fn get_taproot_public_key(&self, index: u32) -> Result<String, String> {
@@ -2985,14 +2985,7 @@ pub struct ZincPersistence {
     pub payment: Option<bdk_wallet::ChangeSet>,
 }
 
-fn bytes_to_lower_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        use std::fmt::Write;
-        write!(&mut s, "{:02x}", b).unwrap();
-    }
-    s
-}
+
 
 #[cfg(test)]
 mod tests {
