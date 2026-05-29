@@ -206,6 +206,15 @@ pub struct ListingBuyerFundingInput {
     pub witness_utxo: TxOut,
 }
 
+/// Optional CPFP anchor output for fee bumping, per ord.net specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorOutput {
+    /// Script receiving the anchor output (buyer-controlled for CPFP spending).
+    pub script_pubkey: ScriptBuf,
+    /// Anchor output value in sats (typically dust limit, e.g. 330 sats).
+    pub value_sats: u64,
+}
+
 /// Request to turn a seller-signed listing sale PSBT into a buyer-funded sale PSBT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizeListingPurchaseRequest {
@@ -219,6 +228,8 @@ pub struct FinalizeListingPurchaseRequest {
     pub change_script_pubkey: Option<ScriptBuf>,
     /// Buyer change amount in sats. Set to zero for no change output.
     pub change_sats: u64,
+    /// Optional CPFP anchor output for fee bumping.
+    pub anchor_output: Option<AnchorOutput>,
     /// UNIX timestamp (seconds) used for listing expiration validation.
     pub now_unix: i64,
 }
@@ -238,6 +249,8 @@ pub struct FinalizeListingPurchaseResultV1 {
     pub buyer_receive_output_index: usize,
     /// Buyer change output index, if a change output was added.
     pub change_output_index: Option<usize>,
+    /// CPFP anchor output index, if an anchor was added.
+    pub anchor_output_index: Option<usize>,
 }
 
 /// Request to have the buyer wallet fund and sign buyer inputs for a listing purchase.
@@ -609,6 +622,28 @@ pub fn finalize_listing_purchase(
         None
     };
 
+    let anchor_output_index = if let Some(anchor) = &request.anchor_output {
+        if anchor.script_pubkey.is_empty() {
+            return Err(ZincError::OfferError(
+                "anchor output scriptPubKey must not be empty".to_string(),
+            ));
+        }
+        if anchor.value_sats == 0 {
+            return Err(ZincError::OfferError(
+                "anchor output value must be > 0".to_string(),
+            ));
+        }
+        let index = psbt.unsigned_tx.output.len();
+        psbt.unsigned_tx.output.push(TxOut {
+            value: Amount::from_sat(anchor.value_sats),
+            script_pubkey: anchor.script_pubkey.clone(),
+        });
+        psbt.outputs.push(PsbtOutput::default());
+        Some(index)
+    } else {
+        None
+    };
+
     for buyer_input in &request.buyer_inputs {
         psbt.unsigned_tx
             .input
@@ -655,6 +690,7 @@ pub fn finalize_listing_purchase(
         seller_input_index: plan.seller_input_index,
         buyer_receive_output_index,
         change_output_index,
+        anchor_output_index,
     })
 }
 
