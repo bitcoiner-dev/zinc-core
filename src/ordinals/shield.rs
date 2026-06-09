@@ -435,8 +435,9 @@ pub fn analyze_psbt_with_scope(
                         } else if val_opcode == 0x4d {
                             if cursor + 3 <= script_bytes.len() {
                                 (
+                                    // SECURITY: Safe slice conversion to avoid panic on malformed arrays
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -476,8 +477,9 @@ pub fn analyze_psbt_with_scope(
                         } else if op == 0x4d {
                             if cursor + 3 <= script_bytes.len() {
                                 (
+                                    // SECURITY: Safe slice conversion to avoid panic on malformed arrays
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -511,8 +513,9 @@ pub fn analyze_psbt_with_scope(
                         } else if opcode == 0x4d {
                             if cursor + 3 <= script_bytes.len() {
                                 (
+                                    // SECURITY: Safe slice conversion to avoid panic on malformed arrays
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
