@@ -197,12 +197,9 @@ fn hex_to_digest32(hex: &str) -> Result<[u8; 32], ZincError> {
     }
 
     let mut bytes = [0u8; 32];
-    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let part = std::str::from_utf8(chunk)
-            .map_err(|e| ZincError::OfferError(format!("invalid digest hex utf8: {e}")))?;
-        bytes[idx] = u8::from_str_radix(part, 16)
-            .map_err(|e| ZincError::OfferError(format!("invalid digest hex byte: {e}")))?;
-    }
+    // PERFORMANCE OPTIMIZATION (Bolt): Use hex::decode_to_slice instead of manual chunking
+    hex::decode_to_slice(hex, &mut bytes)
+        .map_err(|e| ZincError::OfferError(format!("invalid digest hex: {e}")))?;
     Ok(bytes)
 }
 
