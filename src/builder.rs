@@ -314,7 +314,7 @@ impl WalletKind {
     }
 
     /// Derive external and internal descriptor strings for the vault and optional payment keychains.
-    /// Returns (vault_external, vault_internal, payment_external, payment_internal).
+    /// Returns (`vault_external`, `vault_internal`, `payment_external`, `payment_internal`).
     pub fn derive_descriptors(
         &self,
         scheme: AddressScheme,
@@ -642,15 +642,16 @@ impl ZincWallet {
         match &self.kind {
             WalletKind::Seed { master_xprv } => {
                 let network = self.vault_wallet.network();
-                let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+                let coin_type = u32::from(network != Network::Bitcoin);
                 let chain = 0; // External
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    // SECURITY: Avoid panicking on unvalidated user-controlled derivation indices
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| format!("Invalid coin type: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| format!("Invalid chain: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {e}"))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -704,8 +705,7 @@ impl ZincWallet {
                 use std::str::FromStr;
                 let xpub = Xpub::from_str(xpub_str).map_err(|e| {
                     format!(
-                        "Failed to parse xpub from descriptor (part: {}): {}",
-                        xpub_str, e
+                        "Failed to parse xpub from descriptor (part: {xpub_str}): {e}"
                     )
                 })?;
 
@@ -718,7 +718,7 @@ impl ZincWallet {
                             ChildNumber::from_normal_idx(index).unwrap(),
                         ],
                     )
-                    .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
+                    .map_err(|e| format!("Failed to derive public key from xpub: {e}"))?;
 
                 let public_key = derived_xpub.public_key;
 
@@ -735,7 +735,7 @@ impl ZincWallet {
                 }
                 let output_key = taproot_output_key_from_address(address)
                     .map_err(|_| ZincError::CapabilityMissing.to_string())?;
-                return Ok(output_key.to_string());
+                Ok(output_key.to_string())
             }
         }
     }
@@ -1811,8 +1811,8 @@ impl ZincWallet {
 
         if let Some(opts) = &options {
             if let Some(sighash_u8) = opts.sighash {
-                let target_sighash = bitcoin::psbt::PsbtSighashType::from_u32(sighash_u8 as u32);
-                for input in psbt.inputs.iter_mut() {
+                let target_sighash = bitcoin::psbt::PsbtSighashType::from_u32(u32::from(sighash_u8));
+                for input in &mut psbt.inputs {
                     input.sighash_type = Some(target_sighash);
                 }
             }
@@ -1831,15 +1831,13 @@ impl ZincWallet {
                 }
                 if !seen.insert(*index) {
                     return Err(format!(
-                        "Security Violation: sign_inputs index {} is duplicated",
-                        index
+                        "Security Violation: sign_inputs index {index} is duplicated"
                     ));
                 }
                 let input = &psbt.inputs[*index];
                 if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
                     return Err(format!(
-                        "Security Violation: Requested input #{} is missing UTXO metadata",
-                        index
+                        "Security Violation: Requested input #{index} is missing UTXO metadata"
                     ));
                 }
             }
@@ -1854,8 +1852,7 @@ impl ZincWallet {
 
                 if anyone_can_pay || !is_allowed_base {
                     return Err(format!(
-                        "Security Violation: Sighash type is not allowed on input #{} (value={})",
-                        index, value
+                        "Security Violation: Sighash type is not allowed on input #{index} (value={value})"
                     ));
                 }
             }
@@ -1879,7 +1876,7 @@ impl ZincWallet {
             inputs_to_sign.as_deref(),
             self.vault_wallet.network(),
         ) {
-            return Err(format!("Security Violation: {}", e));
+            return Err(format!("Security Violation: {e}"));
         }
 
         let prepared_bytes = psbt.serialize();
@@ -1930,15 +1927,12 @@ impl ZincWallet {
             );
         }
 
-        let check_indices: Vec<usize> = required_input_indices
-            .map(|v| v.to_vec())
-            .unwrap_or_else(|| (0..signed.inputs.len()).collect());
+        let check_indices: Vec<usize> = required_input_indices.map_or_else(|| (0..signed.inputs.len()).collect(), <[usize]>::to_vec);
 
         for &idx in &check_indices {
             if idx >= signed.inputs.len() {
                 return Err(format!(
-                    "Security Violation: required input index {} is out of bounds",
-                    idx
+                    "Security Violation: required input index {idx} is out of bounds"
                 ));
             }
 
@@ -1950,8 +1944,7 @@ impl ZincWallet {
 
             if !has_signature {
                 return Err(format!(
-                    "Security Violation: Required input #{} was not signed by the device",
-                    idx
+                    "Security Violation: Required input #{idx} was not signed by the device"
                 ));
             }
         }
@@ -1974,9 +1967,8 @@ impl ZincWallet {
 
                 if signatures_changed {
                     return Err(format!(
-                        "Security Violation: Input #{} received an unauthorized signature \
-                         (not in required_input_indices)",
-                        i
+                        "Security Violation: Input #{i} received an unauthorized signature \
+                         (not in required_input_indices)"
                     ));
                 }
             }
@@ -1989,14 +1981,14 @@ impl ZincWallet {
             // confused by derivations added in prior passes. Clearing derivation
             // metadata here keeps the collected signatures while preventing
             // cross-pass account-type contamination.
-            for input in signed.inputs.iter_mut() {
+            for input in &mut signed.inputs {
                 input.bip32_derivation.clear();
                 input.tap_key_origins.clear();
             }
         }
 
         if finalize {
-            for input in signed.inputs.iter_mut() {
+            for input in &mut signed.inputs {
                 if let Some(sig) = input.tap_key_sig {
                     let mut witness = bitcoin::Witness::new();
                     witness.push(sig.to_vec());
@@ -2340,11 +2332,12 @@ impl ZincWallet {
                 let coin_type = u32::from(network != Network::Bitcoin);
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    // SECURITY: Avoid panicking on unvalidated user-controlled derivation indices
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).map_err(|e| format!("Invalid coin type: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).map_err(|e| format!("Invalid chain: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {e}"))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -2421,7 +2414,7 @@ impl ZincWallet {
                                 .unwrap_or(bitcoin::psbt::PsbtSighashType::from_u32(0)); // DEFAULT
 
                             // For reveal, we sign the script path.
-                            for (_control_block, (script, _)) in &input.tap_scripts {
+                            for (script, _) in input.tap_scripts.values() {
                                 let leaf_hash = bitcoin::taproot::TapLeafHash::from_script(
                                     script,
                                     bitcoin::taproot::LeafVersion::TapScript,
@@ -2486,7 +2479,6 @@ impl ZincWallet {
         };
         wallet
             .list_unused_addresses(keychain)
-            .into_iter()
             .map(|info| info.address.to_string())
             .collect()
     }
@@ -2735,20 +2727,17 @@ impl WalletBuilder {
                     .extract_keys()
                     .load_wallet_no_persist(changeset.clone());
 
-                match res {
-                    Ok(Some(w)) => (w, changeset.clone()),
-                    Ok(None) | Err(_) => {
-                        let creator = if matches!(kind, WalletKind::WatchAddress(_)) {
-                            Wallet::create_single(vault_ext)
-                        } else {
-                            Wallet::create(vault_ext, vault_int)
-                        };
-                        let w = creator
-                            .network(self.network)
-                            .create_wallet_no_persist()
-                            .map_err(|e| format!("Failed to create taproot wallet: {e}"))?;
-                        (w, bdk_wallet::ChangeSet::default())
-                    }
+                if let Ok(Some(w)) = res { (w, changeset.clone()) } else {
+                    let creator = if matches!(kind, WalletKind::WatchAddress(_)) {
+                        Wallet::create_single(vault_ext)
+                    } else {
+                        Wallet::create(vault_ext, vault_int)
+                    };
+                    let w = creator
+                        .network(self.network)
+                        .create_wallet_no_persist()
+                        .map_err(|e| format!("Failed to create taproot wallet: {e}"))?;
+                    (w, bdk_wallet::ChangeSet::default())
                 }
             } else {
                 let creator = if matches!(kind, WalletKind::WatchAddress(_)) {
@@ -2786,15 +2775,12 @@ impl WalletBuilder {
                             .extract_keys()
                             .load_wallet_no_persist(changeset.clone());
 
-                        match res {
-                            Ok(Some(w)) => (w, Some(changeset.clone())),
-                            Ok(None) | Err(_) => {
-                                let w = Wallet::create(pay_ext, pay_int)
-                                    .network(self.network)
-                                    .create_wallet_no_persist()
-                                    .map_err(|e| format!("Failed to create payment wallet: {e}"))?;
-                                (w, None)
-                            }
+                        if let Ok(Some(w)) = res { (w, Some(changeset.clone())) } else {
+                            let w = Wallet::create(pay_ext, pay_int)
+                                .network(self.network)
+                                .create_wallet_no_persist()
+                                .map_err(|e| format!("Failed to create payment wallet: {e}"))?;
+                            (w, None)
                         }
                     } else {
                         let w = Wallet::create(pay_ext, pay_int)
@@ -2871,20 +2857,17 @@ impl WalletBuilder {
                     .extract_keys()
                     .load_wallet_no_persist(changeset.clone());
 
-                match res {
-                    Ok(Some(w)) => (w, changeset.clone()),
-                    Ok(None) | Err(_) => {
-                        let w = Wallet::create(
-                            taproot_external_desc.clone(),
-                            taproot_internal_desc.clone(),
-                        )
-                        .network(network)
-                        .create_wallet_no_persist()
-                        .map_err(|e| {
-                            format!("Failed to create taproot wallet from descriptor: {e}")
-                        })?;
-                        (w, bdk_wallet::ChangeSet::default())
-                    }
+                if let Ok(Some(w)) = res { (w, changeset.clone()) } else {
+                    let w = Wallet::create(
+                        taproot_external_desc.clone(),
+                        taproot_internal_desc.clone(),
+                    )
+                    .network(network)
+                    .create_wallet_no_persist()
+                    .map_err(|e| {
+                        format!("Failed to create taproot wallet from descriptor: {e}")
+                    })?;
+                    (w, bdk_wallet::ChangeSet::default())
                 }
             } else {
                 let w =
@@ -2916,17 +2899,14 @@ impl WalletBuilder {
                         .extract_keys()
                         .load_wallet_no_persist(changeset.clone());
 
-                    match res {
-                        Ok(Some(w)) => (w, Some(changeset.clone())),
-                        Ok(None) | Err(_) => {
-                            let w = Wallet::create(pay_ext.clone(), pay_int.clone())
-                                .network(network)
-                                .create_wallet_no_persist()
-                                .map_err(|e| {
-                                    format!("Failed to create payment wallet from descriptor: {e}")
-                                })?;
-                            (w, None)
-                        }
+                    if let Ok(Some(w)) = res { (w, Some(changeset.clone())) } else {
+                        let w = Wallet::create(pay_ext.clone(), pay_int.clone())
+                            .network(network)
+                            .create_wallet_no_persist()
+                            .map_err(|e| {
+                                format!("Failed to create payment wallet from descriptor: {e}")
+                            })?;
+                        (w, None)
                     }
                 } else {
                     let w = Wallet::create(pay_ext.clone(), pay_int.clone())
@@ -2989,7 +2969,7 @@ fn bytes_to_lower_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         use std::fmt::Write;
-        write!(&mut s, "{:02x}", b).unwrap();
+        write!(&mut s, "{b:02x}").unwrap();
     }
     s
 }

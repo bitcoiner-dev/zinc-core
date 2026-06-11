@@ -812,8 +812,7 @@ pub fn create_listing_purchase(
     for index in &buyer_input_indices {
         if !input_has_signature(&psbt.inputs[*index]) {
             return Err(ZincError::OfferError(format!(
-                "buyer input #{} was not signed by this wallet",
-                index
+                "buyer input #{index} was not signed by this wallet"
             )));
         }
     }

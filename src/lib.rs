@@ -1515,7 +1515,7 @@ impl ZincWasmWallet {
         let inner = self
             .inner
             .try_borrow()
-            .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {}", e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {e}")))?;
 
         let accounts = inner.get_accounts(count);
         Ok(serde_wasm_bindgen::to_value(&accounts)?)
