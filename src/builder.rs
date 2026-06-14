@@ -710,12 +710,15 @@ impl ZincWallet {
                 })?;
 
                 // Derive /0/index (assuming external chain '0' matches our descriptors)
+                // SECURITY: Avoid panic by mapping child derivation index safely
                 let derived_xpub = xpub
                     .derive_pub(
                         &secp,
                         &[
-                            ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            ChildNumber::from_normal_idx(0)
+                                .map_err(|e| format!("Invalid normal index 0: {e}"))?,
+                            ChildNumber::from_normal_idx(index)
+                                .map_err(|e| format!("Invalid derivation index: {e}"))?,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
