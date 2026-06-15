@@ -1754,21 +1754,12 @@ fn ensure_event_tags_match(
     Ok(())
 }
 
+// PERFORMANCE OPTIMIZATION (Bolt):
+// Replaced manual nibble mapping with `hex::encode(bytes)`.
+// `hex::encode` uses optimized operations and removes the need for manual character
+// matching and push operations.
 fn bytes_to_hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(nibble_to_hex(byte >> 4));
-        out.push(nibble_to_hex(byte & 0x0f));
-    }
-    out
-}
-
-fn nibble_to_hex(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => '0',
-    }
+    hex::encode(bytes)
 }
 
 fn ensure_event_pairing_hash_matches(
