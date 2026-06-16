@@ -85,7 +85,8 @@ impl OfferEnvelopeV1 {
     /// Compute the SHA-256 offer id hex string.
     pub fn offer_id_hex(&self) -> Result<String, ZincError> {
         let digest = self.offer_id_digest()?;
-        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+        // PERFORMANCE OPTIMIZATION (Bolt): Replace formatting with optimized hex encoding.
+        Ok(hex::encode(digest))
     }
 
     /// Sign the offer id digest with a Schnorr key (hex-encoded secret key).

@@ -2070,7 +2070,8 @@ fn domain_separated_digest(domain: &str, canonical_payload: &[u8]) -> Result<[u8
 }
 
 fn digest_hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    // PERFORMANCE OPTIMIZATION (Bolt): Replace formatting with optimized hex encoding.
+    hex::encode(digest)
 }
 
 fn pubkey_hex_from_secret(secret_key: &SecretKey) -> String {
