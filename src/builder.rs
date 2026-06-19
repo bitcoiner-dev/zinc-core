@@ -2986,12 +2986,8 @@ pub struct ZincPersistence {
 }
 
 fn bytes_to_lower_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        use std::fmt::Write;
-        write!(&mut s, "{:02x}", b).unwrap();
-    }
-    s
+    // PERFORMANCE OPTIMIZATION (Bolt): Replace write! macro overhead and loop with fast hex encoding crate.
+    hex::encode(bytes)
 }
 
 #[cfg(test)]
