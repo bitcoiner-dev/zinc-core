@@ -2,3 +2,8 @@
 **Vulnerability:** Found uses of `.unwrap()` on `u32::try_from(vout)` when converting from `usize` in PSBT and transaction output parsing. This can cause the application (and particularly the WASM runtime) to panic and crash if the index exceeds `u32::MAX`, leading to a Denial of Service (DoS).
 **Learning:** Type conversions, especially from `usize` to narrower types like `u32` when handling potentially large or external inputs (like PSBT inputs/outputs), are prone to panic if unhandled.
 **Prevention:** Avoid using `.unwrap()` or `.expect()` on `TryFrom` conversions in parsing and handling user-provided data. Use safe fallbacks or map errors (e.g. `OrdError::RequestFailed` or returning an error `Result`) instead to fail securely.
+
+## 2024-05-31 - [Panic Risk from unwrap on type conversions]
+**Vulnerability:** Found uses of `.unwrap()` on `bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx` and `from_normal_idx` when deriving keys. This can cause the application (and particularly the WASM runtime) to panic and crash if the index exceeds `u32::MAX` / 2^31 - 1, leading to a Denial of Service (DoS).
+**Learning:** Type conversions using `bip32::ChildNumber` constructors are prone to panic if inputs exceed bounds and are unhandled.
+**Prevention:** Avoid using `.unwrap()` or `.expect()` on `ChildNumber` creation in derivation paths. Use safe fallbacks or map errors (e.g. `Result` with a string mapping) instead to fail securely.
