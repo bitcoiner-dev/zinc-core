@@ -646,11 +646,12 @@ impl ZincWallet {
                 let chain = 0; // External
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
+                    // SECURITY: Avoid panic by returning an error if dynamic derivation index is out of bounds
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose: {}", e))?,
                     bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account: {}", e))?,
                     bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {}", e))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -714,8 +715,9 @@ impl ZincWallet {
                     .derive_pub(
                         &secp,
                         &[
+                            // SECURITY: Avoid panic by returning an error if dynamic derivation index is out of bounds
                             ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {}", e))?,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
@@ -2340,11 +2342,12 @@ impl ZincWallet {
                 let coin_type = u32::from(network != Network::Bitcoin);
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
+                    // SECURITY: Avoid panic by returning an error if dynamic derivation index is out of bounds
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).map_err(|e| format!("Invalid purpose: {}", e))?,
                     bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).map_err(|e| format!("Invalid account: {}", e))?,
                     bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).map_err(|e| format!("Invalid index: {}", e))?,
                 ];
 
                 let child_xprv = master_xprv
