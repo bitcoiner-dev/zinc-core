@@ -2986,10 +2986,12 @@ pub struct ZincPersistence {
 }
 
 fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    // PERFORMANCE OPTIMIZATION (Bolt): Replace write! macro overhead with zero-dependency table lookup
     let mut s = String::with_capacity(bytes.len() * 2);
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     for &b in bytes {
-        use std::fmt::Write;
-        write!(&mut s, "{:02x}", b).unwrap();
+        s.push(HEX_CHARS[(b >> 4) as usize] as char);
+        s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
     }
     s
 }
