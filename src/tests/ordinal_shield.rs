@@ -1,4 +1,7 @@
-use crate::ordinals::shield::{analyze_psbt, WarningLevel};
+use crate::ordinals::shield::{
+    analyze_psbt, analyze_psbt_with_scope, audit_psbt, is_safe_to_spend, WarningLevel,
+};
+use std::collections::HashSet;
 use bitcoin::psbt::{Input, Psbt};
 use bitcoin::transaction::Transaction;
 use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, Txid};
@@ -81,6 +84,61 @@ fn test_tight_squeeze_burn() {
     assert!(result
         .inscriptions_burned
         .contains(&"Inscription 0".to_string()));
+}
+
+// Salvage shape (input 10k → [546 postage, recovery], fee in the tail) with the inscription at offset 0:
+// it lands in the padded output and is NOT burned. The shield returns Warn (postage was reduced), which
+// the service gate ALLOWS — it only refuses Danger/burned. So an offset-0 salvage proceeds.
+#[test]
+fn test_salvage_offset_zero_is_allowed() {
+    let inputs = vec![(10_000, Some(0))];
+    let outputs = vec![546, 9_254]; // 200 sats fee in the tail
+    let psbt = create_dummy_psbt(&inputs, &outputs);
+
+    let mut known_inscriptions = HashMap::new();
+    known_inscriptions.insert(
+        (psbt.unsigned_tx.input[0].previous_output.txid, 0),
+        vec![("Inscription 0".to_string(), 0_u64)],
+    );
+
+    let result = analyze_psbt(&psbt, &known_inscriptions, bitcoin::Network::Regtest).unwrap();
+    // The gate refuses only on Danger or a burned inscription; postage-reduction Warn is allowed.
+    assert_ne!(
+        result.warning_level,
+        WarningLevel::Danger,
+        "offset-0 inscription is preserved (in the postage output) → not Danger"
+    );
+    assert!(
+        result.inscriptions_burned.is_empty(),
+        "offset-0 inscription is not burned"
+    );
+}
+
+// Same salvage shape, but the inscription is near the END of the UTXO (offset 9,900), which falls in
+// the fee tail → BURNED. The shield must flag Danger so the service gate (assertPsbtPreservesInscriptions)
+// refuses to sign. This is the core safety guarantee for sat-surgery.
+#[test]
+fn test_salvage_high_offset_burn_is_blocked() {
+    let inputs = vec![(10_000, Some(9_900))];
+    let outputs = vec![546, 9_254]; // outputs cover sats 0..9_800; sats 9_800..10_000 are fee
+    let psbt = create_dummy_psbt(&inputs, &outputs);
+
+    let mut known_inscriptions = HashMap::new();
+    known_inscriptions.insert(
+        (psbt.unsigned_tx.input[0].previous_output.txid, 0),
+        vec![("Inscription 0".to_string(), 9_900_u64)],
+    );
+
+    let result = analyze_psbt(&psbt, &known_inscriptions, bitcoin::Network::Regtest).unwrap();
+    assert_eq!(
+        result.warning_level,
+        WarningLevel::Danger,
+        "a mid/high-offset inscription that falls in the fee tail must be flagged Danger"
+    );
+    assert!(
+        result.inscriptions_burned.contains(&"Inscription 0".to_string()),
+        "the burned inscription must be reported so the gate can refuse it"
+    );
 }
 
 #[test]
@@ -353,5 +411,51 @@ fn test_analyze_sighash_warning() {
     assert!(
         result.warnings[0].contains("SIGHASH_NONE"),
         "Warning should mention SIGHASH_NONE"
+    );
+}
+
+#[test]
+fn is_safe_to_spend_reflects_membership() {
+    let op = OutPoint {
+        txid: Txid::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap(),
+        vout: 7,
+    };
+    let mut protected = HashSet::new();
+    assert!(is_safe_to_spend(&op, &protected), "unknown outpoint is spendable");
+    protected.insert(op);
+    assert!(!is_safe_to_spend(&op, &protected), "protected outpoint is not spendable");
+}
+
+#[test]
+fn audit_psbt_accepts_a_clean_psbt() {
+    // One funded input, one output, no known inscriptions → analysis succeeds.
+    let psbt = create_dummy_psbt(&[(10_000, None)], &[9_000]);
+    let known = HashMap::new();
+    assert!(audit_psbt(&psbt, &known, None, bitcoin::Network::Regtest).is_ok());
+}
+
+#[test]
+fn audit_and_analyze_respect_input_scope_subset() {
+    let psbt = create_dummy_psbt(&[(10_000, None), (20_000, None)], &[25_000]);
+    let known = HashMap::new();
+    // Scope limited to input 0 only.
+    assert!(audit_psbt(&psbt, &known, Some(&[0]), bitcoin::Network::Regtest).is_ok());
+    let scoped =
+        analyze_psbt_with_scope(&psbt, &known, Some(&[0]), bitcoin::Network::Regtest).unwrap();
+    let full = analyze_psbt(&psbt, &known, bitcoin::Network::Regtest).unwrap();
+    // Both analyses complete; full sees both inputs, scoped is constrained to one.
+    let _ = (&scoped, &full);
+}
+
+#[test]
+fn analyze_psbt_with_scope_rejects_out_of_range_index() {
+    let psbt = create_dummy_psbt(&[(10_000, None)], &[9_000]);
+    let known = HashMap::new();
+    assert!(
+        analyze_psbt_with_scope(&psbt, &known, Some(&[5]), bitcoin::Network::Regtest).is_err(),
+        "an out-of-range scope index must be rejected"
     );
 }

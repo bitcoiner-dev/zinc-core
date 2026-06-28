@@ -43,16 +43,15 @@ fn test_get_accounts_returns_public_keys() {
         "Vault pubkey should be 32 bytes hex (x-only)"
     );
 
-    // Unified -> Payment Public Key should be None (as per our impl, we return derived if !unified, else None)
-    // Wait, let's double check implementation logic in lib.rs:
-    // "paymentPublicKey": payment_pubkey_hex
-    // where payment_pubkey_hex is None if unified.
-    // So for "unified", we expect paymentPublicKey to be null (or missing depending on serialization).
-    let payment_pub = acc0.get("paymentPublicKey");
-    // serde_json usually serializes Option::None as null
-    assert!(
-        payment_pub.is_none() || payment_pub.unwrap().is_null(),
-        "Unified payment pubkey should be null"
+    // Unified scheme aliases the payment branch onto taproot (see ZincWallet::get_accounts),
+    // so paymentPublicKey equals the taproot (vault) pubkey rather than being null.
+    let payment_pub = acc0
+        .get("paymentPublicKey")
+        .and_then(|v| v.as_str())
+        .expect("paymentPublicKey present in unified mode");
+    assert_eq!(
+        payment_pub, vault_hex,
+        "Unified payment pubkey aliases the taproot pubkey"
     );
 }
 

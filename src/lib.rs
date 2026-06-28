@@ -1626,6 +1626,18 @@ impl ZincWasmWallet {
         }
     }
 
+    /// List all wallet UTXOs across keychains, annotated with inscription/rune info and an estimate
+    /// of salvageable cardinal sats (for the Sparrow full-screen coin-control view).
+    #[wasm_bindgen(js_name = getUtxos)]
+    pub fn get_utxos(&self) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => serde_wasm_bindgen::to_value(&inner.list_utxos())
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize utxos: {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (get_utxos): {e}"))),
+        }
+    }
+
     /// Return cached read-only rune balances currently loaded in wallet state.
     #[wasm_bindgen(js_name = getRuneBalances)]
     pub fn get_rune_balances(&self) -> Result<JsValue, JsValue> {
@@ -1747,6 +1759,23 @@ impl ZincWasmWallet {
     }
 
     #[cfg(target_arch = "wasm32")]
+    /// Force the next `sync` to perform a full gap-limit scan (then revert to incremental). Use for an
+    /// explicit "rescan" to discover funds on addresses past the currently-revealed frontier.
+    #[wasm_bindgen(js_name = requestFullRescan)]
+    pub fn request_full_rescan(&self) -> Result<(), JsValue> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                inner.request_full_rescan();
+                Ok(())
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Failed to borrow wallet inner state: {}",
+                e
+            ))),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = sync)]
     pub fn sync(&self, esplora_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
@@ -1772,7 +1801,10 @@ impl ZincWasmWallet {
                         }
                         inner.is_syncing = true;
                         zinc_log_debug!(target: LOG_TARGET_WASM, "borrow successful, preparing requests");
-                        (inner.prepare_requests(), inner.account_generation())
+                        // Consume any pending full-rescan request: full scan once, then incremental.
+                        let force_full = inner.force_next_full;
+                        inner.force_next_full = false;
+                        (inner.prepare_requests(force_full), inner.account_generation())
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: FAILED TO BORROW INNER: {:?}", e);
@@ -1812,7 +1844,7 @@ impl ZincWasmWallet {
                 SyncRequestType::Full(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot full scan");
                     client
-                        .full_scan(req, 20, 1)
+                        .full_scan(req, 20, 5)
                         .await
                         .map(|u| u.into())
                         .map_err(|e| {
@@ -1851,7 +1883,7 @@ impl ZincWasmWallet {
                     SyncRequestType::Full(req) => {
                         zinc_log_info!(target: LOG_TARGET_WASM, "starting payment full scan");
                         client
-                                .full_scan(req, 20, 1)
+                                .full_scan(req, 20, 5)
                                 .await
                                 .map(|u| u.into())
                                 .map_err(|e| {
@@ -2297,7 +2329,7 @@ impl ZincWasmWallet {
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
             // 1. Collect info needed for sync (Borrow Read)
-            let (addresses, wallet_height, sync_generation) = {
+            let (outpoints, wallet_height, sync_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.is_syncing {
@@ -2307,18 +2339,13 @@ impl ZincWasmWallet {
                             ));
                         }
                         inner.is_syncing = true;
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collecting active addresses...");
-                        let addrs = inner.collect_active_addresses();
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collected {} addresses", addrs.len());
-                        for a in &addrs {
-                            zinc_log_debug!(
-                                target: LOG_TARGET_WASM,
-                                "sync_ordinals address queued: {}",
-                                a
-                            );
-                        }
+                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collecting UTXO outpoints...");
+                        // Inscriptions/runes are UTXO-bound, so we bulk-query exactly our own outpoints
+                        // (POST /outputs) — one request instead of per-address + per-output round-trips.
+                        let ops = inner.collect_utxo_outpoints();
+                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collected {} outpoints", ops.len());
                         let height = inner.vault_wallet.local_chain().tip().height();
-                        (addrs, height, inner.account_generation())
+                        (ops, height, inner.account_generation())
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: FAILED TO BORROW INNER: {:?}", e);
@@ -2371,98 +2398,33 @@ impl ZincWasmWallet {
                 )));
             }
 
-            // 2b. Fetch rune balances and artifact metadata
-            let rune_balances = match client.get_rune_balances_for_addresses(&addresses).await {
-                Ok(balances) => balances,
+            // 2b. Resolve inscriptions + runes + protected outpoints in ONE bulk pass: a single
+            // `POST /outputs` over our own UTXO outpoints (batched/concurrent) yields inscription ids +
+            // runes + protected status, then per-inscription details are fetched in parallel. This
+            // replaces the old per-address + per-output round-trip storm (the "ages to populate" cause).
+            // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
+            // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
+            zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
+            let resolved = match client.resolve_assets_for_outpoints(&outpoints).await {
+                Ok(r) => r,
                 Err(e) => {
-                    zinc_log_debug!(
-                        target: LOG_TARGET_WASM,
-                        "Failed to fetch rune balances: {:?}",
-                        e
-                    );
-                    ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
-                    if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
-                        &inner_rc,
-                        sync_generation,
-                        ORD_SYNC_STALE_ERROR,
-                    ) {
-                        return Err(stale);
+                    zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);
+                    if let Ok(mut inner) = inner_rc.try_borrow_mut() {
+                        if inner.account_generation() != sync_generation {
+                            return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                        }
+                        inner.ordinals_verified = false;
+                        inner.is_syncing = false;
                     }
-                    return Err(JsValue::from_str(&format!(
-                        "Failed to fetch rune balances: {}",
-                        e
-                    )));
+                    return Err(JsValue::from_str(&e.to_string()));
                 }
             };
-
-            zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: fetching inscriptions");
-            let mut all_inscriptions = Vec::new();
-            let mut protected_outpoints = std::collections::HashSet::new();
-            for addr_str in addresses {
-                match client.get_inscriptions(&addr_str).await {
-                    Ok(list) => {
-                        zinc_log_debug!(target: LOG_TARGET_WASM,
-                            "sync_ordinals: found {} inscriptions for {}",
-                            list.len(),
-                            addr_str
-                        );
-                        all_inscriptions.extend(list);
-                    }
-                    Err(e) => {
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "Failed to fetch inscriptions for {}: {}", addr_str, e);
-                        ZincWasmWallet::clear_syncing_if_generation_matches(
-                            &inner_rc,
-                            sync_generation,
-                        );
-                        if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
-                            &inner_rc,
-                            sync_generation,
-                            ORD_SYNC_STALE_ERROR,
-                        ) {
-                            return Err(stale);
-                        }
-                        return Err(JsValue::from_str(&format!(
-                            "Failed to fetch for {}: {}",
-                            addr_str, e
-                        )));
-                    }
-                }
-
-                match client.get_protected_outpoints(&addr_str).await {
-                    Ok(outpoints) => {
-                        zinc_log_debug!(target: LOG_TARGET_WASM,
-                            "sync_ordinals: found {} protected outputs for {}",
-                            outpoints.len(),
-                            addr_str
-                        );
-                        protected_outpoints.extend(outpoints);
-                    }
-                    Err(e) => {
-                        zinc_log_debug!(target: LOG_TARGET_WASM,
-                            "Failed to fetch protected outputs for {}: {}",
-                            addr_str,
-                            e
-                        );
-                        match inner_rc.try_borrow_mut() {
-                            Ok(mut inner) => {
-                                if inner.account_generation() != sync_generation {
-                                    return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
-                                }
-                                inner.ordinals_verified = false;
-                                inner.is_syncing = false;
-                            }
-                            Err(_) => {}
-                        }
-                        return Err(JsValue::from_str(&format!(
-                            "Failed to fetch protected outputs for {}: {}",
-                            addr_str, e
-                        )));
-                    }
-                }
-            }
+            let all_inscriptions = resolved.inscriptions;
+            let protected_outpoints = resolved.protected_outpoints;
+            let rune_balances = resolved.rune_balances;
             zinc_log_debug!(target: LOG_TARGET_WASM,
-                "sync_ordinals: total inscriptions found: {}",
-                all_inscriptions.len()
+                "sync_ordinals: resolved {} inscriptions, {} protected outpoints",
+                all_inscriptions.len(), protected_outpoints.len()
             );
 
             // 3. Apply Update (Borrow Mut)
@@ -2528,6 +2490,109 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Invalid request: {e}")))?;
 
         self.create_psbt_with_transport(transport, "createPsbt")
+    }
+
+    /// Build an unsigned "sat surgery" / salvage PSBT (base64): recover cardinal sats from the given
+    /// inscription UTXOs, keeping each inscription padded. The caller MUST verify the result with
+    /// `analyzePsbt` (Ordinal Shield) before signing.
+    ///
+    /// Request shape (camelCase): `{ outpoints: string[], feeRateSatVb: number, targetPostage: number,
+    /// ordinalsAddress: string, destination: string }`.
+    #[wasm_bindgen(js_name = planSalvage)]
+    pub fn plan_salvage_request(&self, request: JsValue) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PlanSalvageRequest {
+            outpoints: Vec<String>,
+            fee_rate_sat_vb: u64,
+            target_postage: u64,
+            ordinals_address: String,
+            destination: String,
+        }
+
+        let req: PlanSalvageRequest = serde_wasm_bindgen::from_value(request)
+            .map_err(|e| JsValue::from_str(&format!("Invalid salvage request: {e}")))?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .plan_salvage_base64(
+                    &req.outpoints,
+                    req.fee_rate_sat_vb,
+                    req.target_postage,
+                    &req.ordinals_address,
+                    &req.destination,
+                )
+                .map_err(|e| JsValue::from_str(&e.to_string())),
+            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planSalvage): {e}"))),
+        }
+    }
+
+    /// Build an unsigned consolidation PSBT (base64): sweep the given clean UTXOs into one output.
+    ///
+    /// Request shape (camelCase): `{ outpoints: string[], feeRateSatVb: number, destination: string }`.
+    #[wasm_bindgen(js_name = planConsolidate)]
+    pub fn plan_consolidate_request(&self, request: JsValue) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PlanConsolidateRequest {
+            outpoints: Vec<String>,
+            fee_rate_sat_vb: u64,
+            destination: String,
+        }
+
+        let req: PlanConsolidateRequest = serde_wasm_bindgen::from_value(request)
+            .map_err(|e| JsValue::from_str(&format!("Invalid consolidate request: {e}")))?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .plan_consolidate_base64(&req.outpoints, req.fee_rate_sat_vb, &req.destination)
+                .map_err(|e| JsValue::from_str(&e.to_string())),
+            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planConsolidate): {e}"))),
+        }
+    }
+
+    /// Build an unsigned smart-send PSBT (base64): pay a recipient, auto-salvaging inscription UTXOs
+    /// among the inputs to help fund it. Caller MUST verify with `analyzePsbt` before signing.
+    ///
+    /// Request shape (camelCase): `{ inputOutpoints: string[], recipient: string, amountSats: number,
+    /// feeRateSatVb: number, targetPostage: number, ordinalsAddress: string, changeAddress: string }`.
+    #[wasm_bindgen(js_name = planSendWithSalvage)]
+    pub fn plan_send_with_salvage_request(&self, request: JsValue) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PlanSendWithSalvageRequest {
+            input_outpoints: Vec<String>,
+            recipient: String,
+            amount_sats: u64,
+            fee_rate_sat_vb: u64,
+            target_postage: u64,
+            ordinals_address: String,
+            change_address: String,
+        }
+
+        let req: PlanSendWithSalvageRequest = serde_wasm_bindgen::from_value(request)
+            .map_err(|e| JsValue::from_str(&format!("Invalid send request: {e}")))?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .plan_send_with_salvage_base64(
+                    &req.input_outpoints,
+                    &req.recipient,
+                    req.amount_sats,
+                    req.fee_rate_sat_vb,
+                    req.target_postage,
+                    &req.ordinals_address,
+                    &req.change_address,
+                )
+                .map_err(|e| JsValue::from_str(&e.to_string())),
+            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planSendWithSalvage): {e}"))),
+        }
     }
 
     /// Create a buyer-funded, buyer-signed listing purchase PSBT.
@@ -3035,5 +3100,8 @@ impl ZincWasmWallet {
 }
 
 // Integration tests under src/tests/.
-#[cfg(test)]
+// Native unit tests — many use tokio/mockito/std networking that have no wasm32 target.
+// They are excluded from the wasm test build (`wasm-pack test`); wasm coverage lives in
+// `tests/wasm_*.rs`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod tests;

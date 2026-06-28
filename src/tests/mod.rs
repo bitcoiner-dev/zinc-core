@@ -1,6 +1,10 @@
 pub mod balance;
+pub mod builder_depth;
+pub mod builder_planning;
 pub mod discovery_scan;
 pub mod dual_send_signing;
+pub mod external_signing;
+pub mod history;
 pub mod listing;
 pub mod listing_nostr;
 pub mod listing_relay;
@@ -14,4 +18,6 @@ pub mod persistence_scope;
 pub mod profiles;
 pub mod sign_intent;
 pub mod signing;
+pub mod utxo_list;
 pub mod wasm_wallet_state;
+pub mod watch_and_xpub;

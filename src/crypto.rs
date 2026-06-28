@@ -188,4 +188,58 @@ mod tests {
         let result = decrypt_seed(&encrypted, password);
         assert!(matches!(result, Err(ZincError::DecryptionError)));
     }
+
+    #[test]
+    fn tampered_ciphertext_fails_authentication() {
+        let seed = b"another test seed value";
+        let password = "pw";
+        let mut encrypted = encrypt_seed(seed, password).unwrap();
+
+        // Flip one byte of the ciphertext; AES-256-GCM authentication must reject it.
+        let mut raw = base64_decode(&encrypted.ciphertext).unwrap();
+        raw[0] ^= 0x01;
+        encrypted.ciphertext = base64_encode(&raw);
+
+        assert!(matches!(
+            decrypt_seed(&encrypted, password),
+            Err(ZincError::DecryptionError)
+        ));
+    }
+
+    #[test]
+    fn invalid_base64_ciphertext_is_reported_not_panicked() {
+        let seed = b"seed";
+        let password = "pw";
+        let mut encrypted = encrypt_seed(seed, password).unwrap();
+        encrypted.ciphertext = "!!! not base64 !!!".to_string();
+
+        assert!(matches!(
+            decrypt_seed(&encrypted, password),
+            Err(ZincError::SerializationError(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected() {
+        let seed = b"seed";
+        let password = "pw";
+        let mut encrypted = encrypt_seed(seed, password).unwrap();
+        encrypted.version = 99;
+
+        assert!(decrypt_seed(&encrypted, password).is_err());
+    }
+
+    #[test]
+    fn derive_key_versions_differ_and_are_deterministic() {
+        // `derive_key` consumes the salt as raw bytes; any >=8-byte string is valid.
+        let salt = "saltsaltsalt1234";
+        let k1a = derive_key("pw", salt, 1).unwrap();
+        let k1b = derive_key("pw", salt, 1).unwrap();
+        let k2 = derive_key("pw", salt, 2).unwrap();
+
+        // Deterministic for a fixed (password, salt, version).
+        assert_eq!(&*k1a, &*k1b);
+        // Different Argon2 params (v1 = 64MB/3, v2 = 32MB/1) must yield different keys.
+        assert_ne!(&*k1a, &*k2);
+    }
 }

@@ -117,4 +117,25 @@ mod tests {
         let seed2 = m.to_seed("password");
         assert_ne!(&seed1[..], &seed2[..]);
     }
+
+    #[test]
+    fn seed_matches_bip39_known_answer_vector() {
+        // Canonical BIP-39 test vector: the "abandon ... about" mnemonic with an
+        // empty passphrase derives a fixed 512-bit seed. Locks BIP-39 derivation.
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let m = ZincMnemonic::parse(phrase).unwrap();
+        let seed = m.to_seed("");
+        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_word_count() {
+        // 11 words: a valid-looking phrase with a bad length must fail the checksum.
+        let eleven = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        assert!(ZincMnemonic::parse(eleven).is_err());
+    }
 }

@@ -24,7 +24,7 @@ fn test_sync_strategy_choice() {
     let builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(TEST_SEED));
     let wallet = builder.build().expect("Should build wallet");
 
-    let reqs = wallet.prepare_requests();
+    let reqs = wallet.prepare_requests(false);
     match reqs.taproot {
         SyncRequestType::Full(_) => {}
         SyncRequestType::Incremental(_) => {

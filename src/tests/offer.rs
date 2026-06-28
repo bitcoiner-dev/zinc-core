@@ -103,3 +103,43 @@ fn schnorr_signature_rejects_wrong_pubkey() {
     let wrong_offer = sample_offer(&wrong_pubkey.to_string());
     assert!(wrong_offer.verify_schnorr_hex(&signature).is_err());
 }
+
+#[test]
+fn validate_rejects_unsupported_version() {
+    let mut offer = sample_offer(&test_public_key_hex());
+    offer.version = 2;
+    assert!(offer.canonical_json().is_err());
+}
+
+#[test]
+fn validate_rejects_empty_required_field() {
+    let mut offer = sample_offer(&test_public_key_hex());
+    offer.inscription_id = String::new();
+    assert!(offer.offer_id_hex().is_err());
+}
+
+#[test]
+fn validate_rejects_non_positive_expiry_window() {
+    let mut offer = sample_offer(&test_public_key_hex());
+    offer.expires_at_unix = offer.created_at_unix;
+    assert!(offer.canonical_json().is_err());
+}
+
+#[test]
+fn sign_rejects_invalid_secret_key() {
+    let offer = sample_offer(&test_public_key_hex());
+    assert!(offer.sign_schnorr_hex("not-a-valid-hex-secret").is_err());
+}
+
+#[test]
+fn verify_rejects_invalid_signature_hex() {
+    let offer = sample_offer(&test_public_key_hex());
+    assert!(offer.verify_schnorr_hex("zzzz").is_err());
+}
+
+#[test]
+fn verify_rejects_invalid_seller_pubkey() {
+    // Non-empty but unparsable seller pubkey is rejected before signature checking.
+    let offer = sample_offer("not-a-pubkey");
+    assert!(offer.verify_schnorr_hex(&"00".repeat(64)).is_err());
+}

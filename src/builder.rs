@@ -406,6 +406,11 @@ pub struct ZincWallet {
     pub(crate) is_syncing: bool,
     /// Monotonic generation used to invalidate stale async operations.
     pub(crate) account_generation: u64,
+    /// When set, the next `prepare_requests` returns a Full (gap-limit) scan instead of an
+    /// incremental sync, then clears itself. Used for an explicit "rescan" to discover funds on
+    /// addresses past the currently-revealed frontier (e.g. a Sparrow user who keeps generating
+    /// new receive addresses). In-memory only — not persisted.
+    pub(crate) force_next_full: bool,
 }
 
 /// Describes how chain data should be fetched for a keychain set.
@@ -435,6 +440,41 @@ pub struct ZincBalance {
     pub display_spendable: bdk_wallet::Balance,
     /// Estimated value currently marked as inscribed/protected.
     pub inscribed: u64,
+}
+
+/// Minimum sats kept with an inscription when estimating salvageable cardinal value.
+const MIN_SALVAGE_PADDING_SATS: u64 = 546;
+
+/// A single wallet UTXO with ordinal-awareness, for coin-control UIs (camelCase over WASM).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UtxoItem {
+    /// Transaction id (hex).
+    pub txid: String,
+    /// Output index.
+    pub vout: u32,
+    /// Output value in sats.
+    pub value_sats: u64,
+    /// Derived address holding this UTXO, if it could be resolved.
+    pub address: Option<String>,
+    /// Keychain: `"external"` (receive) or `"internal"` (change).
+    pub keychain: String,
+    /// Owning wallet: `"taproot"` (vault) or `"payment"` (dual-scheme segwit branch).
+    pub wallet_role: String,
+    /// Whether the UTXO is confirmed.
+    pub confirmed: bool,
+    /// Confirmation count (0 when unconfirmed).
+    pub confirmations: u32,
+    /// True if the outpoint is protected (holds an inscription or rune).
+    pub is_inscribed: bool,
+    /// True if at least one known inscription sits in this UTXO.
+    pub has_inscription: bool,
+    /// Ids of inscriptions located in this UTXO.
+    pub inscription_ids: Vec<String>,
+    /// Byte offsets of those inscriptions within the UTXO.
+    pub inscription_offsets: Vec<u64>,
+    /// Conservative estimate of cardinal sats recoverable via salvage (0 unless inscription-bearing).
+    pub cardinal_salvageable_sats: u64,
 }
 
 /// Account summary returned by discovery and account listing APIs.
@@ -974,22 +1014,37 @@ impl ZincWallet {
     }
 
     /// Build sync requests for taproot/payment wallets.
-    pub fn prepare_requests(&self) -> ZincSyncRequest {
+    pub fn prepare_requests(&self, force_full: bool) -> ZincSyncRequest {
         let now = wasm_now_secs();
-        let vault = SyncRequestType::Full(Self::flexible_full_scan_request(
-            &self.vault_wallet,
-            self.scan_policy,
-            now,
-        ));
+        // Full (gap-limit) scan only when we must: the first-ever sync (no chain tip yet) or an
+        // explicit rescan. Otherwise an incremental sync over already-revealed spks — far fewer
+        // requests, so routine syncs and the post-unlock refresh land quickly. Newly-revealed
+        // receive addresses are included automatically (they're part of the revealed set); funds on
+        // addresses past the revealed frontier are picked up by a forced rescan.
+        let full = force_full || self.needs_full_scan();
+        let policy = self.scan_policy;
 
-        let payment = self.payment_wallet.as_ref().map(|w| {
-            SyncRequestType::Full(Self::flexible_full_scan_request(w, self.scan_policy, now))
-        });
+        let build = |w: &Wallet| -> SyncRequestType {
+            if full {
+                SyncRequestType::Full(Self::flexible_full_scan_request(w, policy, now))
+            } else {
+                SyncRequestType::Incremental(Self::flexible_sync_request(w, now))
+            }
+        };
+
+        let vault = build(&self.vault_wallet);
+        let payment = self.payment_wallet.as_ref().map(|w| build(w));
 
         ZincSyncRequest {
             taproot: vault,
             payment,
         }
+    }
+
+    /// Request that the next `prepare_requests` performs a full gap-limit scan (it then reverts to
+    /// incremental). Use for an explicit "rescan" to discover funds beyond the revealed frontier.
+    pub fn request_full_rescan(&mut self) {
+        self.force_next_full = true;
     }
 
     /// Apply taproot/payment updates and return merged event strings.
@@ -1139,8 +1194,22 @@ impl ZincWallet {
                 }
             }
 
-            // 2. Include any addresses that have been discovered via sync/reveal
-            // (e.g. if the user manually revealed address 5, or sync found funds there)
+            // 2. CRITICAL for ordinal safety: include every address that currently holds a UTXO
+            // (these are USED addresses, which list_unused_addresses omits). Multi-address HD wallets
+            // like Sparrow hold inscriptions across many used addresses; without this the ordinals scan
+            // never sees them, inscribed_utxos stays empty for those outpoints, and a normal send would
+            // happily select an inscription UTXO. Covers both external and internal keychains.
+            for u in wallet.list_unspent() {
+                let addr = wallet
+                    .peek_address(u.keychain, u.derivation_index)
+                    .address
+                    .to_string();
+                if seen.insert(addr.clone()) {
+                    addresses.push(addr);
+                }
+            }
+
+            // 3. Include revealed-but-unused addresses too (gap addresses), for completeness.
             for info in wallet.list_unused_addresses(KeychainKind::External) {
                 let addr = info.address.to_string();
                 if seen.insert(addr.clone()) {
@@ -1155,6 +1224,62 @@ impl ZincWallet {
         }
 
         addresses
+    }
+
+    /// Addresses that currently hold a UTXO (across vault + payment keychains). Inscriptions and runes
+    /// are UTXO-bound, so this is the complete, minimal set the ordinals sync needs — it skips the
+    /// empty gap/unused addresses `collect_active_addresses` includes (each costs an ord round-trip
+    /// but can never hold an asset). This is what makes "digital artifacts" populate quickly.
+    pub fn collect_utxo_addresses(&self) -> Vec<String> {
+        if let Some(address) = self.watched_address() {
+            return vec![address.to_string()];
+        }
+
+        let mut addresses = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let mut collect_from_wallet = |wallet: &Wallet| {
+            for u in wallet.list_unspent() {
+                let addr = wallet
+                    .peek_address(u.keychain, u.derivation_index)
+                    .address
+                    .to_string();
+                if seen.insert(addr.clone()) {
+                    addresses.push(addr);
+                }
+            }
+        };
+
+        collect_from_wallet(&self.vault_wallet);
+        if let Some(w) = &self.payment_wallet {
+            collect_from_wallet(w);
+        }
+
+        addresses
+    }
+
+    /// All wallet outpoints ("txid:vout") across vault + payment keychains, from the BDK UTXO set.
+    /// These are the only outputs that can hold our inscriptions/runes, so the ordinals sync can
+    /// bulk-query exactly these via `POST /outputs` — one request instead of per-address/per-output.
+    pub fn collect_utxo_outpoints(&self) -> Vec<String> {
+        let mut outpoints = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let mut collect_from_wallet = |wallet: &Wallet| {
+            for u in wallet.list_unspent() {
+                let op = u.outpoint.to_string();
+                if seen.insert(op.clone()) {
+                    outpoints.push(op);
+                }
+            }
+        };
+
+        collect_from_wallet(&self.vault_wallet);
+        if let Some(w) = &self.payment_wallet {
+            collect_from_wallet(w);
+        }
+
+        outpoints
     }
 
     /// Update the wallet's internal inscription state.
@@ -1470,6 +1595,542 @@ impl ZincWallet {
                     .to_sat()
                     .saturating_sub(safe_bal.trusted_pending.to_sat()), // Estimate
         }
+    }
+
+    /// List every wallet UTXO (taproot keychain, plus payment in dual mode), annotated for
+    /// coin-control UIs: address, confirmations, inscription ids/offsets, and an estimate of
+    /// salvageable cardinal sats. Spans all derived addresses in each keychain.
+    pub fn list_utxos(&self) -> Vec<UtxoItem> {
+        let tip = self.vault_wallet.local_chain().tip().height();
+        let mut out = Vec::new();
+        self.collect_utxos_from(&self.vault_wallet, "taproot", tip, &mut out);
+        if let Some(w) = &self.payment_wallet {
+            self.collect_utxos_from(w, "payment", tip, &mut out);
+        }
+        out
+    }
+
+    fn collect_utxos_from(&self, wallet: &Wallet, role: &str, tip: u32, out: &mut Vec<UtxoItem>) {
+        for u in wallet.list_unspent() {
+            let (confirmed, confirmations) = match &u.chain_position {
+                bdk_chain::ChainPosition::Confirmed { anchor, .. } => (
+                    true,
+                    tip.saturating_sub(anchor.block_id.height).saturating_add(1),
+                ),
+                bdk_chain::ChainPosition::Unconfirmed { .. } => (false, 0),
+            };
+
+            let address = Some(
+                wallet
+                    .peek_address(u.keychain, u.derivation_index)
+                    .address
+                    .to_string(),
+            );
+
+            let is_inscribed = self.inscribed_utxos.contains(&u.outpoint);
+            let mut inscription_ids = Vec::new();
+            let mut inscription_offsets = Vec::new();
+            for ins in &self.inscriptions {
+                if ins.satpoint.outpoint == u.outpoint {
+                    inscription_ids.push(ins.id.clone());
+                    inscription_offsets.push(ins.satpoint.offset);
+                }
+            }
+            let has_inscription = !inscription_ids.is_empty();
+            let value_sats = u.txout.value.to_sat();
+
+            // Conservative estimate: only inscription-bearing UTXOs expose salvageable cardinal sats,
+            // keeping MIN_SALVAGE_PADDING_SATS per inscription. Runes-only protected UTXOs report 0
+            // (handled by dedicated flows). The Ordinal Shield re-verifies any salvage before signing.
+            let cardinal_salvageable_sats = if has_inscription {
+                value_sats
+                    .saturating_sub(inscription_ids.len() as u64 * MIN_SALVAGE_PADDING_SATS)
+            } else {
+                0
+            };
+
+            let keychain = match u.keychain {
+                KeychainKind::Internal => "internal",
+                KeychainKind::External => "external",
+            };
+
+            out.push(UtxoItem {
+                txid: u.outpoint.txid.to_string(),
+                vout: u.outpoint.vout,
+                value_sats,
+                address,
+                keychain: keychain.to_string(),
+                wallet_role: role.to_string(),
+                confirmed,
+                confirmations,
+                is_inscribed,
+                has_inscription,
+                inscription_ids,
+                inscription_offsets,
+                cardinal_salvageable_sats,
+            });
+        }
+    }
+
+    /// Resolve one of the wallet's own UTXOs (across taproot + payment keychains) to its TxOut.
+    fn resolve_owned_txout(&self, op: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
+        let find = |w: &Wallet| {
+            w.list_unspent()
+                .find(|u| u.outpoint == *op)
+                .map(|u| u.txout.clone())
+        };
+        find(&self.vault_wallet).or_else(|| self.payment_wallet.as_ref().and_then(find))
+    }
+
+    /// Build an unsigned "sat surgery" / salvage PSBT: spend the given inscription-bearing UTXOs and
+    /// recover their cardinal (non-inscription) sats, keeping each inscription in its own
+    /// `target_postage` output sent to `ordinals_address`; the recovered remainder (minus fee) goes to
+    /// `destination`.
+    ///
+    /// Outputs are hand-ordered (postage outputs first, then recovery) so the inscription sats — assumed
+    /// at offset 0 of each input — land in the padded outputs. This assumption is NOT trusted blindly:
+    /// the caller MUST run the Ordinal Shield (`analyze_psbt`) on the result and refuse to sign if any
+    /// inscription would move/burn (the shield uses real satpoint offsets).
+    pub fn plan_salvage_tx(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+        fee_rate: FeeRate,
+        target_postage: u64,
+        ordinals_address: &Address,
+        destination: &Address,
+    ) -> Result<Psbt, ZincError> {
+        use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        if !self.ordinals_verified {
+            return Err(ZincError::WalletError(
+                "Ordinals verification failed - safety lock engaged. Please retry sync.".to_string(),
+            ));
+        }
+        if outpoints.is_empty() {
+            return Err(ZincError::WalletError(
+                "No UTXOs selected for salvage".to_string(),
+            ));
+        }
+
+        let mut resolved: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
+        for op in outpoints {
+            let txo = self
+                .resolve_owned_txout(op)
+                .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
+            resolved.push((*op, txo));
+        }
+
+        let total_input: u64 = resolved.iter().map(|(_, t)| t.value.to_sat()).sum();
+        let count = resolved.len() as u64;
+        let total_postage = target_postage.saturating_mul(count);
+        let ord_spk = ordinals_address.script_pubkey();
+        let dest_spk = destination.script_pubkey();
+
+        // Dummy witness-sized tx to measure exact vsize → fee.
+        let mut dummy_inputs = Vec::new();
+        for (op, txo) in &resolved {
+            let mut input = TxIn {
+                previous_output: *op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            };
+            if txo.script_pubkey.is_p2tr() {
+                input.witness.push(vec![0u8; 64]);
+            } else {
+                input.witness.push(vec![0u8; 72]);
+                input.witness.push(vec![0u8; 33]);
+            }
+            dummy_inputs.push(input);
+        }
+        let mut dummy_outputs: Vec<TxOut> = (0..count)
+            .map(|_| TxOut {
+                value: Amount::from_sat(target_postage),
+                script_pubkey: ord_spk.clone(),
+            })
+            .collect();
+        dummy_outputs.push(TxOut {
+            value: Amount::from_sat(total_input.saturating_sub(total_postage)),
+            script_pubkey: dest_spk.clone(),
+        });
+        let dummy_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: dummy_inputs.clone(),
+            output: dummy_outputs,
+        };
+        let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
+
+        let recoverable = total_input
+            .checked_sub(total_postage + fee)
+            .filter(|v| *v > 0)
+            .ok_or_else(|| {
+                ZincError::WalletError(format!(
+                    "Insufficient funds for salvage: input {total_input}, postage {total_postage}, fee {fee}"
+                ))
+            })?;
+
+        let mut outputs: Vec<TxOut> = (0..count)
+            .map(|_| TxOut {
+                value: Amount::from_sat(target_postage),
+                script_pubkey: ord_spk.clone(),
+            })
+            .collect();
+        outputs.push(TxOut {
+            value: Amount::from_sat(recoverable),
+            script_pubkey: dest_spk,
+        });
+
+        let mut inputs = dummy_inputs;
+        for input in &mut inputs {
+            input.witness = Witness::new();
+        }
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs,
+            output: outputs,
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx)
+            .map_err(|e| ZincError::WalletError(format!("Failed to build salvage PSBT: {e}")))?;
+        for (i, (_, txo)) in resolved.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(txo.clone());
+        }
+        Ok(psbt)
+    }
+
+    /// Build an unsigned consolidation PSBT: sweep the given (cardinal-only) UTXOs into a single
+    /// output at `destination`, minus fee. Refuses any inscription/rune-protected outpoint as a
+    /// defense-in-depth check (the caller should only pass clean UTXOs).
+    pub fn plan_consolidate_tx(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+        fee_rate: FeeRate,
+        destination: &Address,
+    ) -> Result<Psbt, ZincError> {
+        use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        if outpoints.is_empty() {
+            return Err(ZincError::WalletError(
+                "No UTXOs selected for consolidation".to_string(),
+            ));
+        }
+
+        let mut resolved: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
+        for op in outpoints {
+            if self.inscribed_utxos.contains(op) {
+                return Err(ZincError::WalletError(format!(
+                    "Refusing to consolidate a protected (inscription/rune) UTXO: {op}"
+                )));
+            }
+            let txo = self
+                .resolve_owned_txout(op)
+                .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
+            resolved.push((*op, txo));
+        }
+
+        let total_input: u64 = resolved.iter().map(|(_, t)| t.value.to_sat()).sum();
+        let dest_spk = destination.script_pubkey();
+
+        let mut dummy_inputs = Vec::new();
+        for (op, txo) in &resolved {
+            let mut input = TxIn {
+                previous_output: *op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            };
+            if txo.script_pubkey.is_p2tr() {
+                input.witness.push(vec![0u8; 64]);
+            } else {
+                input.witness.push(vec![0u8; 72]);
+                input.witness.push(vec![0u8; 33]);
+            }
+            dummy_inputs.push(input);
+        }
+        let dummy_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: dummy_inputs.clone(),
+            output: vec![TxOut {
+                value: Amount::from_sat(total_input),
+                script_pubkey: dest_spk.clone(),
+            }],
+        };
+        let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
+
+        let consolidated = total_input
+            .checked_sub(fee)
+            .filter(|v| *v >= 546)
+            .ok_or_else(|| {
+                ZincError::WalletError(format!(
+                    "Insufficient funds for consolidation: input {total_input}, fee {fee}"
+                ))
+            })?;
+
+        let mut inputs = dummy_inputs;
+        for input in &mut inputs {
+            input.witness = Witness::new();
+        }
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs,
+            output: vec![TxOut {
+                value: Amount::from_sat(consolidated),
+                script_pubkey: dest_spk,
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx)
+            .map_err(|e| ZincError::WalletError(format!("Failed to build consolidation PSBT: {e}")))?;
+        for (i, (_, txo)) in resolved.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(txo.clone());
+        }
+        Ok(psbt)
+    }
+
+    /// Parse string inputs and return a base64 consolidation PSBT.
+    pub fn plan_consolidate_base64(
+        &self,
+        outpoints: &[String],
+        fee_rate_sat_vb: u64,
+        destination: &str,
+    ) -> Result<String, ZincError> {
+        let network = self.vault_wallet.network();
+        let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
+            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let dest_addr = Address::from_str(destination)
+            .map_err(|e| ZincError::ConfigError(format!("Invalid destination address: {e}")))?
+            .require_network(network)
+            .map_err(|e| ZincError::ConfigError(format!("Destination address network mismatch: {e}")))?;
+        let mut ops = Vec::with_capacity(outpoints.len());
+        for s in outpoints {
+            ops.push(
+                bitcoin::OutPoint::from_str(s)
+                    .map_err(|e| ZincError::ConfigError(format!("Invalid outpoint {s}: {e}")))?,
+            );
+        }
+        let psbt = self.plan_consolidate_tx(&ops, fee_rate, &dest_addr)?;
+        Ok(Self::encode_psbt_base64(&psbt))
+    }
+
+    /// Build an unsigned "smart send" PSBT that pays `recipient` `amount_sats`, automatically salvaging
+    /// any inscription-bearing UTXOs among `input_outpoints` (their cardinal sats help fund the send).
+    ///
+    /// Inscribed inputs are placed FIRST and each gets its own `target_postage` output (to
+    /// `ordinals_address`) FIRST, so the inscription sats (assumed at offset 0) land in the padded
+    /// outputs; the recipient + change follow. The caller MUST verify the result with `analyze_psbt`
+    /// before signing — the shield uses real offsets and refuses anything that would move/burn an
+    /// inscription (notably the multi-inscription sat-flow edge cases this simple builder can't model).
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_send_with_salvage_tx(
+        &self,
+        input_outpoints: &[bitcoin::OutPoint],
+        recipient: &Address,
+        amount_sats: u64,
+        fee_rate: FeeRate,
+        target_postage: u64,
+        ordinals_address: &Address,
+        change_address: &Address,
+    ) -> Result<Psbt, ZincError> {
+        use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        if !self.ordinals_verified {
+            return Err(ZincError::WalletError(
+                "Ordinals verification failed - safety lock engaged. Please retry sync.".to_string(),
+            ));
+        }
+        if input_outpoints.is_empty() {
+            return Err(ZincError::WalletError("No inputs provided for send".to_string()));
+        }
+        if amount_sats == 0 {
+            return Err(ZincError::WalletError("Send amount must be greater than zero".to_string()));
+        }
+
+        // Resolve + partition: inscribed inputs (salvaged) first, then clean inputs.
+        let mut inscribed: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
+        let mut clean: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
+        for op in input_outpoints {
+            let txo = self
+                .resolve_owned_txout(op)
+                .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
+            if self.inscribed_utxos.contains(op) {
+                inscribed.push((*op, txo));
+            } else {
+                clean.push((*op, txo));
+            }
+        }
+        let ordered: Vec<(bitcoin::OutPoint, TxOut)> =
+            inscribed.iter().chain(clean.iter()).cloned().collect();
+        let salvage_count = inscribed.len() as u64;
+        let total_input: u64 = ordered.iter().map(|(_, t)| t.value.to_sat()).sum();
+        let postage_total = target_postage.saturating_mul(salvage_count);
+
+        let ord_spk = ordinals_address.script_pubkey();
+        let recipient_spk = recipient.script_pubkey();
+        let change_spk = change_address.script_pubkey();
+
+        let build_inputs = || {
+            ordered
+                .iter()
+                .map(|(op, txo)| {
+                    let mut input = TxIn {
+                        previous_output: *op,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness: Witness::new(),
+                    };
+                    if txo.script_pubkey.is_p2tr() {
+                        input.witness.push(vec![0u8; 64]);
+                    } else {
+                        input.witness.push(vec![0u8; 72]);
+                        input.witness.push(vec![0u8; 33]);
+                    }
+                    input
+                })
+                .collect::<Vec<_>>()
+        };
+        let postage_outputs = |spk: &ScriptBuf| {
+            (0..salvage_count)
+                .map(|_| TxOut {
+                    value: Amount::from_sat(target_postage),
+                    script_pubkey: spk.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Measure vsize with a change output present (worst case), then decide whether to keep change.
+        let mut dummy_out = postage_outputs(&ord_spk);
+        dummy_out.push(TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient_spk.clone(),
+        });
+        dummy_out.push(TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: change_spk.clone(),
+        });
+        let dummy_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: build_inputs(),
+            output: dummy_out,
+        };
+        let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
+
+        let change = total_input
+            .checked_sub(postage_total + amount_sats + fee)
+            .ok_or_else(|| {
+                ZincError::WalletError(format!(
+                    "Insufficient funds: have {total_input}, need {} (postage {postage_total} + amount {amount_sats} + fee {fee})",
+                    postage_total + amount_sats + fee
+                ))
+            })?;
+
+        let mut outputs = postage_outputs(&ord_spk);
+        outputs.push(TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient_spk,
+        });
+        // Keep a change output only if it clears dust; otherwise the remainder is absorbed into the fee.
+        if change >= 546 {
+            outputs.push(TxOut {
+                value: Amount::from_sat(change),
+                script_pubkey: change_spk,
+            });
+        }
+
+        let mut real_inputs = build_inputs();
+        for input in &mut real_inputs {
+            input.witness = Witness::new();
+        }
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: real_inputs,
+            output: outputs,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx)
+            .map_err(|e| ZincError::WalletError(format!("Failed to build send PSBT: {e}")))?;
+        for (i, (_, txo)) in ordered.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(txo.clone());
+        }
+        Ok(psbt)
+    }
+
+    /// Parse string inputs and return a base64 smart-send (send-with-salvage) PSBT.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_send_with_salvage_base64(
+        &self,
+        input_outpoints: &[String],
+        recipient: &str,
+        amount_sats: u64,
+        fee_rate_sat_vb: u64,
+        target_postage: u64,
+        ordinals_address: &str,
+        change_address: &str,
+    ) -> Result<String, ZincError> {
+        let network = self.vault_wallet.network();
+        let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
+            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let parse_addr = |s: &str, what: &str| -> Result<Address, ZincError> {
+            Address::from_str(s)
+                .map_err(|e| ZincError::ConfigError(format!("Invalid {what} address: {e}")))?
+                .require_network(network)
+                .map_err(|e| ZincError::ConfigError(format!("{what} address network mismatch: {e}")))
+        };
+        let recipient_addr = parse_addr(recipient, "recipient")?;
+        let ord_addr = parse_addr(ordinals_address, "ordinals")?;
+        let change_addr = parse_addr(change_address, "change")?;
+        let mut ops = Vec::with_capacity(input_outpoints.len());
+        for s in input_outpoints {
+            ops.push(
+                bitcoin::OutPoint::from_str(s)
+                    .map_err(|e| ZincError::ConfigError(format!("Invalid outpoint {s}: {e}")))?,
+            );
+        }
+        let psbt = self.plan_send_with_salvage_tx(
+            &ops,
+            &recipient_addr,
+            amount_sats,
+            fee_rate,
+            target_postage,
+            &ord_addr,
+            &change_addr,
+        )?;
+        Ok(Self::encode_psbt_base64(&psbt))
+    }
+
+    /// Parse string inputs (outpoints `txid:vout`, addresses, fee rate) and return a base64 salvage PSBT.
+    pub fn plan_salvage_base64(
+        &self,
+        outpoints: &[String],
+        fee_rate_sat_vb: u64,
+        target_postage: u64,
+        ordinals_address: &str,
+        destination: &str,
+    ) -> Result<String, ZincError> {
+        let network = self.vault_wallet.network();
+        let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
+            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let ord_addr = Address::from_str(ordinals_address)
+            .map_err(|e| ZincError::ConfigError(format!("Invalid ordinals address: {e}")))?
+            .require_network(network)
+            .map_err(|e| ZincError::ConfigError(format!("Ordinals address network mismatch: {e}")))?;
+        let dest_addr = Address::from_str(destination)
+            .map_err(|e| ZincError::ConfigError(format!("Invalid destination address: {e}")))?
+            .require_network(network)
+            .map_err(|e| ZincError::ConfigError(format!("Destination address network mismatch: {e}")))?;
+        let mut ops = Vec::with_capacity(outpoints.len());
+        for s in outpoints {
+            ops.push(
+                bitcoin::OutPoint::from_str(s)
+                    .map_err(|e| ZincError::ConfigError(format!("Invalid outpoint {s}: {e}")))?,
+            );
+        }
+        let psbt = self.plan_salvage_tx(&ops, fee_rate, target_postage, &ord_addr, &dest_addr)?;
+        Ok(Self::encode_psbt_base64(&psbt))
     }
 
     /// Create an unsigned PSBT for sending BTC.
@@ -2493,25 +3154,26 @@ impl ZincWallet {
 
     fn flexible_full_scan_request(
         wallet: &Wallet,
-        policy: ScanPolicy,
+        _policy: ScanPolicy,
         now: u64,
     ) -> FullScanRequest<KeychainKind> {
-        // IMPORTANT: use the explicit `start_time` variant to avoid
-        // std time calls that panic on wasm32-unknown-unknown.
-        let mut builder = wallet.start_full_scan_at(now);
+        // Proper BIP-32 gap-limit scan. `start_full_scan_at` pre-loads each keychain's UNBOUNDED spk
+        // iterator (via `spks_from_indexer`), so `client.full_scan(req, stop_gap, ..)` walks addresses
+        // until `stop_gap` consecutive unused — essential for multi-address HD wallets like Sparrow
+        // (a fresh address per receive). We use the explicit `start_time` variant to avoid the
+        // std-time panic on wasm32-unknown-unknown.
+        //
+        // Do NOT call `spks_for_keychain` here: it REPLACES the unbounded iterator with a finite list,
+        // which previously (with address_scan_depth=1) capped the scan to address index 0 — so only
+        // funds on the first address were ever discovered.
+        wallet.start_full_scan_at(now).build()
+    }
 
-        // 1. Set explicit scan depth (always scan at least N)
-        if policy.address_scan_depth > 0 {
-            for keychain in [KeychainKind::External, KeychainKind::Internal] {
-                // Eagerly collect to satisfy 'static bound on iterator in BDK builder
-                let spks: Vec<(u32, bitcoin::ScriptBuf)> = (0..policy.address_scan_depth)
-                    .map(|i| (i, wallet.peek_address(keychain, i).script_pubkey()))
-                    .collect();
-                builder = builder.spks_for_keychain(keychain, spks);
-            }
-        }
-
-        builder.build()
+    /// Build an incremental sync request over the wallet's already-revealed spks. Much cheaper than a
+    /// full scan (it doesn't walk the gap), so it's the default for routine syncs. Uses the explicit
+    /// `start_time` variant to avoid the std-time panic on wasm32-unknown-unknown.
+    fn flexible_sync_request(wallet: &Wallet, now: u64) -> SyncRequest<(KeychainKind, u32)> {
+        wallet.start_sync_with_revealed_spks_at(now).build()
     }
 }
 
@@ -2834,6 +3496,7 @@ impl WalletBuilder {
             kind,
             is_syncing: false,
             account_generation: 0,
+            force_next_full: false,
         })
     }
 
@@ -2972,6 +3635,7 @@ impl WalletBuilder {
             },
             is_syncing: false,
             account_generation: 0,
+            force_next_full: false,
         })
     }
 }
