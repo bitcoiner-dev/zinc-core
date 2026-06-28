@@ -885,6 +885,22 @@ impl ZincWallet {
         Ok(info.address)
     }
 
+    /// Return the next UNUSED taproot receive address (Sparrow-style): the lowest revealed address
+    /// that has not received funds, revealing a fresh one only if every revealed address is used.
+    /// Idempotent until the returned address is used. May reveal (mutating state) — persist after.
+    pub fn next_unused_taproot_address(&mut self) -> Result<Address, String> {
+        if let Some(address) = self.watched_address() {
+            return Ok(address.clone());
+        }
+        if self.derivation_mode == DerivationMode::Index {
+            return Ok(self.peek_taproot_address(0));
+        }
+        Ok(self
+            .vault_wallet
+            .next_unused_address(KeychainKind::External)
+            .address)
+    }
+
     /// Peek a taproot receive address at `index` without advancing state.
     pub fn peek_taproot_address(&self, index: u32) -> Address {
         if let Some(address) = self.watched_address() {
