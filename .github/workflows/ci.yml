@@ -25,3 +25,61 @@ jobs:
 
       - name: Run ${{ matrix.command }}
         run: ${{ matrix.command }}
+
+  # Enforce a line-coverage floor. Ratchet `--fail-under-lines` upward as each
+  # coverage phase lands so the floor only ever moves up.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Measure coverage (fails below floor)
+        run: cargo llvm-cov --no-cfg-coverage --fail-under-lines 62
+
+  # Public-API guardrail: this is a published crate. Block any breaking change to
+  # the public API surface relative to the last release on crates.io. Coverage
+  # work is additive (tests only) and must never trip this job.
+  public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for SemVer-breaking API changes
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  # Exercise the #[wasm_bindgen] JS surface (ZincWasmWallet + free fns) under Node.
+  # secp256k1-sys compiles C for wasm32, which needs a wasm-capable clang — on Ubuntu
+  # the LLVM `clang`/`llvm-ar` provide the wasm target (Apple clang on macOS does NOT;
+  # locally run with CC_wasm32_unknown_unknown=$(brew --prefix llvm)/bin/clang).
+  wasm-test:
+    runs-on: ubuntu-latest
+    env:
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (with wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-capable C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@wasm-pack
+
+      - name: Run wasm-bindgen tests in Node
+        run: wasm-pack test --node . --test wasm_test --test wasm_account_test --test wasm_contract_test

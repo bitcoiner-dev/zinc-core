@@ -1049,3 +1049,167 @@ fn decode_pairing_transport_event_with_secret_rejects_non_1059_kind() {
         "unexpected error: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Validation negatives. `SignedXxxV1::new` signs via `canonical_json`, which
+// runs `validate()` first, so a malformed payload is rejected at construction.
+// ---------------------------------------------------------------------------
+
+fn buyer_offer_intent(inscription_id: &str, ask_sats: u64, fee_rate_sat_vb: u64) -> SignIntentV1 {
+    let request = sample_pairing_request();
+    SignIntentV1 {
+        version: 1,
+        pairing_id: request.pairing_id_hex().expect("pairing id"),
+        agent_pubkey_hex: request.agent_pubkey_hex,
+        wallet_pubkey_hex: pubkey_hex_from_secret_key(wallet_secret_hex()).expect("wallet pubkey"),
+        network: "regtest".to_string(),
+        created_at_unix: 1_710_000_200,
+        expires_at_unix: 1_710_000_920,
+        nonce: 1,
+        payload: SignIntentPayloadV1::BuildBuyerOffer(BuildBuyerOfferIntentV1 {
+            inscription_id: inscription_id.to_string(),
+            seller_outpoint: "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0"
+                .to_string(),
+            ask_sats,
+            fee_rate_sat_vb,
+        }),
+    }
+}
+
+#[test]
+fn pairing_request_rejects_duplicate_allowed_actions() {
+    let mut req = sample_pairing_request();
+    req.requested_capabilities.allowed_actions = vec![
+        SignIntentActionV1::BuildBuyerOffer,
+        SignIntentActionV1::BuildBuyerOffer,
+    ];
+    assert!(SignedPairingRequestV1::new(req, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn pairing_request_rejects_empty_allowed_actions() {
+    let mut req = sample_pairing_request();
+    req.requested_capabilities.allowed_actions = vec![];
+    assert!(SignedPairingRequestV1::new(req, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn pairing_request_rejects_empty_allowed_networks() {
+    let mut req = sample_pairing_request();
+    req.requested_capabilities.allowed_networks = vec![];
+    assert!(SignedPairingRequestV1::new(req, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn pairing_request_rejects_duplicate_networks() {
+    let mut req = sample_pairing_request();
+    req.requested_capabilities.allowed_networks =
+        vec!["regtest".to_string(), "regtest".to_string()];
+    assert!(SignedPairingRequestV1::new(req, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn pairing_request_rejects_created_equals_expires() {
+    let mut req = sample_pairing_request();
+    req.expires_at_unix = req.created_at_unix;
+    assert!(SignedPairingRequestV1::new(req, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn pairing_request_rejects_unsupported_version() {
+    let mut req = sample_pairing_request();
+    req.version = 2;
+    assert!(SignedPairingRequestV1::new(req, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn pairing_request_rejects_signing_with_wrong_key() {
+    // agent_pubkey_hex names the agent key, but we sign with the wallet key.
+    let req = sample_pairing_request();
+    assert!(SignedPairingRequestV1::new(req, wallet_secret_hex()).is_err());
+}
+
+#[test]
+fn sign_intent_rejects_zero_ask_sats() {
+    let intent = buyer_offer_intent("inscription-123", 0, 2);
+    assert!(SignedSignIntentV1::new(intent, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn sign_intent_rejects_zero_fee_rate() {
+    let intent = buyer_offer_intent("inscription-123", 100_000, 0);
+    assert!(SignedSignIntentV1::new(intent, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn sign_intent_rejects_empty_inscription_id() {
+    let intent = buyer_offer_intent("", 100_000, 2);
+    assert!(SignedSignIntentV1::new(intent, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn sign_intent_rejects_unsupported_network() {
+    let mut intent = buyer_offer_intent("inscription-123", 100_000, 2);
+    intent.network = "litecoin".to_string();
+    assert!(SignedSignIntentV1::new(intent, agent_secret_hex()).is_err());
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_duplicate_seller_input() {
+    let outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(outpoint, true, false, true, false, false),
+        outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+    let err = verify_sign_seller_input_scope(&signed_intent, 1_710_000_210)
+        .expect_err("duplicate seller input must fail");
+    assert!(
+        err.to_string().contains("expected seller input"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_payout_value_mismatch() {
+    let outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64(outpoint, false, false, true, false, true),
+        outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+    let err = verify_sign_seller_input_scope(&signed_intent, 1_710_000_210)
+        .expect_err("payout mismatch must fail");
+    assert!(
+        err.to_string().contains("seller payout"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn approved_receipt_without_psbt_or_artifact_is_rejected() {
+    let signed_intent =
+        SignedSignIntentV1::new(buyer_offer_intent("inscription-123", 100_000, 2), agent_secret_hex())
+            .expect("signed intent");
+    let request = sample_pairing_request();
+    let receipt = SignIntentReceiptV1 {
+        version: 1,
+        intent_id: signed_intent.intent_id_hex().expect("intent id"),
+        pairing_id: request.pairing_id_hex().expect("pairing id"),
+        signer_pubkey_hex: pubkey_hex_from_secret_key(wallet_secret_hex()).expect("wallet pubkey"),
+        created_at_unix: 1_710_000_030,
+        status: SignIntentReceiptStatusV1::Approved,
+        signed_psbt_base64: None,
+        artifact_json: None,
+        error_message: None,
+    };
+    assert!(SignedSignIntentReceiptV1::new(receipt, wallet_secret_hex()).is_err());
+}

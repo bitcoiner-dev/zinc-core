@@ -10,7 +10,8 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 use zinc_core::*;
 
-wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+// Run under Node (no browser/webdriver dependency). Re-add
+// `wasm_bindgen_test_configure!(run_in_browser)` only if a headless browser is wired up.
 
 #[wasm_bindgen_test]
 fn test_generate_wallet_returns_object() {

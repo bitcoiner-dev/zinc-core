@@ -103,3 +103,30 @@ fn parse_event_frame_requires_matching_subscription() {
 fn wss_transport_compiles_with_tls_connect_api() {
     let _ = tokio_tungstenite::connect_async_tls_with_config::<&str>;
 }
+
+#[test]
+fn close_frame_builds_close_array() {
+    let frame = NostrListingRelayClient::close_frame("sub-9").expect("close frame");
+    let parsed: serde_json::Value = serde_json::from_str(&frame).expect("json");
+    assert_eq!(parsed[0], "CLOSE");
+    assert_eq!(parsed[1], "sub-9");
+}
+
+#[test]
+fn parse_ok_frame_rejects_malformed_inputs() {
+    let p = |f: &str| NostrListingRelayClient::parse_ok_frame(f, "id");
+    assert!(p("not json").is_none(), "non-json");
+    assert!(p(r#"["OK","id",true]"#).is_none(), "wrong length");
+    assert!(p(r#"["NOTOK","id",true,"m"]"#).is_none(), "wrong tag");
+    assert!(p(r#"["OK","other",true,"m"]"#).is_none(), "event id mismatch");
+    assert!(p(r#"["OK","id","yes","m"]"#).is_none(), "accepted not a bool");
+}
+
+#[test]
+fn parse_event_frame_rejects_malformed_inputs() {
+    let p = |f: &str| NostrListingRelayClient::parse_event_frame(f, "sub");
+    assert!(p("not json").is_none(), "non-json");
+    assert!(p(r#"["EVENT","sub"]"#).is_none(), "wrong length");
+    assert!(p(r#"["NOTEVENT","sub",{}]"#).is_none(), "wrong tag");
+    assert!(p(r#"["EVENT","sub",{"bad":"event"}]"#).is_none(), "invalid event payload");
+}

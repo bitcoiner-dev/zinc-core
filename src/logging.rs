@@ -209,4 +209,37 @@ mod tests {
         set_logging_enabled(true);
         set_log_level(DEFAULT_LOG_LEVEL);
     }
+
+    #[test]
+    fn as_str_round_trips_through_parse_level() {
+        for lvl in [
+            LogLevel::Off,
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            assert_eq!(parse_level(lvl.as_str()), Some(lvl));
+        }
+    }
+
+    #[test]
+    fn from_u8_maps_valid_levels_and_rejects_others() {
+        assert_eq!(LogLevel::from_u8(0), Some(LogLevel::Off));
+        assert_eq!(LogLevel::from_u8(1), Some(LogLevel::Error));
+        assert_eq!(LogLevel::from_u8(5), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::from_u8(6), None);
+        assert_eq!(LogLevel::from_u8(255), None);
+    }
+
+    #[test]
+    fn off_target_level_is_never_logged_even_at_max_verbosity() {
+        let _guard = LOG_STATE_LOCK.lock().unwrap();
+        set_logging_enabled(true);
+        set_log_level(LogLevel::Trace);
+        // Asking whether to emit an `Off`-level record must always be false.
+        assert!(!should_log(LogLevel::Off));
+        set_log_level(DEFAULT_LOG_LEVEL);
+    }
 }

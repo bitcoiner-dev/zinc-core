@@ -1,4 +1,4 @@
-use crate::builder::{AddressScheme, Seed64, WalletBuilder};
+use crate::builder::{AddressScheme, PaymentAddressType, Seed64, WalletBuilder};
 use crate::error::ZincError;
 use crate::keys::ZincMnemonic;
 use bdk_wallet::bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
@@ -27,6 +27,28 @@ fn test_account_xpub_for_purpose(network: Network, purpose: u32) -> String {
         .derive_priv(&secp, &derivation_path)
         .expect("account xprv");
     Xpub::from_priv(&secp, &account_xprv).to_string()
+}
+
+// Proves a Sparrow native-segwit single-sig wallet imports to byte-identical addresses in Zinc.
+// The "abandon abandon ... about" seed is the canonical BIP-84 test vector; mainnet m/84'/0'/0'/0/0
+// must equal bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu (same value Sparrow derives + NEO queries).
+#[test]
+fn test_sparrow_native_segwit_address_parity_bip84() {
+    let network = Network::Bitcoin;
+    let mnemonic = ZincMnemonic::parse(TEST_MNEMONIC).expect("valid mnemonic");
+    let wallet = WalletBuilder::from_mnemonic(network, &mnemonic)
+        .with_scheme(AddressScheme::Dual)
+        .with_payment_address_type(PaymentAddressType::NativeSegwit)
+        .build()
+        .expect("seed wallet");
+
+    assert_eq!(
+        wallet
+            .peek_payment_address(0)
+            .expect("payment address")
+            .to_string(),
+        "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+    );
 }
 
 #[test]

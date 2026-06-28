@@ -93,4 +93,27 @@ mod tests {
 
         assert_eq!(desc1.external.to_string(), desc2.external.to_string());
     }
+
+    #[test]
+    fn mainnet_and_testnet_descriptors_differ_by_coin_type() {
+        let m = ZincMnemonic::parse(TEST_MNEMONIC).unwrap();
+        let main = taproot_descriptors(&m, Network::Bitcoin).unwrap();
+        let test = taproot_descriptors(&m, Network::Testnet).unwrap();
+        // BIP-86 coin types differ (m/86'/0' vs m/86'/1'), so descriptors must differ.
+        assert_ne!(main.external.to_string(), test.external.to_string());
+    }
+
+    #[test]
+    fn mainnet_external_descriptor_matches_bip86_account_xpub() {
+        let m = ZincMnemonic::parse(TEST_MNEMONIC).unwrap();
+        let desc = taproot_descriptors(&m, Network::Bitcoin).unwrap();
+        // BIP-86 known-answer: account-0 xpub for the canonical "abandon ... about" seed.
+        assert!(
+            desc.external.to_string().contains(
+                "xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ"
+            ),
+            "unexpected descriptor: {}",
+            desc.external
+        );
+    }
 }

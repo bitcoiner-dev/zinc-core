@@ -71,6 +71,17 @@ pub struct InscriptionContent {
     pub bytes: Vec<u8>,
 }
 
+/// All ordinal assets resolved for a set of wallet outpoints in one bulk pass.
+#[derive(Debug, Default)]
+pub struct ResolvedAssets {
+    /// Inscriptions held by the wallet (with display metadata + satpoint offsets).
+    pub inscriptions: Vec<Inscription>,
+    /// Outpoints holding an inscription or rune — the shield's protected (unspendable) set.
+    pub protected_outpoints: HashSet<OutPoint>,
+    /// Aggregated rune balances.
+    pub rune_balances: Vec<RuneBalance>,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum OffersResponse {
@@ -472,11 +483,117 @@ impl OrdClient {
         &self,
         addresses: &[String],
     ) -> Result<Vec<RuneBalance>, OrdError> {
+        // Fetch per-address rune balances concurrently in bounded batches (was one address at a time,
+        // which serialized in front of the inscription pass and delayed artifacts from showing).
+        const RUNE_FETCH_BATCH: usize = 8;
         let mut collected = Vec::new();
-        for address in addresses {
-            collected.extend(self.get_rune_balances(address).await?);
+        for batch in addresses.chunks(RUNE_FETCH_BATCH) {
+            let futures = batch.iter().map(|address| self.get_rune_balances(address.as_str()));
+            for result in futures_util::future::join_all(futures).await {
+                collected.extend(result?);
+            }
         }
         Ok(merge_rune_balances(collected))
+    }
+
+    /// Bulk-fetch output metadata for many outpoints in ONE request via ord's `POST /outputs`.
+    /// Each returned entry carries its own `outpoint`, so callers can match results to requests.
+    /// Internal helper for `resolve_assets_for_outpoints` (returns the crate-private response type).
+    async fn get_outputs_bulk(
+        &self,
+        outpoints: &[String],
+    ) -> Result<Vec<OutputResponse>, OrdError> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/outputs", self.base_url);
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Accept", "application/json")
+            .json(outpoints)
+            .send()
+            .await
+            .map_err(|e| OrdError::RequestFailed(format!("Bulk outputs request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(OrdError::RequestFailed(format!(
+                "API Error (Outputs bulk): {}",
+                response.status()
+            )));
+        }
+
+        response
+            .json::<Vec<OutputResponse>>()
+            .await
+            .map_err(|e| OrdError::RequestFailed(format!("Failed to parse Outputs bulk JSON: {e}")))
+    }
+
+    /// Resolve all ordinal assets for the given wallet outpoints in as few requests as possible:
+    /// one bulk `/outputs` pass (batched, concurrent) for inscription ids + runes + protected status,
+    /// then a parallel per-inscription detail fetch for display metadata + satpoint offsets.
+    ///
+    /// Fails closed: if the bulk response does not cover every requested outpoint, returns an error so
+    /// the ordinals state is never marked verified on partial data (a silently-missing output could
+    /// hide a protected/inscribed UTXO from the send-safety set).
+    pub async fn resolve_assets_for_outpoints(
+        &self,
+        outpoints: &[String],
+    ) -> Result<ResolvedAssets, OrdError> {
+        if outpoints.is_empty() {
+            return Ok(ResolvedAssets::default());
+        }
+
+        // 1. Bulk outputs, batched + concurrent.
+        const OUTPUTS_BATCH: usize = 100;
+        let chunk_futures = outpoints
+            .chunks(OUTPUTS_BATCH)
+            .map(|chunk| self.get_outputs_bulk(chunk));
+        let mut entries: Vec<OutputResponse> = Vec::new();
+        for result in futures_util::future::join_all(chunk_futures).await {
+            entries.extend(result?);
+        }
+
+        // Coverage check (fail closed): every requested outpoint must be present in the response.
+        let returned: HashSet<&str> =
+            entries.iter().filter_map(|e| e.outpoint.as_deref()).collect();
+        for requested in outpoints {
+            if !returned.contains(requested.as_str()) {
+                return Err(OrdError::RequestFailed(format!(
+                    "Bulk outputs response missing {requested}; refusing partial ordinals state"
+                )));
+            }
+        }
+
+        // 2. Derive protected set + inscription ids + rune balances from the bulk entries.
+        let mut protected_outpoints = HashSet::new();
+        let mut inscription_ids: Vec<String> = Vec::new();
+        let mut rune_balances: Vec<RuneBalance> = Vec::new();
+        for e in &entries {
+            if e.has_protected_assets() {
+                if let Some(op) = e.outpoint.as_deref().and_then(|s| s.parse::<OutPoint>().ok()) {
+                    protected_outpoints.insert(op);
+                }
+            }
+            inscription_ids.extend(e.inscriptions.iter().cloned());
+            rune_balances.extend(parse_runes_balances_value(&e.runes));
+        }
+
+        // 3. Parallel per-inscription details (number/content_type/satpoint offset for display + shield).
+        const INS_BATCH: usize = 8;
+        let mut inscriptions = Vec::new();
+        for chunk in inscription_ids.chunks(INS_BATCH) {
+            let detail_futures = chunk.iter().map(|id| self.get_inscription_details(id.as_str()));
+            for result in futures_util::future::join_all(detail_futures).await {
+                inscriptions.push(result?);
+            }
+        }
+
+        Ok(ResolvedAssets {
+            inscriptions,
+            protected_outpoints,
+            rune_balances: merge_rune_balances(rune_balances),
+        })
     }
 
     /// Resolve protected outpoints for assets referenced by an address.
@@ -627,7 +744,9 @@ impl OrdClient {
     }
 }
 
-#[cfg(test)]
+// These are native-only tests (mockito has no wasm32 target); exclude them from the wasm
+// test build so `wasm-pack test --node` can compile the crate.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{parse_offers_payload, parse_runes_balances_value, OrdClient, OutputResponse};
 
