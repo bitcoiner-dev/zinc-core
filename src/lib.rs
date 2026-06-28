@@ -1383,6 +1383,20 @@ impl ZincWasmWallet {
         res
     }
 
+    /// Reveal and return the next UNUSED taproot receive address (Sparrow-style). Idempotent until
+    /// used; may reveal a fresh address, so the caller should persist the changeset afterwards.
+    #[wasm_bindgen(js_name = nextUnusedTaprootAddress)]
+    pub fn next_unused_taproot_address(&self) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .next_unused_taproot_address()
+                .map(|a| a.to_string())
+                .map_err(|e| JsValue::from_str(&e)),
+            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (next address): {e}"))),
+        }
+    }
+
     /// Change the address scheme (Unified <-> Dual) on the fly.
     /// This rebuilds the internal wallet using the stored phrase.
     pub fn set_scheme(&self, scheme_str: &str) -> Result<(), JsValue> {
