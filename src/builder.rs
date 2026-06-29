@@ -686,11 +686,19 @@ impl ZincWallet {
                 let chain = 0; // External
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    // SECURITY: return an error instead of panicking if a derivation index
+                    // exceeds the BIP-32 hardened/normal bound (2^31). A dynamic/untrusted
+                    // index would otherwise abort the WASM runtime (DoS).
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose)
+                        .map_err(|e| format!("Invalid purpose index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type)
+                        .map_err(|e| format!("Invalid coin_type index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account)
+                        .map_err(|e| format!("Invalid account index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain)
+                        .map_err(|e| format!("Invalid chain index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index)
+                        .map_err(|e| format!("Invalid index: {e}"))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -754,8 +762,11 @@ impl ZincWallet {
                     .derive_pub(
                         &secp,
                         &[
-                            ChildNumber::from_normal_idx(0).unwrap(),
-                            ChildNumber::from_normal_idx(index).unwrap(),
+                            ChildNumber::from_normal_idx(0)
+                                .map_err(|e| format!("Invalid chain index: {e}"))?,
+                            // SECURITY: avoid panic on out-of-range derivation index.
+                            ChildNumber::from_normal_idx(index)
+                                .map_err(|e| format!("Invalid index: {e}"))?,
                         ],
                     )
                     .map_err(|e| format!("Failed to derive public key from xpub: {}", e))?;
@@ -2447,7 +2458,7 @@ impl ZincWallet {
         // Ordinal Shield Audit: BEFORE signing!
         // We must build the known_inscriptions map to check for BURNS (sophisticated check)
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -2638,7 +2649,7 @@ impl ZincWallet {
         }
 
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
         for ins in &self.inscriptions {
             known_inscriptions
                 .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
@@ -2849,7 +2860,7 @@ impl ZincWallet {
         // Build Known Inscriptions Map from internal state
         // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::new();
+            HashMap::with_capacity(self.inscriptions.len());
 
         // We also need a way to map offsets back to Inscription IDs for the result?
         // The `analyze_psbt` function currently generates keys like "Inscription {N}".
@@ -3058,7 +3069,7 @@ impl ZincWallet {
     /// Uses the first taproot external key path: `m/86'/coin'/account'/0/0`.
     pub fn get_pairing_secret_key_hex(&self) -> Result<String, String> {
         let key = self.derive_private_key(86, 0, 0)?;
-        Ok(bytes_to_lower_hex(&key.secret_bytes()))
+        Ok(hex::encode(key.secret_bytes()))
     }
     /// Derive the taproot public key for this account at `index`.
     pub fn get_taproot_public_key(&self, index: u32) -> Result<String, String> {
@@ -3116,11 +3127,19 @@ impl ZincWallet {
                 let coin_type = u32::from(network != Network::Bitcoin);
 
                 let derivation_path = [
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain).unwrap(),
-                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index).unwrap(),
+                    // SECURITY: return an error instead of panicking if a derivation index
+                    // exceeds the BIP-32 hardened/normal bound (2^31). A dynamic/untrusted
+                    // index would otherwise abort the WASM runtime (DoS).
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(purpose)
+                        .map_err(|e| format!("Invalid purpose index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(coin_type)
+                        .map_err(|e| format!("Invalid coin_type index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_hardened_idx(account)
+                        .map_err(|e| format!("Invalid account index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(chain)
+                        .map_err(|e| format!("Invalid chain index: {e}"))?,
+                    bdk_wallet::bitcoin::bip32::ChildNumber::from_normal_idx(index)
+                        .map_err(|e| format!("Invalid index: {e}"))?,
                 ];
 
                 let child_xprv = master_xprv
@@ -3234,10 +3253,11 @@ impl ZincWallet {
                                     final_sig.push(tap_sighash_type as u8);
                                 }
 
-                                input.tap_script_sigs.insert(
-                                    (*pubkey, leaf_hash),
-                                    bitcoin::taproot::Signature::from_slice(&final_sig).unwrap(),
-                                );
+                                // SECURITY: avoid panic if the assembled taproot signature
+                                // is malformed; surface an error instead of aborting.
+                                let tap_sig = bitcoin::taproot::Signature::from_slice(&final_sig)
+                                    .map_err(|e| format!("Invalid taproot signature: {e}"))?;
+                                input.tap_script_sigs.insert((*pubkey, leaf_hash), tap_sig);
                                 key_found = true;
                             }
                         }
@@ -3762,15 +3782,6 @@ pub struct ZincPersistence {
     pub taproot: Option<bdk_wallet::ChangeSet>,
     /// Merged changeset for the optional payment wallet.
     pub payment: Option<bdk_wallet::ChangeSet>,
-}
-
-fn bytes_to_lower_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        use std::fmt::Write;
-        write!(&mut s, "{:02x}", b).unwrap();
-    }
-    s
 }
 
 #[cfg(test)]
