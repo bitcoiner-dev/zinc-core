@@ -552,6 +552,14 @@ pub fn analyze_psbt_with_scope(
     // 2. Map to Outputs
     let mut current_output_offset = 0u64;
     for (vout, output) in analysis_psbt.unsigned_tx.output.iter().enumerate() {
+        // SECURITY: convert the output index once, up front, instead of an unchecked
+        // `as u32` truncation; fail loudly rather than silently corrupting the index.
+        let vout_u32 = u32::try_from(vout).map_err(|_| {
+            OrdError::RequestFailed(format!(
+                "Ordinal Shield Error: Output index {vout} exceeds u32 limit"
+            ))
+        })?;
+
         let output_value = output.value.to_sat();
         let output_end = current_output_offset + output_value;
 
@@ -566,15 +574,6 @@ pub fn analyze_psbt_with_scope(
             if *abs_offset >= current_output_offset && *abs_offset < output_end {
                 // Found destination!
                 let relative_offset = abs_offset - current_output_offset;
-
-                let vout_u32 = match u32::try_from(vout) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Err(OrdError::RequestFailed(format!(
-                            "Ordinal Shield Error: Output index {vout} exceeds u32 limit"
-                        )));
-                    }
-                };
 
                 inscription_destinations.insert(
                     key.clone(),
@@ -603,7 +602,7 @@ pub fn analyze_psbt_with_scope(
         }
 
         outputs_info.push(OutputInfo {
-            vout: vout as u32,
+            vout: vout_u32,
             value: output_value,
             script_pubkey: output.script_pubkey.to_hex_string(),
             address,
