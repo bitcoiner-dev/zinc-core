@@ -1728,30 +1728,86 @@ impl ZincWallet {
             ));
         }
 
-        let mut resolved: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
+        // Dust floor: 546 sats clears every standard output type and matches our postage target.
+        let dust = target_postage.max(546);
+
+        // Resolve each selected UTXO together with the offset of its (single) inscription.
+        struct SalvageInput {
+            op: bitcoin::OutPoint,
+            txo: TxOut,
+            offset: u64,
+        }
+        let mut metas: Vec<SalvageInput> = Vec::new();
         for op in outpoints {
             let txo = self
                 .resolve_owned_txout(op)
                 .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
-            resolved.push((*op, txo));
+            let mut offsets: Vec<u64> = self
+                .inscriptions
+                .iter()
+                .filter(|ins| ins.satpoint.outpoint == *op)
+                .map(|ins| ins.satpoint.offset)
+                .collect();
+            offsets.sort_unstable();
+            // Multiple inscriptions in one UTXO can't each be padded without modelling every sat
+            // boundary; refuse here (the user can salvage it alone) rather than risk moving one.
+            if offsets.len() > 1 {
+                return Err(ZincError::WalletError(format!(
+                    "UTXO {op} holds multiple inscriptions; salvage it on its own"
+                )));
+            }
+            let offset = offsets.first().copied().unwrap_or(0);
+            let value = txo.value.to_sat();
+            if offset.saturating_add(target_postage) > value {
+                return Err(ZincError::WalletError(format!(
+                    "Inscription in {op} sits too close to the UTXO end to pad to {target_postage} sats"
+                )));
+            }
+            metas.push(SalvageInput { op: *op, txo, offset });
         }
 
-        let total_input: u64 = resolved.iter().map(|(_, t)| t.value.to_sat()).sum();
-        let count = resolved.len() as u64;
-        let total_postage = target_postage.saturating_mul(count);
+        // Place the input with the largest trailing cardinal LAST: only the final output's value is
+        // reduced by the fee, and that reduction must never shift an earlier inscription's sat.
+        metas.sort_by_key(|m| m.txo.value.to_sat().saturating_sub(m.offset + target_postage));
+
         let ord_spk = ordinals_address.script_pubkey();
         let dest_spk = destination.script_pubkey();
 
-        // Dummy witness-sized tx to measure exact vsize → fee.
-        let mut dummy_inputs = Vec::new();
-        for (op, txo) in &resolved {
+        // Partition every input's sats, IN STREAM ORDER, into outputs:
+        //   [lead cardinal -> dest] [postage (holds the inscription sat) -> ord] [trail cardinal -> dest]
+        // Bitcoin assigns sats to outputs in input order, so this is the only layout that keeps each
+        // inscription inside its own padded output. Sub-dust lead/trail is folded into that input's
+        // postage (a little extra padding) — never dropped mid-stream, which would shift later sats.
+        // The bool marks cardinal (dest) outputs; the fee comes out of the final one.
+        let mut segments: Vec<(u64, ScriptBuf, bool)> = Vec::new();
+        for m in &metas {
+            let value = m.txo.value.to_sat();
+            let offset = m.offset;
+            let trail = value - offset - target_postage;
+            let mut postage = target_postage;
+            if offset >= dust {
+                segments.push((offset, dest_spk.clone(), true));
+            } else {
+                postage += offset; // fold sub-dust lead: postage window now starts at sat 0
+            }
+            if trail >= dust {
+                segments.push((postage, ord_spk.clone(), false));
+                segments.push((trail, dest_spk.clone(), true));
+            } else {
+                segments.push((postage + trail, ord_spk.clone(), false)); // fold sub-dust trail
+            }
+        }
+
+        // Fee from a dummy tx with the real witnesses + the real output set.
+        let mut dummy_inputs: Vec<TxIn> = Vec::with_capacity(metas.len());
+        for m in &metas {
             let mut input = TxIn {
-                previous_output: *op,
+                previous_output: m.op,
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             };
-            if txo.script_pubkey.is_p2tr() {
+            if m.txo.script_pubkey.is_p2tr() {
                 input.witness.push(vec![0u8; 64]);
             } else {
                 input.witness.push(vec![0u8; 72]);
@@ -1759,59 +1815,64 @@ impl ZincWallet {
             }
             dummy_inputs.push(input);
         }
-        let mut dummy_outputs: Vec<TxOut> = (0..count)
-            .map(|_| TxOut {
-                value: Amount::from_sat(target_postage),
-                script_pubkey: ord_spk.clone(),
-            })
+        let dummy_outputs: Vec<TxOut> = segments
+            .iter()
+            .map(|(v, spk, _)| TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() })
             .collect();
-        dummy_outputs.push(TxOut {
-            value: Amount::from_sat(total_input.saturating_sub(total_postage)),
-            script_pubkey: dest_spk.clone(),
-        });
         let dummy_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: dummy_inputs.clone(),
+            input: dummy_inputs,
             output: dummy_outputs,
         };
         let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
 
-        let recoverable = total_input
-            .checked_sub(total_postage + fee)
-            .filter(|v| *v > 0)
-            .ok_or_else(|| {
-                ZincError::WalletError(format!(
-                    "Insufficient funds for salvage: input {total_input}, postage {total_postage}, fee {fee}"
-                ))
-            })?;
+        // The final output must be cardinal, so the fee never touches a postage (inscription) output.
+        let last_idx = segments.len() - 1;
+        if !segments[last_idx].2 {
+            return Err(ZincError::WalletError(
+                "Selected inscriptions have no cardinal sats above the dust threshold to salvage".to_string(),
+            ));
+        }
+        let last_after_fee = segments[last_idx].0.checked_sub(fee).ok_or_else(|| {
+            ZincError::WalletError(format!("Salvage is too small to cover the network fee ({fee} sats)"))
+        })?;
 
-        let mut outputs: Vec<TxOut> = (0..count)
-            .map(|_| TxOut {
-                value: Amount::from_sat(target_postage),
-                script_pubkey: ord_spk.clone(),
+        let mut outputs: Vec<TxOut> = Vec::with_capacity(segments.len());
+        for (i, (v, spk, _)) in segments.iter().enumerate() {
+            if i == last_idx {
+                // Drop the final cardinal output if the fee leaves it below dust (absorbed into the
+                // fee); dropping the LAST output never shifts an inscription.
+                if last_after_fee >= dust {
+                    outputs.push(TxOut { value: Amount::from_sat(last_after_fee), script_pubkey: spk.clone() });
+                }
+            } else {
+                outputs.push(TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() });
+            }
+        }
+        if outputs.is_empty() {
+            return Err(ZincError::WalletError("Salvage produced no spendable outputs".to_string()));
+        }
+
+        let real_inputs: Vec<TxIn> = metas
+            .iter()
+            .map(|m| TxIn {
+                previous_output: m.op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
             })
             .collect();
-        outputs.push(TxOut {
-            value: Amount::from_sat(recoverable),
-            script_pubkey: dest_spk,
-        });
-
-        let mut inputs = dummy_inputs;
-        for input in &mut inputs {
-            input.witness = Witness::new();
-        }
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: inputs,
+            input: real_inputs,
             output: outputs,
         };
-
         let mut psbt = Psbt::from_unsigned_tx(tx)
             .map_err(|e| ZincError::WalletError(format!("Failed to build salvage PSBT: {e}")))?;
-        for (i, (_, txo)) in resolved.iter().enumerate() {
-            psbt.inputs[i].witness_utxo = Some(txo.clone());
+        for (i, m) in metas.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(m.txo.clone());
         }
         Ok(psbt)
     }
@@ -1935,11 +1996,11 @@ impl ZincWallet {
     /// Build an unsigned "smart send" PSBT that pays `recipient` `amount_sats`, automatically salvaging
     /// any inscription-bearing UTXOs among `input_outpoints` (their cardinal sats help fund the send).
     ///
-    /// Inscribed inputs are placed FIRST and each gets its own `target_postage` output (to
-    /// `ordinals_address`) FIRST, so the inscription sats (assumed at offset 0) land in the padded
-    /// outputs; the recipient + change follow. The caller MUST verify the result with `analyze_psbt`
-    /// before signing — the shield uses real offsets and refuses anything that would move/burn an
-    /// inscription (notably the multi-inscription sat-flow edge cases this simple builder can't model).
+    /// Each inscribed input is padded inside its own postage output at the inscription's real sat
+    /// offset; the recipient + change are paid from the contiguous cardinal at the tail (the
+    /// largest inscribed input's trailing cardinal — placed last — plus the clean inputs), and every
+    /// earlier inscribed input's cardinal returns to the wallet as its own change. The caller MUST
+    /// still verify the result with `analyze_psbt` before signing.
     #[allow(clippy::too_many_arguments)]
     pub fn plan_send_with_salvage_tx(
         &self,
@@ -1965,24 +2026,50 @@ impl ZincWallet {
             return Err(ZincError::WalletError("Send amount must be greater than zero".to_string()));
         }
 
-        // Resolve + partition: inscribed inputs (salvaged) first, then clean inputs.
-        let mut inscribed: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
-        let mut clean: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
+        // Resolve every input together with the offset of its inscription (clean inputs carry none).
+        let dust = target_postage.max(546);
+        struct SendInput {
+            op: bitcoin::OutPoint,
+            txo: TxOut,
+            offset: u64,
+        }
+        let mut inscribed: Vec<SendInput> = Vec::new();
+        let mut clean: Vec<SendInput> = Vec::new();
         for op in input_outpoints {
             let txo = self
                 .resolve_owned_txout(op)
                 .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
             if self.inscribed_utxos.contains(op) {
-                inscribed.push((*op, txo));
+                let mut offsets: Vec<u64> = self
+                    .inscriptions
+                    .iter()
+                    .filter(|ins| ins.satpoint.outpoint == *op)
+                    .map(|ins| ins.satpoint.offset)
+                    .collect();
+                offsets.sort_unstable();
+                if offsets.len() > 1 {
+                    return Err(ZincError::WalletError(format!(
+                        "UTXO {op} holds multiple inscriptions; salvage it on its own first"
+                    )));
+                }
+                let offset = offsets.first().copied().unwrap_or(0);
+                if offset.saturating_add(target_postage) > txo.value.to_sat() {
+                    return Err(ZincError::WalletError(format!(
+                        "Inscription in {op} sits too close to the UTXO end to pad to {target_postage} sats"
+                    )));
+                }
+                inscribed.push(SendInput { op: *op, txo, offset });
             } else {
-                clean.push((*op, txo));
+                clean.push(SendInput { op: *op, txo, offset: 0 });
             }
         }
-        let ordered: Vec<(bitcoin::OutPoint, TxOut)> =
-            inscribed.iter().chain(clean.iter()).cloned().collect();
-        let salvage_count = inscribed.len() as u64;
-        let total_input: u64 = ordered.iter().map(|(_, t)| t.value.to_sat()).sum();
-        let postage_total = target_postage.saturating_mul(salvage_count);
+
+        // Largest trailing cardinal LAST among inscribed inputs, right before the clean inputs: only
+        // that last inscribed input's trail + the clean inputs form the contiguous cardinal run the
+        // recipient + change are paid from. Every earlier inscribed input's cardinal is stranded
+        // between postage outputs and returns to the wallet as its own change.
+        inscribed.sort_by_key(|m| m.txo.value.to_sat().saturating_sub(m.offset + target_postage));
+        let ordered: Vec<&SendInput> = inscribed.iter().chain(clean.iter()).collect();
 
         let ord_spk = ordinals_address.script_pubkey();
         let recipient_spk = recipient.script_pubkey();
@@ -1991,14 +2078,14 @@ impl ZincWallet {
         let build_inputs = || {
             ordered
                 .iter()
-                .map(|(op, txo)| {
+                .map(|m| {
                     let mut input = TxIn {
-                        previous_output: *op,
+                        previous_output: m.op,
                         script_sig: ScriptBuf::new(),
                         sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                         witness: Witness::new(),
                     };
-                    if txo.script_pubkey.is_p2tr() {
+                    if m.txo.script_pubkey.is_p2tr() {
                         input.witness.push(vec![0u8; 64]);
                     } else {
                         input.witness.push(vec![0u8; 72]);
@@ -2008,25 +2095,45 @@ impl ZincWallet {
                 })
                 .collect::<Vec<_>>()
         };
-        let postage_outputs = |spk: &ScriptBuf| {
-            (0..salvage_count)
-                .map(|_| TxOut {
-                    value: Amount::from_sat(target_postage),
-                    script_pubkey: spk.clone(),
-                })
-                .collect::<Vec<_>>()
-        };
 
-        // Measure vsize with a change output present (worst case), then decide whether to keep change.
-        let mut dummy_out = postage_outputs(&ord_spk);
-        dummy_out.push(TxOut {
-            value: Amount::from_sat(amount_sats),
-            script_pubkey: recipient_spk.clone(),
-        });
-        dummy_out.push(TxOut {
-            value: Amount::from_sat(0),
-            script_pubkey: change_spk.clone(),
-        });
+        // Leading outputs (everything before the recipient/change pool): each inscribed input's padded
+        // postage in stream order, plus any stranded cardinal as self-change. The last inscribed input
+        // emits only its postage — its trailing cardinal flows into the spend pool below. Sub-dust
+        // lead/trail is folded into that input's postage rather than dropped (which would shift sats).
+        let mut leading: Vec<TxOut> = Vec::new();
+        let inscribed_count = inscribed.len();
+        for (idx, m) in inscribed.iter().enumerate() {
+            let value = m.txo.value.to_sat();
+            let offset = m.offset;
+            let trail = value - offset - target_postage;
+            let mut postage = target_postage;
+            if offset >= dust {
+                leading.push(TxOut { value: Amount::from_sat(offset), script_pubkey: change_spk.clone() });
+            } else {
+                postage += offset;
+            }
+            if idx + 1 == inscribed_count {
+                leading.push(TxOut { value: Amount::from_sat(postage), script_pubkey: ord_spk.clone() });
+            } else if trail >= dust {
+                leading.push(TxOut { value: Amount::from_sat(postage), script_pubkey: ord_spk.clone() });
+                leading.push(TxOut { value: Amount::from_sat(trail), script_pubkey: change_spk.clone() });
+            } else {
+                leading.push(TxOut { value: Amount::from_sat(postage + trail), script_pubkey: ord_spk.clone() });
+            }
+        }
+
+        // Contiguous spendable pool at the tail: last inscribed input's trail + all clean inputs.
+        let last_trail = inscribed
+            .last()
+            .map(|m| m.txo.value.to_sat() - m.offset - target_postage)
+            .unwrap_or(0);
+        let clean_total: u64 = clean.iter().map(|m| m.txo.value.to_sat()).sum();
+        let pool = last_trail + clean_total;
+
+        // Fee from a dummy tx with the leading outputs + recipient + a change placeholder (worst case).
+        let mut dummy_out = leading.clone();
+        dummy_out.push(TxOut { value: Amount::from_sat(amount_sats), script_pubkey: recipient_spk.clone() });
+        dummy_out.push(TxOut { value: Amount::from_sat(0), script_pubkey: change_spk.clone() });
         let dummy_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -2035,26 +2142,18 @@ impl ZincWallet {
         };
         let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
 
-        let change = total_input
-            .checked_sub(postage_total + amount_sats + fee)
-            .ok_or_else(|| {
-                ZincError::WalletError(format!(
-                    "Insufficient funds: have {total_input}, need {} (postage {postage_total} + amount {amount_sats} + fee {fee})",
-                    postage_total + amount_sats + fee
-                ))
-            })?;
+        let change = pool.checked_sub(amount_sats + fee).ok_or_else(|| {
+            ZincError::WalletError(format!(
+                "Insufficient funds: the amount must be covered by the largest inscription's cardinal sats plus clean UTXOs (have {pool}, need {} = amount {amount_sats} + fee {fee})",
+                amount_sats + fee
+            ))
+        })?;
 
-        let mut outputs = postage_outputs(&ord_spk);
-        outputs.push(TxOut {
-            value: Amount::from_sat(amount_sats),
-            script_pubkey: recipient_spk,
-        });
+        let mut outputs = leading;
+        outputs.push(TxOut { value: Amount::from_sat(amount_sats), script_pubkey: recipient_spk });
         // Keep a change output only if it clears dust; otherwise the remainder is absorbed into the fee.
-        if change >= 546 {
-            outputs.push(TxOut {
-                value: Amount::from_sat(change),
-                script_pubkey: change_spk,
-            });
+        if change >= dust {
+            outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
         }
 
         let mut real_inputs = build_inputs();
@@ -2069,8 +2168,8 @@ impl ZincWallet {
         };
         let mut psbt = Psbt::from_unsigned_tx(tx)
             .map_err(|e| ZincError::WalletError(format!("Failed to build send PSBT: {e}")))?;
-        for (i, (_, txo)) in ordered.iter().enumerate() {
-            psbt.inputs[i].witness_utxo = Some(txo.clone());
+        for (i, m) in ordered.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(m.txo.clone());
         }
         Ok(psbt)
     }

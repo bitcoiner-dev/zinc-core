@@ -372,4 +372,179 @@ mod tests {
             "witness_utxo populated for signing"
         );
     }
+
+    // Assert every inscription (its input outpoint + offset-within-the-UTXO) lands inside a
+    // `postage`-sat output of the built PSBT — i.e. it stays padded and never drifts into a
+    // cardinal/recipient output. Sats are assigned to outputs FIFO in input order, so this walks the
+    // stream exactly the way Bitcoin does.
+    fn assert_each_inscription_padded(
+        psbt: &bdk_wallet::bitcoin::Psbt,
+        inscribed: &[(OutPoint, u64)],
+        postage: u64,
+    ) {
+        let mut acc = 0u64;
+        let input_starts: Vec<u64> = psbt
+            .inputs
+            .iter()
+            .map(|inp| {
+                let s = acc;
+                acc += inp.witness_utxo.as_ref().unwrap().value.to_sat();
+                s
+            })
+            .collect();
+        let mut oacc = 0u64;
+        let output_starts: Vec<u64> = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|o| {
+                let s = oacc;
+                oacc += o.value.to_sat();
+                s
+            })
+            .collect();
+        for &(op, off) in inscribed {
+            let i = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .position(|inp| inp.previous_output == op)
+                .expect("inscription input present in psbt");
+            let abs = input_starts[i] + off;
+            let landed = psbt.unsigned_tx.output.iter().enumerate().find_map(|(o, out)| {
+                let start = output_starts[o];
+                if abs >= start && abs < start + out.value.to_sat() {
+                    Some(out.value.to_sat())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(
+                landed,
+                Some(postage),
+                "inscription at {op}:{off} must land in a {postage}-sat postage output (landed in {landed:?})"
+            );
+        }
+    }
+
+    // Build a Regtest wallet funded with the given (value, inscription_offset) inscription UTXOs,
+    // each registered in inscribed_utxos + inscriptions. Returns (builder, outpoints, address).
+    fn wallet_with_inscribed_utxos(
+        specs: &[(u64, u64)],
+    ) -> (crate::builder::ZincWallet, Vec<OutPoint>, bdk_wallet::bitcoin::Address) {
+        let seed = [0u8; 64];
+        let mut builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+        let addr = builder
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
+        let script = addr.script_pubkey();
+        let hash = bdk_wallet::bitcoin::BlockHash::all_zeros();
+        let mut graph = bdk_wallet::chain::TxGraph::default();
+        let mut ops = Vec::new();
+        for (idx, (value, _off)) in specs.iter().enumerate() {
+            let tx = create_dummy_tx(*value, script.clone(), (idx as u8) + 1);
+            let _ = graph.insert_tx(tx.clone());
+            let _ = graph.insert_anchor(
+                tx.compute_txid(),
+                ConfirmationBlockTime {
+                    block_id: bdk_wallet::chain::BlockId { height: 100 + idx as u32, hash },
+                    confirmation_time: 1000 + idx as u64,
+                },
+            );
+            ops.push(OutPoint::new(tx.compute_txid(), 0));
+        }
+        let mut last = std::collections::BTreeMap::new();
+        last.insert(KeychainKind::External, 0);
+        builder
+            .vault_wallet
+            .apply_update(bdk_wallet::Update {
+                tx_update: graph.into(),
+                chain: Default::default(),
+                last_active_indices: last,
+            })
+            .unwrap();
+        for (op, (_value, off)) in ops.iter().zip(specs.iter()) {
+            builder.inscribed_utxos.insert(*op);
+            builder.inscriptions.push(Inscription {
+                id: format!("insc-{}", op.txid),
+                number: 1,
+                satpoint: Satpoint { outpoint: *op, offset: *off },
+                content_type: Some("text/plain".to_string()),
+                value: Some(546),
+                content_length: None,
+                timestamp: None,
+            });
+        }
+        builder.ordinals_verified = true;
+        (builder, ops, addr)
+    }
+
+    // Regression: salvaging TWO inscription UTXOs must keep EACH inscription in its own padded output.
+    // The old builder lumped all postage outputs at the front, so only the first inscription landed in
+    // a 546 output; the second drifted into the big cardinal output (kept ~18k sats instead of 546).
+    #[test]
+    fn test_plan_salvage_multiple_inscriptions_each_padded() {
+        use bdk_wallet::bitcoin::FeeRate;
+        let (builder, ops, addr) = wallet_with_inscribed_utxos(&[(8_000, 0), (20_000, 0)]);
+        let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+        let psbt = builder
+            .plan_salvage_tx(&ops, fee_rate, 546, &addr, &addr)
+            .expect("salvage psbt");
+
+        // Postage + cardinal per input → 4 outputs.
+        assert_eq!(psbt.unsigned_tx.output.len(), 4, "two postage + two cardinal outputs");
+        // The decisive check: BOTH inscriptions land in their own 546-sat output.
+        assert_each_inscription_padded(&psbt, &[(ops[0], 0), (ops[1], 0)], 546);
+        assert!(psbt.inputs.iter().all(|i| i.witness_utxo.is_some()));
+    }
+
+    // Regression: a smart-send funded by salvaging MULTIPLE inscription UTXOs must keep every
+    // inscription padded and must never route an inscription sat into the recipient output.
+    #[test]
+    fn test_plan_send_with_salvage_multiple_inscriptions_keeps_each_padded() {
+        use bdk_wallet::bitcoin::FeeRate;
+        let (mut builder, ops, addr) = wallet_with_inscribed_utxos(&[(8_000, 0), (20_000, 0)]);
+        // Add a clean UTXO; the amount needs salvage (clean alone is short).
+        let clean_tx = create_dummy_tx(5_000, addr.script_pubkey(), 9);
+        let mut graph = bdk_wallet::chain::TxGraph::default();
+        let _ = graph.insert_tx(clean_tx.clone());
+        let _ = graph.insert_anchor(
+            clean_tx.compute_txid(),
+            ConfirmationBlockTime {
+                block_id: bdk_wallet::chain::BlockId {
+                    height: 200,
+                    hash: bdk_wallet::bitcoin::BlockHash::all_zeros(),
+                },
+                confirmation_time: 2000,
+            },
+        );
+        let mut last = std::collections::BTreeMap::new();
+        last.insert(KeychainKind::External, 0);
+        builder
+            .vault_wallet
+            .apply_update(bdk_wallet::Update {
+                tx_update: graph.into(),
+                chain: Default::default(),
+                last_active_indices: last,
+            })
+            .unwrap();
+        let clean_op = OutPoint::new(clean_tx.compute_txid(), 0);
+
+        let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+        let psbt = builder
+            .plan_send_with_salvage_tx(&[clean_op, ops[0], ops[1]], &addr, 20_000, fee_rate, 546, &addr, &addr)
+            .expect("smart-send psbt");
+
+        // Both inscriptions stay padded at 546, and the recipient gets exactly the requested amount.
+        assert_each_inscription_padded(&psbt, &[(ops[0], 0), (ops[1], 0)], 546);
+        assert!(
+            psbt.unsigned_tx.output.iter().any(|o| o.value.to_sat() == 20_000),
+            "recipient output present and inscription-free"
+        );
+        assert!(psbt.inputs.iter().all(|i| i.witness_utxo.is_some()));
+    }
 }

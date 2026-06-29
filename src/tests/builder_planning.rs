@@ -142,13 +142,14 @@ mod tests {
 
     #[test]
     fn salvage_rejects_insufficient_funds() {
-        // 600 sat input cannot cover 546 postage + fee → nothing recoverable.
+        // 600 sat input: only 54 cardinal sats above the 546 postage — below dust, so nothing is
+        // recoverable and the build is refused.
         let (mut w, addr, ops) = funded_wallet(&[600]);
         w.ordinals_verified = true;
         w.inscribed_utxos.insert(ops[0]);
         wallet_err(
             w.plan_salvage_tx(&ops, fee1(), 546, &addr, &addr),
-            "Insufficient funds for salvage",
+            "no cardinal sats above the dust threshold",
         );
     }
 
