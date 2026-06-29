@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-06-28
+
+### Added
+- CPFP anchor output support for listing purchases.
+- `next_unused_taproot_address` for Sparrow / `ord` receive workflows.
+
+### Changed
+- **Breaking:** `ZincWallet::prepare_requests` now takes a `force_full: bool` argument.
+- **Breaking:** `FinalizeListingPurchaseRequest` gains an `anchor_output` field and
+  `FinalizeListingPurchaseResultV1` gains an `anchor_output_index` field; struct-literal
+  construction of these types must be updated.
+
+### Fixed
+- **Security:** hardened BIP-32 child-key derivation so out-of-range derivation indices
+  return an error instead of panicking and aborting the WASM runtime; added safe handling
+  of taproot signature parsing and Ordinal-Shield output-index conversion.
+- Corrected multi-inscription salvage sat-tracking.
+
+### Performance
+- Replaced the hand-rolled hex encoder with `hex::encode`; pre-sized inscription lookup maps.
+
 ## [0.3.0] - 2026-04-17
 
 ### Added
