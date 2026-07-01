@@ -125,7 +125,14 @@ mod tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let m = ZincMnemonic::parse(phrase).unwrap();
         let seed = m.to_seed("");
-        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        // PERFORMANCE OPTIMIZATION (Bolt): Replaced slow format! macro in loop with direct bitwise lookup table mapping
+        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+        let mut out = Vec::with_capacity(seed.len() * 2);
+        for byte in &*seed {
+            out.push(HEX_CHARS[(byte >> 4) as usize]);
+            out.push(HEX_CHARS[(byte & 0x0F) as usize]);
+        }
+        let hex = String::from_utf8(out).unwrap();
         assert_eq!(
             hex,
             "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4"
@@ -135,7 +142,8 @@ mod tests {
     #[test]
     fn parse_rejects_wrong_word_count() {
         // 11 words: a valid-looking phrase with a bad length must fail the checksum.
-        let eleven = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let eleven =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         assert!(ZincMnemonic::parse(eleven).is_err());
     }
 }
