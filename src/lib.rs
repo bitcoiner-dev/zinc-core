@@ -1393,7 +1393,9 @@ impl ZincWasmWallet {
                 .next_unused_taproot_address()
                 .map(|a| a.to_string())
                 .map_err(|e| JsValue::from_str(&e)),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (next address): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (next address): {e}"
+            ))),
         }
     }
 
@@ -1818,7 +1820,10 @@ impl ZincWasmWallet {
                         // Consume any pending full-rescan request: full scan once, then incremental.
                         let force_full = inner.force_next_full;
                         inner.force_next_full = false;
-                        (inner.prepare_requests(force_full), inner.account_generation())
+                        (
+                            inner.prepare_requests(force_full),
+                            inner.account_generation(),
+                        )
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: FAILED TO BORROW INNER: {:?}", e);
@@ -2539,7 +2544,9 @@ impl ZincWasmWallet {
                     &req.destination,
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string())),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planSalvage): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planSalvage): {e}"
+            ))),
         }
     }
 
@@ -2565,7 +2572,9 @@ impl ZincWasmWallet {
             Ok(inner) => inner
                 .plan_consolidate_base64(&req.outpoints, req.fee_rate_sat_vb, &req.destination)
                 .map_err(|e| JsValue::from_str(&e.to_string())),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planConsolidate): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planConsolidate): {e}"
+            ))),
         }
     }
 
@@ -2605,7 +2614,9 @@ impl ZincWasmWallet {
                     &req.change_address,
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string())),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planSendWithSalvage): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planSendWithSalvage): {e}"
+            ))),
         }
     }
 
@@ -3119,3 +3130,16 @@ impl ZincWasmWallet {
 // `tests/wasm_*.rs`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod tests;
+
+/// Quickly converts a byte slice to a hex string.
+/// PERFORMANCE OPTIMIZATION (Bolt):
+/// Replaces formatting allocations and UTF-8 checks with direct nibble lookup map.
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX_CHARS[(byte >> 4) as usize]);
+        out.push(HEX_CHARS[(byte & 0x0f) as usize]);
+    }
+    String::from_utf8(out).unwrap()
+}

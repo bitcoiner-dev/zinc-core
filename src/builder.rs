@@ -1670,8 +1670,7 @@ impl ZincWallet {
             // keeping MIN_SALVAGE_PADDING_SATS per inscription. Runes-only protected UTXOs report 0
             // (handled by dedicated flows). The Ordinal Shield re-verifies any salvage before signing.
             let cardinal_salvageable_sats = if has_inscription {
-                value_sats
-                    .saturating_sub(inscription_ids.len() as u64 * MIN_SALVAGE_PADDING_SATS)
+                value_sats.saturating_sub(inscription_ids.len() as u64 * MIN_SALVAGE_PADDING_SATS)
             } else {
                 0
             };
@@ -1730,7 +1729,8 @@ impl ZincWallet {
 
         if !self.ordinals_verified {
             return Err(ZincError::WalletError(
-                "Ordinals verification failed - safety lock engaged. Please retry sync.".to_string(),
+                "Ordinals verification failed - safety lock engaged. Please retry sync."
+                    .to_string(),
             ));
         }
         if outpoints.is_empty() {
@@ -1774,12 +1774,21 @@ impl ZincWallet {
                     "Inscription in {op} sits too close to the UTXO end to pad to {target_postage} sats"
                 )));
             }
-            metas.push(SalvageInput { op: *op, txo, offset });
+            metas.push(SalvageInput {
+                op: *op,
+                txo,
+                offset,
+            });
         }
 
         // Place the input with the largest trailing cardinal LAST: only the final output's value is
         // reduced by the fee, and that reduction must never shift an earlier inscription's sat.
-        metas.sort_by_key(|m| m.txo.value.to_sat().saturating_sub(m.offset + target_postage));
+        metas.sort_by_key(|m| {
+            m.txo
+                .value
+                .to_sat()
+                .saturating_sub(m.offset + target_postage)
+        });
 
         let ord_spk = ordinals_address.script_pubkey();
         let dest_spk = destination.script_pubkey();
@@ -1828,7 +1837,10 @@ impl ZincWallet {
         }
         let dummy_outputs: Vec<TxOut> = segments
             .iter()
-            .map(|(v, spk, _)| TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() })
+            .map(|(v, spk, _)| TxOut {
+                value: Amount::from_sat(*v),
+                script_pubkey: spk.clone(),
+            })
             .collect();
         let dummy_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -1842,11 +1854,14 @@ impl ZincWallet {
         let last_idx = segments.len() - 1;
         if !segments[last_idx].2 {
             return Err(ZincError::WalletError(
-                "Selected inscriptions have no cardinal sats above the dust threshold to salvage".to_string(),
+                "Selected inscriptions have no cardinal sats above the dust threshold to salvage"
+                    .to_string(),
             ));
         }
         let last_after_fee = segments[last_idx].0.checked_sub(fee).ok_or_else(|| {
-            ZincError::WalletError(format!("Salvage is too small to cover the network fee ({fee} sats)"))
+            ZincError::WalletError(format!(
+                "Salvage is too small to cover the network fee ({fee} sats)"
+            ))
         })?;
 
         let mut outputs: Vec<TxOut> = Vec::with_capacity(segments.len());
@@ -1855,14 +1870,22 @@ impl ZincWallet {
                 // Drop the final cardinal output if the fee leaves it below dust (absorbed into the
                 // fee); dropping the LAST output never shifts an inscription.
                 if last_after_fee >= dust {
-                    outputs.push(TxOut { value: Amount::from_sat(last_after_fee), script_pubkey: spk.clone() });
+                    outputs.push(TxOut {
+                        value: Amount::from_sat(last_after_fee),
+                        script_pubkey: spk.clone(),
+                    });
                 }
             } else {
-                outputs.push(TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() });
+                outputs.push(TxOut {
+                    value: Amount::from_sat(*v),
+                    script_pubkey: spk.clone(),
+                });
             }
         }
         if outputs.is_empty() {
-            return Err(ZincError::WalletError("Salvage produced no spendable outputs".to_string()));
+            return Err(ZincError::WalletError(
+                "Salvage produced no spendable outputs".to_string(),
+            ));
         }
 
         let real_inputs: Vec<TxIn> = metas
@@ -1971,8 +1994,9 @@ impl ZincWallet {
             }],
         };
 
-        let mut psbt = Psbt::from_unsigned_tx(tx)
-            .map_err(|e| ZincError::WalletError(format!("Failed to build consolidation PSBT: {e}")))?;
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| {
+            ZincError::WalletError(format!("Failed to build consolidation PSBT: {e}"))
+        })?;
         for (i, (_, txo)) in resolved.iter().enumerate() {
             psbt.inputs[i].witness_utxo = Some(txo.clone());
         }
@@ -1992,7 +2016,9 @@ impl ZincWallet {
         let dest_addr = Address::from_str(destination)
             .map_err(|e| ZincError::ConfigError(format!("Invalid destination address: {e}")))?
             .require_network(network)
-            .map_err(|e| ZincError::ConfigError(format!("Destination address network mismatch: {e}")))?;
+            .map_err(|e| {
+                ZincError::ConfigError(format!("Destination address network mismatch: {e}"))
+            })?;
         let mut ops = Vec::with_capacity(outpoints.len());
         for s in outpoints {
             ops.push(
@@ -2027,14 +2053,19 @@ impl ZincWallet {
 
         if !self.ordinals_verified {
             return Err(ZincError::WalletError(
-                "Ordinals verification failed - safety lock engaged. Please retry sync.".to_string(),
+                "Ordinals verification failed - safety lock engaged. Please retry sync."
+                    .to_string(),
             ));
         }
         if input_outpoints.is_empty() {
-            return Err(ZincError::WalletError("No inputs provided for send".to_string()));
+            return Err(ZincError::WalletError(
+                "No inputs provided for send".to_string(),
+            ));
         }
         if amount_sats == 0 {
-            return Err(ZincError::WalletError("Send amount must be greater than zero".to_string()));
+            return Err(ZincError::WalletError(
+                "Send amount must be greater than zero".to_string(),
+            ));
         }
 
         // Resolve every input together with the offset of its inscription (clean inputs carry none).
@@ -2069,9 +2100,17 @@ impl ZincWallet {
                         "Inscription in {op} sits too close to the UTXO end to pad to {target_postage} sats"
                     )));
                 }
-                inscribed.push(SendInput { op: *op, txo, offset });
+                inscribed.push(SendInput {
+                    op: *op,
+                    txo,
+                    offset,
+                });
             } else {
-                clean.push(SendInput { op: *op, txo, offset: 0 });
+                clean.push(SendInput {
+                    op: *op,
+                    txo,
+                    offset: 0,
+                });
             }
         }
 
@@ -2079,7 +2118,12 @@ impl ZincWallet {
         // that last inscribed input's trail + the clean inputs form the contiguous cardinal run the
         // recipient + change are paid from. Every earlier inscribed input's cardinal is stranded
         // between postage outputs and returns to the wallet as its own change.
-        inscribed.sort_by_key(|m| m.txo.value.to_sat().saturating_sub(m.offset + target_postage));
+        inscribed.sort_by_key(|m| {
+            m.txo
+                .value
+                .to_sat()
+                .saturating_sub(m.offset + target_postage)
+        });
         let ordered: Vec<&SendInput> = inscribed.iter().chain(clean.iter()).collect();
 
         let ord_spk = ordinals_address.script_pubkey();
@@ -2119,17 +2163,32 @@ impl ZincWallet {
             let trail = value - offset - target_postage;
             let mut postage = target_postage;
             if offset >= dust {
-                leading.push(TxOut { value: Amount::from_sat(offset), script_pubkey: change_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(offset),
+                    script_pubkey: change_spk.clone(),
+                });
             } else {
                 postage += offset;
             }
             if idx + 1 == inscribed_count {
-                leading.push(TxOut { value: Amount::from_sat(postage), script_pubkey: ord_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(postage),
+                    script_pubkey: ord_spk.clone(),
+                });
             } else if trail >= dust {
-                leading.push(TxOut { value: Amount::from_sat(postage), script_pubkey: ord_spk.clone() });
-                leading.push(TxOut { value: Amount::from_sat(trail), script_pubkey: change_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(postage),
+                    script_pubkey: ord_spk.clone(),
+                });
+                leading.push(TxOut {
+                    value: Amount::from_sat(trail),
+                    script_pubkey: change_spk.clone(),
+                });
             } else {
-                leading.push(TxOut { value: Amount::from_sat(postage + trail), script_pubkey: ord_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(postage + trail),
+                    script_pubkey: ord_spk.clone(),
+                });
             }
         }
 
@@ -2143,8 +2202,14 @@ impl ZincWallet {
 
         // Fee from a dummy tx with the leading outputs + recipient + a change placeholder (worst case).
         let mut dummy_out = leading.clone();
-        dummy_out.push(TxOut { value: Amount::from_sat(amount_sats), script_pubkey: recipient_spk.clone() });
-        dummy_out.push(TxOut { value: Amount::from_sat(0), script_pubkey: change_spk.clone() });
+        dummy_out.push(TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient_spk.clone(),
+        });
+        dummy_out.push(TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: change_spk.clone(),
+        });
         let dummy_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -2161,10 +2226,16 @@ impl ZincWallet {
         })?;
 
         let mut outputs = leading;
-        outputs.push(TxOut { value: Amount::from_sat(amount_sats), script_pubkey: recipient_spk });
+        outputs.push(TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient_spk,
+        });
         // Keep a change output only if it clears dust; otherwise the remainder is absorbed into the fee.
         if change >= dust {
-            outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
+            outputs.push(TxOut {
+                value: Amount::from_sat(change),
+                script_pubkey: change_spk,
+            });
         }
 
         let mut real_inputs = build_inputs();
@@ -2204,7 +2275,9 @@ impl ZincWallet {
             Address::from_str(s)
                 .map_err(|e| ZincError::ConfigError(format!("Invalid {what} address: {e}")))?
                 .require_network(network)
-                .map_err(|e| ZincError::ConfigError(format!("{what} address network mismatch: {e}")))
+                .map_err(|e| {
+                    ZincError::ConfigError(format!("{what} address network mismatch: {e}"))
+                })
         };
         let recipient_addr = parse_addr(recipient, "recipient")?;
         let ord_addr = parse_addr(ordinals_address, "ordinals")?;
@@ -2243,11 +2316,15 @@ impl ZincWallet {
         let ord_addr = Address::from_str(ordinals_address)
             .map_err(|e| ZincError::ConfigError(format!("Invalid ordinals address: {e}")))?
             .require_network(network)
-            .map_err(|e| ZincError::ConfigError(format!("Ordinals address network mismatch: {e}")))?;
+            .map_err(|e| {
+                ZincError::ConfigError(format!("Ordinals address network mismatch: {e}"))
+            })?;
         let dest_addr = Address::from_str(destination)
             .map_err(|e| ZincError::ConfigError(format!("Invalid destination address: {e}")))?
             .require_network(network)
-            .map_err(|e| ZincError::ConfigError(format!("Destination address network mismatch: {e}")))?;
+            .map_err(|e| {
+                ZincError::ConfigError(format!("Destination address network mismatch: {e}"))
+            })?;
         let mut ops = Vec::with_capacity(outpoints.len());
         for s in outpoints {
             ops.push(
@@ -3255,8 +3332,9 @@ impl ZincWallet {
 
                                 // SECURITY: avoid panic if the assembled taproot signature
                                 // is malformed; surface an error instead of aborting.
-                                let tap_sig = bitcoin::taproot::Signature::from_slice(&final_sig)
-                                    .map_err(|e| format!("Invalid taproot signature: {e}"))?;
+                                let tap_sig =
+                                    bitcoin::taproot::Signature::from_slice(&final_sig)
+                                        .map_err(|e| format!("Invalid taproot signature: {e}"))?;
                                 input.tap_script_sigs.insert((*pubkey, leaf_hash), tap_sig);
                                 key_found = true;
                             }

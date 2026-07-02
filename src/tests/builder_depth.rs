@@ -89,7 +89,11 @@ mod tests {
         w.inscribed_utxos.insert(ops[0]); // protect the 10k UTXO
 
         let bal = w.get_balance();
-        assert_eq!(bal.total.confirmed.to_sat(), 60_000, "raw total counts everything");
+        assert_eq!(
+            bal.total.confirmed.to_sat(),
+            60_000,
+            "raw total counts everything"
+        );
         assert_eq!(
             bal.spendable.confirmed.to_sat(),
             50_000,
@@ -134,7 +138,10 @@ mod tests {
         let w = unified();
         let tap = w.get_taproot_public_key(0).expect("taproot pubkey");
         assert!(hex::decode(&tap).is_ok(), "taproot pubkey is hex: {tap}");
-        assert!(matches!(tap.len(), 64 | 66), "x-only/compressed pubkey hex: {tap}");
+        assert!(
+            matches!(tap.len(), 64 | 66),
+            "x-only/compressed pubkey hex: {tap}"
+        );
 
         let dual = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0u8; 64]))
             .with_scheme(AddressScheme::Dual)
@@ -156,7 +163,10 @@ mod tests {
     fn sign_message_signs_own_address_and_rejects_foreign() {
         let w = unified();
         let own = w.peek_taproot_address(0).to_string();
-        assert!(w.sign_message(&own, "gm").is_ok(), "wallet signs its own address");
+        assert!(
+            w.sign_message(&own, "gm").is_ok(),
+            "wallet signs its own address"
+        );
 
         // A valid Regtest taproot address owned by a different seed must be rejected.
         let other = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([7u8; 64]))
@@ -164,14 +174,19 @@ mod tests {
             .build()
             .unwrap();
         let foreign = other.peek_taproot_address(0).to_string();
-        assert!(w.sign_message(&foreign, "gm").is_err(), "cannot sign a foreign address");
+        assert!(
+            w.sign_message(&foreign, "gm").is_err(),
+            "cannot sign a foreign address"
+        );
     }
 
     #[test]
     fn bip322_simple_signature_is_hex() {
         let w = unified();
         let own = w.peek_taproot_address(0).to_string();
-        let sig = w.sign_bip322_simple_hex(&own, "hello bip322").expect("bip322 sig");
+        let sig = w
+            .sign_bip322_simple_hex(&own, "hello bip322")
+            .expect("bip322 sig");
         assert!(hex::decode(&sig).is_ok() && !sig.is_empty());
     }
 
