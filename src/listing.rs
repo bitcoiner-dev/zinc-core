@@ -180,7 +180,7 @@ impl ListingEnvelopeV1 {
     /// Compute the SHA-256 listing id hex string.
     pub fn listing_id_hex(&self) -> Result<String, ZincError> {
         let digest = self.listing_id_digest()?;
-        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+        Ok(crate::bytes_to_hex(&digest))
     }
 }
 

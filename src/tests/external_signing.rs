@@ -121,14 +121,18 @@ mod tests {
     #[test]
     fn prepare_external_rejects_invalid_base64() {
         let (w, _) = setup();
-        let err = w.prepare_external_sign_psbt("!!!not base64!!!", None).unwrap_err();
+        let err = w
+            .prepare_external_sign_psbt("!!!not base64!!!", None)
+            .unwrap_err();
         assert!(err.contains("Invalid base64"), "{err}");
     }
 
     #[test]
     fn prepare_external_rejects_invalid_psbt() {
         let (w, _) = setup();
-        let err = w.prepare_external_sign_psbt(&b64(&[1, 2, 3, 4]), None).unwrap_err();
+        let err = w
+            .prepare_external_sign_psbt(&b64(&[1, 2, 3, 4]), None)
+            .unwrap_err();
         assert!(err.contains("Invalid PSBT"), "{err}");
     }
 
@@ -140,7 +144,9 @@ mod tests {
             sighash: None,
             finalize: false,
         };
-        let err = w.prepare_external_sign_psbt(&unsigned, Some(opts)).unwrap_err();
+        let err = w
+            .prepare_external_sign_psbt(&unsigned, Some(opts))
+            .unwrap_err();
         assert!(err.contains("out of bounds"), "{err}");
     }
 
@@ -152,7 +158,9 @@ mod tests {
             sighash: None,
             finalize: false,
         };
-        let err = w.prepare_external_sign_psbt(&unsigned, Some(opts)).unwrap_err();
+        let err = w
+            .prepare_external_sign_psbt(&unsigned, Some(opts))
+            .unwrap_err();
         assert!(err.contains("duplicated"), "{err}");
     }
 
@@ -165,7 +173,9 @@ mod tests {
             sighash: Some(0x83),
             finalize: false,
         };
-        let err = w.prepare_external_sign_psbt(&unsigned, Some(opts)).unwrap_err();
+        let err = w
+            .prepare_external_sign_psbt(&unsigned, Some(opts))
+            .unwrap_err();
         assert!(err.contains("Sighash type is not allowed"), "{err}");
     }
 
@@ -177,7 +187,9 @@ mod tests {
         psbt.inputs[0].witness_utxo = None;
         let stripped = b64(&psbt.serialize());
 
-        let prepared = w.prepare_external_sign_psbt(&stripped, None).expect("prepare");
+        let prepared = w
+            .prepare_external_sign_psbt(&stripped, None)
+            .expect("prepare");
         let out = decode(&prepared);
         assert!(
             out.inputs[0].witness_utxo.is_some(),
