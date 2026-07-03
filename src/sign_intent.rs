@@ -1754,21 +1754,16 @@ fn ensure_event_tags_match(
     Ok(())
 }
 
-fn bytes_to_hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(nibble_to_hex(byte >> 4));
-        out.push(nibble_to_hex(byte & 0x0f));
-    }
-    out
-}
+// PERFORMANCE OPTIMIZATION (Bolt): Replaced String::push(char) with zero-dependency bitwise/nibble mapping and pushing to Vec<u8> to avoid UTF-8 validation overhead.
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
-fn nibble_to_hex(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => '0',
+fn bytes_to_hex_lower(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX_CHARS[(byte >> 4) as usize]);
+        out.push(HEX_CHARS[(byte & 0x0f) as usize]);
     }
+    String::from_utf8(out).unwrap()
 }
 
 fn ensure_event_pairing_hash_matches(
