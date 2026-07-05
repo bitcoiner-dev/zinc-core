@@ -20,8 +20,14 @@ fn to_json(js: JsValue) -> serde_json::Value {
 }
 
 fn wallet() -> ZincWasmWallet {
-    ZincWasmWallet::new("regtest", PHRASE, Some("unified".to_string()), None, Some(0))
-        .expect("seed wallet")
+    ZincWasmWallet::new(
+        "regtest",
+        PHRASE,
+        Some("unified".to_string()),
+        None,
+        Some(0),
+    )
+    .expect("seed wallet")
 }
 
 // ---------------- crypto free functions ----------------
@@ -30,7 +36,14 @@ fn wallet() -> ZincWasmWallet {
 fn generate_wallet_12_returns_phrase_and_12_words() {
     let v = to_json(generate_wallet(12).expect("generate 12"));
     assert_eq!(v["words"].as_array().expect("words array").len(), 12);
-    assert_eq!(v["phrase"].as_str().expect("phrase").split_whitespace().count(), 12);
+    assert_eq!(
+        v["phrase"]
+            .as_str()
+            .expect("phrase")
+            .split_whitespace()
+            .count(),
+        12
+    );
 }
 
 #[wasm_bindgen_test]
@@ -42,13 +55,18 @@ fn generate_wallet_24_returns_24_words() {
 #[wasm_bindgen_test]
 fn validate_mnemonic_accepts_valid_and_rejects_invalid() {
     assert!(validate_mnemonic(PHRASE));
-    assert!(!validate_mnemonic("totally not a valid mnemonic phrase at all"));
+    assert!(!validate_mnemonic(
+        "totally not a valid mnemonic phrase at all"
+    ));
 }
 
 #[wasm_bindgen_test]
 fn derive_address_returns_regtest_taproot_and_rejects_bad_network() {
     let addr = derive_address(PHRASE, "regtest").expect("derive");
-    assert!(addr.starts_with("bcrt1p"), "expected regtest taproot, got {addr}");
+    assert!(
+        addr.starts_with("bcrt1p"),
+        "expected regtest taproot, got {addr}"
+    );
     assert!(derive_address(PHRASE, "not-a-network").is_err());
 }
 
@@ -68,7 +86,10 @@ fn decrypt_wallet_with_wrong_password_errors() {
 #[wasm_bindgen_test]
 fn encrypt_then_decrypt_secret_round_trips() {
     let enc = encrypt_secret("super-secret-value", "pw").expect("encrypt secret");
-    assert_eq!(decrypt_secret(&enc, "pw").expect("decrypt secret"), "super-secret-value");
+    assert_eq!(
+        decrypt_secret(&enc, "pw").expect("decrypt secret"),
+        "super-secret-value"
+    );
 }
 
 // ---------------- constructors ----------------
@@ -76,20 +97,35 @@ fn encrypt_then_decrypt_secret_round_trips() {
 #[wasm_bindgen_test]
 fn new_encrypted_builds_a_usable_wallet() {
     let enc = encrypt_wallet(PHRASE, "pw").expect("encrypt");
-    let w = ZincWasmWallet::new_encrypted("regtest", &enc, "pw", Some("unified".to_string()), None, Some(0))
-        .expect("new_encrypted");
+    let w = ZincWasmWallet::new_encrypted(
+        "regtest",
+        &enc,
+        "pw",
+        Some("unified".to_string()),
+        None,
+        Some(0),
+    )
+    .expect("new_encrypted");
     let accts = to_json(w.get_accounts(1).expect("accounts"));
     assert_eq!(accts.as_array().expect("accounts array").len(), 1);
-    assert_eq!(accts[0]["taprootPublicKey"].as_str().expect("pubkey").len(), 64);
+    assert_eq!(
+        accts[0]["taprootPublicKey"].as_str().expect("pubkey").len(),
+        64
+    );
 }
 
 #[wasm_bindgen_test]
 fn new_encrypted_with_wrong_password_errors() {
     let enc = encrypt_wallet(PHRASE, "pw").expect("encrypt");
-    assert!(
-        ZincWasmWallet::new_encrypted("regtest", &enc, "nope", Some("unified".to_string()), None, Some(0))
-            .is_err()
-    );
+    assert!(ZincWasmWallet::new_encrypted(
+        "regtest",
+        &enc,
+        "nope",
+        Some("unified".to_string()),
+        None,
+        Some(0)
+    )
+    .is_err());
 }
 
 #[wasm_bindgen_test]
@@ -138,7 +174,10 @@ fn get_addresses_returns_taproot_and_aliased_payment_fields() {
     let addrs = to_json(wallet().get_addresses().expect("addresses"));
     assert!(addrs.is_object(), "get_addresses returns a keyed object");
     let taproot = addrs["taproot"].as_str().expect("taproot field");
-    assert!(taproot.starts_with("bcrt1p"), "expected regtest taproot, got {taproot}");
+    assert!(
+        taproot.starts_with("bcrt1p"),
+        "expected regtest taproot, got {taproot}"
+    );
     // Unified scheme aliases payment + the legacy `vault` field onto taproot.
     assert_eq!(addrs["payment"].as_str(), Some(taproot));
     assert_eq!(addrs["vault"].as_str(), Some(taproot));

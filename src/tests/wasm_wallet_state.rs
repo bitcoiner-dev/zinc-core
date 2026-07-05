@@ -18,6 +18,8 @@ mod tests {
             Some("unified".to_string()),
             None,
             Some(0),
+            None,
+            None,
         )
         .expect("wallet should initialize")
     }

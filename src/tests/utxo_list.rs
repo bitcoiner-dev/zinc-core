@@ -114,15 +114,22 @@ mod tests {
 
         let rune = find(op_rune);
         assert!(rune.is_inscribed, "rune utxo should be protected");
-        assert!(!rune.has_inscription, "rune utxo has no inscription metadata");
-        assert_eq!(rune.cardinal_salvageable_sats, 0, "no salvage without inscription metadata");
+        assert!(
+            !rune.has_inscription,
+            "rune utxo has no inscription metadata"
+        );
+        assert_eq!(
+            rune.cardinal_salvageable_sats, 0,
+            "no salvage without inscription metadata"
+        );
 
         let insc = find(op_insc);
         assert!(insc.is_inscribed && insc.has_inscription);
         assert_eq!(insc.inscription_ids, vec!["insc-1".to_string()]);
         assert_eq!(insc.inscription_offsets, vec![0]);
         assert_eq!(
-            insc.cardinal_salvageable_sats, 10_000 - 546,
+            insc.cardinal_salvageable_sats,
+            10_000 - 546,
             "salvageable = value minus one padding"
         );
 
@@ -130,7 +137,10 @@ mod tests {
         assert!(!btc.is_inscribed && !btc.has_inscription);
         assert_eq!(btc.cardinal_salvageable_sats, 0);
         assert_eq!(btc.value_sats, 314_000_000);
-        assert!(btc.address.is_some(), "address should resolve from keychain");
+        assert!(
+            btc.address.is_some(),
+            "address should resolve from keychain"
+        );
         assert_eq!(btc.wallet_role, "taproot");
     }
 
@@ -147,9 +157,16 @@ mod tests {
             .unwrap();
 
         // Reveal a few addresses and fund index 2 (a USED, non-zero index).
-        let _ = builder.vault_wallet.reveal_next_address(KeychainKind::External);
-        let _ = builder.vault_wallet.reveal_next_address(KeychainKind::External);
-        let addr2 = builder.vault_wallet.peek_address(KeychainKind::External, 2).address;
+        let _ = builder
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External);
+        let _ = builder
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External);
+        let addr2 = builder
+            .vault_wallet
+            .peek_address(KeychainKind::External, 2)
+            .address;
 
         let mut graph = bdk_wallet::chain::TxGraph::default();
         let tx = create_dummy_tx(50_000, addr2.script_pubkey(), 7);
@@ -232,15 +249,31 @@ mod tests {
         let fee_rate = FeeRate::from_sat_per_vb(1).unwrap();
         // Pass inputs clean-first to prove the builder reorders the inscribed input to the front.
         let psbt = builder
-            .plan_send_with_salvage_tx(&[clean_op, insc_op], &addr, 45_000, fee_rate, 546, &addr, &addr)
+            .plan_send_with_salvage_tx(
+                &[clean_op, insc_op],
+                &addr,
+                45_000,
+                fee_rate,
+                546,
+                &addr,
+                &addr,
+            )
             .expect("smart-send psbt");
 
         assert_eq!(
             psbt.unsigned_tx.input[0].previous_output, insc_op,
             "inscribed input must be first"
         );
-        assert_eq!(psbt.unsigned_tx.output[0].value.to_sat(), 546, "inscription postage output first");
-        assert_eq!(psbt.unsigned_tx.output[1].value.to_sat(), 45_000, "recipient output");
+        assert_eq!(
+            psbt.unsigned_tx.output[0].value.to_sat(),
+            546,
+            "inscription postage output first"
+        );
+        assert_eq!(
+            psbt.unsigned_tx.output[1].value.to_sat(),
+            45_000,
+            "recipient output"
+        );
         assert!(psbt.unsigned_tx.output.len() >= 2);
         assert!(psbt.inputs.iter().all(|i| i.witness_utxo.is_some()));
     }
@@ -293,7 +326,11 @@ mod tests {
         let psbt = builder
             .plan_consolidate_tx(&[op1, op2], fee_rate, &addr)
             .expect("consolidate psbt");
-        assert_eq!(psbt.unsigned_tx.output.len(), 1, "single consolidated output");
+        assert_eq!(
+            psbt.unsigned_tx.output.len(),
+            1,
+            "single consolidated output"
+        );
         let out = psbt.unsigned_tx.output[0].value.to_sat();
         assert!(out > 0 && out < 100_000, "output = total - fee, got {out}");
         assert!(psbt.inputs.iter().all(|i| i.witness_utxo.is_some()));
@@ -301,7 +338,9 @@ mod tests {
         // Protected UTXO must be refused.
         builder.inscribed_utxos.insert(op2);
         assert!(
-            builder.plan_consolidate_tx(&[op1, op2], fee_rate, &addr).is_err(),
+            builder
+                .plan_consolidate_tx(&[op1, op2], fee_rate, &addr)
+                .is_err(),
             "must refuse a protected UTXO"
         );
     }
@@ -411,14 +450,19 @@ mod tests {
                 .position(|inp| inp.previous_output == op)
                 .expect("inscription input present in psbt");
             let abs = input_starts[i] + off;
-            let landed = psbt.unsigned_tx.output.iter().enumerate().find_map(|(o, out)| {
-                let start = output_starts[o];
-                if abs >= start && abs < start + out.value.to_sat() {
-                    Some(out.value.to_sat())
-                } else {
-                    None
-                }
-            });
+            let landed = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .enumerate()
+                .find_map(|(o, out)| {
+                    let start = output_starts[o];
+                    if abs >= start && abs < start + out.value.to_sat() {
+                        Some(out.value.to_sat())
+                    } else {
+                        None
+                    }
+                });
             assert_eq!(
                 landed,
                 Some(postage),
@@ -431,7 +475,11 @@ mod tests {
     // each registered in inscribed_utxos + inscriptions. Returns (builder, outpoints, address).
     fn wallet_with_inscribed_utxos(
         specs: &[(u64, u64)],
-    ) -> (crate::builder::ZincWallet, Vec<OutPoint>, bdk_wallet::bitcoin::Address) {
+    ) -> (
+        crate::builder::ZincWallet,
+        Vec<OutPoint>,
+        bdk_wallet::bitcoin::Address,
+    ) {
         let seed = [0u8; 64];
         let mut builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
             .with_scheme(AddressScheme::Unified)
@@ -451,7 +499,10 @@ mod tests {
             let _ = graph.insert_anchor(
                 tx.compute_txid(),
                 ConfirmationBlockTime {
-                    block_id: bdk_wallet::chain::BlockId { height: 100 + idx as u32, hash },
+                    block_id: bdk_wallet::chain::BlockId {
+                        height: 100 + idx as u32,
+                        hash,
+                    },
                     confirmation_time: 1000 + idx as u64,
                 },
             );
@@ -472,7 +523,10 @@ mod tests {
             builder.inscriptions.push(Inscription {
                 id: format!("insc-{}", op.txid),
                 number: 1,
-                satpoint: Satpoint { outpoint: *op, offset: *off },
+                satpoint: Satpoint {
+                    outpoint: *op,
+                    offset: *off,
+                },
                 content_type: Some("text/plain".to_string()),
                 value: Some(546),
                 content_length: None,
@@ -496,7 +550,11 @@ mod tests {
             .expect("salvage psbt");
 
         // Postage + cardinal per input → 4 outputs.
-        assert_eq!(psbt.unsigned_tx.output.len(), 4, "two postage + two cardinal outputs");
+        assert_eq!(
+            psbt.unsigned_tx.output.len(),
+            4,
+            "two postage + two cardinal outputs"
+        );
         // The decisive check: BOTH inscriptions land in their own 546-sat output.
         assert_each_inscription_padded(&psbt, &[(ops[0], 0), (ops[1], 0)], 546);
         assert!(psbt.inputs.iter().all(|i| i.witness_utxo.is_some()));
@@ -536,13 +594,24 @@ mod tests {
 
         let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
         let psbt = builder
-            .plan_send_with_salvage_tx(&[clean_op, ops[0], ops[1]], &addr, 20_000, fee_rate, 546, &addr, &addr)
+            .plan_send_with_salvage_tx(
+                &[clean_op, ops[0], ops[1]],
+                &addr,
+                20_000,
+                fee_rate,
+                546,
+                &addr,
+                &addr,
+            )
             .expect("smart-send psbt");
 
         // Both inscriptions stay padded at 546, and the recipient gets exactly the requested amount.
         assert_each_inscription_padded(&psbt, &[(ops[0], 0), (ops[1], 0)], 546);
         assert!(
-            psbt.unsigned_tx.output.iter().any(|o| o.value.to_sat() == 20_000),
+            psbt.unsigned_tx
+                .output
+                .iter()
+                .any(|o| o.value.to_sat() == 20_000),
             "recipient output present and inscription-free"
         );
         assert!(psbt.inputs.iter().all(|i| i.witness_utxo.is_some()));

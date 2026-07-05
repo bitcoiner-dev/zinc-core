@@ -1428,7 +1428,8 @@ fn test_input_and_output_shift_maintains_valid_signature_and_secures_payout() {
         script_pubkey: ScriptBuf::new(),
     });
     psbt.inputs.insert(0, dummy_psbt_input);
-    psbt.outputs.insert(0, bdk_wallet::bitcoin::psbt::Output::default());
+    psbt.outputs
+        .insert(0, bdk_wallet::bitcoin::psbt::Output::default());
 
     let seller = XOnlyPublicKey::from_str(SELLER_PUBKEY_HEX).expect("seller pubkey");
     let (_control_block, (script, leaf_version)) = psbt.inputs[1]
@@ -1450,7 +1451,7 @@ fn test_input_and_output_shift_maintains_valid_signature_and_secures_payout() {
 
     let sighash = SighashCache::new(&psbt.unsigned_tx)
         .taproot_script_spend_signature_hash(
-            1, // Verify for index 1
+            1,                               // Verify for index 1
             &Prevouts::One(1, &prevouts[1]), // ANYONECANPAY
             leaf_hash,
             TapSighashType::SinglePlusAnyoneCanPay,
@@ -1492,7 +1493,7 @@ fn test_prevent_replay_attack_on_different_utxo() {
     // Attacker tries to replay the signature on a different UTXO
     psbt.unsigned_tx.input[0].previous_output = OutPoint::new(sample_txid(0x88), 0);
     // Even if they keep the same value/script in witness_utxo, the signature commits to the prevout TXID/VOUT.
-    
+
     let seller = XOnlyPublicKey::from_str(SELLER_PUBKEY_HEX).expect("seller pubkey");
     let (_control_block, (script, leaf_version)) = psbt.inputs[0]
         .tap_scripts
@@ -1571,10 +1572,9 @@ fn test_prevent_payout_script_substitution_attack() {
     );
 
     // Now substitute the payout script with an attacker's script
-    let attacker_script = ScriptBuf::from_hex(
-        "5120f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
-    )
-    .expect("attacker script");
+    let attacker_script =
+        ScriptBuf::from_hex("5120f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+            .expect("attacker script");
     psbt.unsigned_tx.output[0].script_pubkey = attacker_script;
 
     let mutated_sighash = SighashCache::new(&psbt.unsigned_tx)

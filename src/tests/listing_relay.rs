@@ -118,8 +118,14 @@ fn parse_ok_frame_rejects_malformed_inputs() {
     assert!(p("not json").is_none(), "non-json");
     assert!(p(r#"["OK","id",true]"#).is_none(), "wrong length");
     assert!(p(r#"["NOTOK","id",true,"m"]"#).is_none(), "wrong tag");
-    assert!(p(r#"["OK","other",true,"m"]"#).is_none(), "event id mismatch");
-    assert!(p(r#"["OK","id","yes","m"]"#).is_none(), "accepted not a bool");
+    assert!(
+        p(r#"["OK","other",true,"m"]"#).is_none(),
+        "event id mismatch"
+    );
+    assert!(
+        p(r#"["OK","id","yes","m"]"#).is_none(),
+        "accepted not a bool"
+    );
 }
 
 #[test]
@@ -128,5 +134,8 @@ fn parse_event_frame_rejects_malformed_inputs() {
     assert!(p("not json").is_none(), "non-json");
     assert!(p(r#"["EVENT","sub"]"#).is_none(), "wrong length");
     assert!(p(r#"["NOTEVENT","sub",{}]"#).is_none(), "wrong tag");
-    assert!(p(r#"["EVENT","sub",{"bad":"event"}]"#).is_none(), "invalid event payload");
+    assert!(
+        p(r#"["EVENT","sub",{"bad":"event"}]"#).is_none(),
+        "invalid event payload"
+    );
 }

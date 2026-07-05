@@ -219,7 +219,15 @@ mod tests {
         let (mut w, addr, _) = funded_wallet(&[50_000]);
         w.ordinals_verified = true;
         wallet_err(
-            w.plan_send_with_salvage_tx(&[foreign_outpoint(0xCC)], &addr, 1_000, fee1(), 546, &addr, &addr),
+            w.plan_send_with_salvage_tx(
+                &[foreign_outpoint(0xCC)],
+                &addr,
+                1_000,
+                fee1(),
+                546,
+                &addr,
+                &addr,
+            ),
             "not found in wallet",
         );
     }

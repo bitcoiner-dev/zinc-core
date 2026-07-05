@@ -127,7 +127,10 @@ mod tests {
             .await
             .err()
             .expect("malformed json must error");
-        assert!(err.to_string().contains("Failed to parse Address JSON"), "{err}");
+        assert!(
+            err.to_string().contains("Failed to parse Address JSON"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

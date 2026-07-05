@@ -95,7 +95,10 @@ mod tests {
     #[test]
     fn receive_tx_is_labeled_and_amounts_match() {
         let mut w = unified();
-        let addr = w.vault_wallet.reveal_next_address(KeychainKind::External).address;
+        let addr = w
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
         let tx = dummy_tx(50_000, addr.script_pubkey(), 1);
         fund(&mut w.vault_wallet, &[(&tx, Some(100))], 0);
 
@@ -104,13 +107,19 @@ mod tests {
         assert_eq!(txs[0].tx_type, "receive");
         assert_eq!(txs[0].amount_sats, 50_000);
         assert!(txs[0].confirmation_time.is_some());
-        assert!(!txs[0].parent_txids.is_empty(), "funding input recorded as a parent txid");
+        assert!(
+            !txs[0].parent_txids.is_empty(),
+            "funding input recorded as a parent txid"
+        );
     }
 
     #[test]
     fn spend_tx_is_labeled_send_with_negative_amount() {
         let mut w = unified();
-        let addr = w.vault_wallet.reveal_next_address(KeychainKind::External).address;
+        let addr = w
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
         let spk = addr.script_pubkey();
 
         // External (non-wallet) destination for the spend.
@@ -122,7 +131,11 @@ mod tests {
 
         let fund_tx = dummy_tx(50_000, spk, 1);
         let spend = spend_tx(OutPoint::new(fund_tx.compute_txid(), 0), 40_000, ext_spk);
-        fund(&mut w.vault_wallet, &[(&fund_tx, Some(100)), (&spend, Some(101))], 0);
+        fund(
+            &mut w.vault_wallet,
+            &[(&fund_tx, Some(100)), (&spend, Some(101))],
+            0,
+        );
 
         let txs = w.get_transactions(50);
         let send = txs
@@ -130,13 +143,20 @@ mod tests {
             .find(|t| t.txid == spend.compute_txid().to_string())
             .expect("spend tx present");
         assert_eq!(send.tx_type, "send");
-        assert!(send.amount_sats < 0, "spend reduces balance: {}", send.amount_sats);
+        assert!(
+            send.amount_sats < 0,
+            "spend reduces balance: {}",
+            send.amount_sats
+        );
     }
 
     #[test]
     fn sorts_unconfirmed_first_then_newest_confirmed() {
         let mut w = unified();
-        let addr = w.vault_wallet.reveal_next_address(KeychainKind::External).address;
+        let addr = w
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
         let spk = addr.script_pubkey();
 
         let old = dummy_tx(10_000, spk.clone(), 1); // height 100
@@ -150,21 +170,40 @@ mod tests {
 
         let txs = w.get_transactions(50);
         assert_eq!(txs.len(), 3);
-        assert_eq!(txs[0].txid, pending.compute_txid().to_string(), "unconfirmed first");
+        assert_eq!(
+            txs[0].txid,
+            pending.compute_txid().to_string(),
+            "unconfirmed first"
+        );
         assert!(txs[0].confirmation_time.is_none());
-        assert_eq!(txs[1].txid, new.compute_txid().to_string(), "newest confirmed next");
-        assert_eq!(txs[2].txid, old.compute_txid().to_string(), "oldest confirmed last");
+        assert_eq!(
+            txs[1].txid,
+            new.compute_txid().to_string(),
+            "newest confirmed next"
+        );
+        assert_eq!(
+            txs[2].txid,
+            old.compute_txid().to_string(),
+            "oldest confirmed last"
+        );
     }
 
     #[test]
     fn limit_caps_the_number_of_results() {
         let mut w = unified();
-        let addr = w.vault_wallet.reveal_next_address(KeychainKind::External).address;
+        let addr = w
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
         let spk = addr.script_pubkey();
         let a = dummy_tx(10_000, spk.clone(), 1);
         let b = dummy_tx(20_000, spk.clone(), 2);
         let c = dummy_tx(30_000, spk, 3);
-        fund(&mut w.vault_wallet, &[(&a, Some(100)), (&b, Some(101)), (&c, Some(102))], 0);
+        fund(
+            &mut w.vault_wallet,
+            &[(&a, Some(100)), (&b, Some(101)), (&c, Some(102))],
+            0,
+        );
 
         assert_eq!(w.get_transactions(2).len(), 2);
     }
@@ -200,13 +239,19 @@ mod tests {
 
         let txs = w.get_transactions(50);
         assert_eq!(txs.len(), 1, "same txid from both wallets is deduplicated");
-        assert_eq!(txs[0].amount_sats, 17_000, "amounts from both branches are summed");
+        assert_eq!(
+            txs[0].amount_sats, 17_000,
+            "amounts from both branches are summed"
+        );
     }
 
     #[test]
     fn inscriptions_are_attached_to_their_transaction() {
         let mut w = unified();
-        let addr = w.vault_wallet.reveal_next_address(KeychainKind::External).address;
+        let addr = w
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
         let tx = dummy_tx(10_000, addr.script_pubkey(), 1);
         fund(&mut w.vault_wallet, &[(&tx, Some(100))], 0);
 
@@ -214,7 +259,10 @@ mod tests {
         w.inscriptions.push(Inscription {
             id: "insc-xyz".to_string(),
             number: 7,
-            satpoint: Satpoint { outpoint: op, offset: 0 },
+            satpoint: Satpoint {
+                outpoint: op,
+                offset: 0,
+            },
             content_type: Some("text/plain".to_string()),
             value: Some(10_000),
             content_length: None,
