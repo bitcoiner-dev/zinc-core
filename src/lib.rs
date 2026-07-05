@@ -1006,6 +1006,32 @@ impl ZincWasmWallet {
         }
     }
 
+    fn parse_scheme_label(scheme: Option<&str>) -> AddressScheme {
+        match scheme {
+            Some("dual") => AddressScheme::Dual,
+            _ => AddressScheme::Unified,
+        }
+    }
+
+    fn parse_derivation_mode_label(mode: Option<&str>) -> Result<DerivationMode, JsValue> {
+        match mode {
+            Some("index") => Ok(DerivationMode::Index),
+            Some("account") | None => Ok(DerivationMode::Account),
+            _ => Err(JsValue::from_str("Invalid derivation mode")),
+        }
+    }
+
+    fn parse_payment_address_type_label(
+        address_type: Option<&str>,
+    ) -> Result<PaymentAddressType, JsValue> {
+        match address_type {
+            Some("nested") => Ok(PaymentAddressType::NestedSegwit),
+            Some("legacy") => Ok(PaymentAddressType::Legacy),
+            Some("native") | None => Ok(PaymentAddressType::NativeSegwit),
+            _ => Err(JsValue::from_str("Invalid payment address type")),
+        }
+    }
+
     fn build_seed_wallet(
         network: Network,
         phrase: &str,
@@ -1189,19 +1215,21 @@ impl ZincWasmWallet {
         scheme_str: Option<String>,
         persistence_json: Option<String>,
         account_index: Option<u32>,
+        derivation_mode_str: Option<String>,
+        payment_address_type_str: Option<String>,
     ) -> Result<ZincWasmWallet, JsValue> {
         let network_enum = Self::parse_network_label(network)?;
-        let scheme = match scheme_str.as_deref() {
-            Some("dual") => AddressScheme::Dual,
-            _ => AddressScheme::Unified,
-        };
+        let scheme = Self::parse_scheme_label(scheme_str.as_deref());
+        let derivation_mode = Self::parse_derivation_mode_label(derivation_mode_str.as_deref())?;
+        let payment_address_type =
+            Self::parse_payment_address_type_label(payment_address_type_str.as_deref())?;
         let active_index = account_index.unwrap_or(0);
         let wallet = Self::build_seed_wallet(
             network_enum,
             phrase,
             scheme,
-            DerivationMode::Account,
-            PaymentAddressType::NativeSegwit,
+            derivation_mode,
+            payment_address_type,
             active_index,
             persistence_json.as_deref(),
         )?;
@@ -1212,8 +1240,8 @@ impl ZincWasmWallet {
             state: Cell::new(WalletState {
                 network: network_enum,
                 scheme,
-                derivation_mode: DerivationMode::Account,
-                payment_address_type: PaymentAddressType::NativeSegwit,
+                derivation_mode,
+                payment_address_type,
                 account_index: active_index,
             }),
             vitality: VITALITY_MAGIC,
@@ -1229,12 +1257,14 @@ impl ZincWasmWallet {
         scheme_str: Option<String>,
         persistence_json: Option<String>,
         account_index: Option<u32>,
+        derivation_mode_str: Option<String>,
+        payment_address_type_str: Option<String>,
     ) -> Result<ZincWasmWallet, JsValue> {
         let network_enum = Self::parse_network_label(network)?;
-        let scheme = match scheme_str.as_deref() {
-            Some("dual") => AddressScheme::Dual,
-            _ => AddressScheme::Unified,
-        };
+        let scheme = Self::parse_scheme_label(scheme_str.as_deref());
+        let derivation_mode = Self::parse_derivation_mode_label(derivation_mode_str.as_deref())?;
+        let payment_address_type =
+            Self::parse_payment_address_type_label(payment_address_type_str.as_deref())?;
         let active_index = account_index.unwrap_or(0);
 
         let result = decrypt_wallet_internal(encrypted_json, password)
@@ -1243,8 +1273,8 @@ impl ZincWasmWallet {
             network_enum,
             &result.phrase,
             scheme,
-            DerivationMode::Account,
-            PaymentAddressType::NativeSegwit,
+            derivation_mode,
+            payment_address_type,
             active_index,
             persistence_json.as_deref(),
         )?;
@@ -1255,8 +1285,8 @@ impl ZincWasmWallet {
             state: Cell::new(WalletState {
                 network: network_enum,
                 scheme,
-                derivation_mode: DerivationMode::Account,
-                payment_address_type: PaymentAddressType::NativeSegwit,
+                derivation_mode,
+                payment_address_type,
                 account_index: active_index,
             }),
             vitality: VITALITY_MAGIC,
@@ -1393,7 +1423,9 @@ impl ZincWasmWallet {
                 .next_unused_taproot_address()
                 .map(|a| a.to_string())
                 .map_err(|e| JsValue::from_str(&e)),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (next address): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (next address): {e}"
+            ))),
         }
     }
 
@@ -1652,6 +1684,40 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Return address-level candidates for dApp payment/ordinals role selection.
+    #[wasm_bindgen(js_name = getDappAddressCandidates)]
+    pub fn get_dapp_address_candidates(&self, scan_depth: Option<u32>) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => serde_wasm_bindgen::to_value(&inner.dapp_address_candidates(scan_depth))
+                .map_err(|e| {
+                    JsValue::from_str(&format!("Failed to serialize dApp address candidates: {e}"))
+                }),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (get_dapp_address_candidates): {e}"
+            ))),
+        }
+    }
+
+    /// Reveal selected dApp addresses so unused external addresses are persisted for scanning.
+    #[wasm_bindgen(js_name = confirmDappAddressSelection)]
+    pub fn confirm_dapp_address_selection(
+        &self,
+        payment_address: String,
+        ordinals_address: String,
+        scan_depth: Option<u32>,
+    ) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .confirm_dapp_address_selection(&payment_address, &ordinals_address, scan_depth)
+                .map_err(|e| JsValue::from_str(&e)),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (confirm_dapp_address_selection): {e}"
+            ))),
+        }
+    }
+
     /// Return cached read-only rune balances currently loaded in wallet state.
     #[wasm_bindgen(js_name = getRuneBalances)]
     pub fn get_rune_balances(&self) -> Result<JsValue, JsValue> {
@@ -1818,7 +1884,10 @@ impl ZincWasmWallet {
                         // Consume any pending full-rescan request: full scan once, then incremental.
                         let force_full = inner.force_next_full;
                         inner.force_next_full = false;
-                        (inner.prepare_requests(force_full), inner.account_generation())
+                        (
+                            inner.prepare_requests(force_full),
+                            inner.account_generation(),
+                        )
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: FAILED TO BORROW INNER: {:?}", e);
@@ -2539,7 +2608,9 @@ impl ZincWasmWallet {
                     &req.destination,
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string())),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planSalvage): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planSalvage): {e}"
+            ))),
         }
     }
 
@@ -2565,7 +2636,9 @@ impl ZincWasmWallet {
             Ok(inner) => inner
                 .plan_consolidate_base64(&req.outpoints, req.fee_rate_sat_vb, &req.destination)
                 .map_err(|e| JsValue::from_str(&e.to_string())),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planConsolidate): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planConsolidate): {e}"
+            ))),
         }
     }
 
@@ -2605,7 +2678,9 @@ impl ZincWasmWallet {
                     &req.change_address,
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string())),
-            Err(e) => Err(JsValue::from_str(&format!("Wallet busy (planSendWithSalvage): {e}"))),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planSendWithSalvage): {e}"
+            ))),
         }
     }
 

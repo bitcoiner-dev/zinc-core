@@ -488,7 +488,9 @@ impl OrdClient {
         const RUNE_FETCH_BATCH: usize = 8;
         let mut collected = Vec::new();
         for batch in addresses.chunks(RUNE_FETCH_BATCH) {
-            let futures = batch.iter().map(|address| self.get_rune_balances(address.as_str()));
+            let futures = batch
+                .iter()
+                .map(|address| self.get_rune_balances(address.as_str()));
             for result in futures_util::future::join_all(futures).await {
                 collected.extend(result?);
             }
@@ -555,8 +557,10 @@ impl OrdClient {
         }
 
         // Coverage check (fail closed): every requested outpoint must be present in the response.
-        let returned: HashSet<&str> =
-            entries.iter().filter_map(|e| e.outpoint.as_deref()).collect();
+        let returned: HashSet<&str> = entries
+            .iter()
+            .filter_map(|e| e.outpoint.as_deref())
+            .collect();
         for requested in outpoints {
             if !returned.contains(requested.as_str()) {
                 return Err(OrdError::RequestFailed(format!(
@@ -571,7 +575,11 @@ impl OrdClient {
         let mut rune_balances: Vec<RuneBalance> = Vec::new();
         for e in &entries {
             if e.has_protected_assets() {
-                if let Some(op) = e.outpoint.as_deref().and_then(|s| s.parse::<OutPoint>().ok()) {
+                if let Some(op) = e
+                    .outpoint
+                    .as_deref()
+                    .and_then(|s| s.parse::<OutPoint>().ok())
+                {
                     protected_outpoints.insert(op);
                 }
             }
@@ -583,7 +591,9 @@ impl OrdClient {
         const INS_BATCH: usize = 8;
         let mut inscriptions = Vec::new();
         for chunk in inscription_ids.chunks(INS_BATCH) {
-            let detail_futures = chunk.iter().map(|id| self.get_inscription_details(id.as_str()));
+            let detail_futures = chunk
+                .iter()
+                .map(|id| self.get_inscription_details(id.as_str()));
             for result in futures_util::future::join_all(detail_futures).await {
                 inscriptions.push(result?);
             }

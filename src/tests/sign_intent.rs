@@ -1196,9 +1196,11 @@ fn verify_sign_seller_input_scope_rejects_payout_value_mismatch() {
 
 #[test]
 fn approved_receipt_without_psbt_or_artifact_is_rejected() {
-    let signed_intent =
-        SignedSignIntentV1::new(buyer_offer_intent("inscription-123", 100_000, 2), agent_secret_hex())
-            .expect("signed intent");
+    let signed_intent = SignedSignIntentV1::new(
+        buyer_offer_intent("inscription-123", 100_000, 2),
+        agent_secret_hex(),
+    )
+    .expect("signed intent");
     let request = sample_pairing_request();
     let receipt = SignIntentReceiptV1 {
         version: 1,

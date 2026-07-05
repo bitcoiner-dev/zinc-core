@@ -5,13 +5,14 @@
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::builder::{AddressScheme, Seed64, WalletBuilder, ZincWallet};
+    use crate::builder::{AddressScheme, DerivationMode, Seed64, WalletBuilder, ZincWallet};
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::{
         Amount, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid,
     };
     use bdk_wallet::chain::{BlockId, ConfirmationBlockTime, TxGraph};
     use bdk_wallet::KeychainKind;
+    use std::collections::HashSet;
 
     fn dummy_tx(value: u64, script_pubkey: ScriptBuf, uid: u8) -> Transaction {
         let mut hash_bytes = [0u8; 32];
@@ -89,7 +90,11 @@ mod tests {
         w.inscribed_utxos.insert(ops[0]); // protect the 10k UTXO
 
         let bal = w.get_balance();
-        assert_eq!(bal.total.confirmed.to_sat(), 60_000, "raw total counts everything");
+        assert_eq!(
+            bal.total.confirmed.to_sat(),
+            60_000,
+            "raw total counts everything"
+        );
         assert_eq!(
             bal.spendable.confirmed.to_sat(),
             50_000,
@@ -106,6 +111,65 @@ mod tests {
         let bal = w.get_balance();
         assert_eq!(bal.spendable.confirmed.to_sat(), 0);
         assert_eq!(bal.spendable.trusted_pending.to_sat(), 30_000);
+    }
+
+    #[test]
+    fn dapp_candidates_include_known_utxos_before_active_index() {
+        let mut w = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([9u8; 64]))
+            .with_scheme(AddressScheme::Unified)
+            .with_derivation_mode(DerivationMode::Index)
+            .with_account_index(5)
+            .build()
+            .unwrap();
+
+        let _revealed: Vec<_> = w
+            .vault_wallet
+            .reveal_addresses_to(KeychainKind::External, 2)
+            .collect();
+        let funded_address = w
+            .vault_wallet
+            .peek_address(KeychainKind::External, 2)
+            .address
+            .to_string();
+        let tx = dummy_tx(
+            42_000,
+            w.vault_wallet
+                .peek_address(KeychainKind::External, 2)
+                .address
+                .script_pubkey(),
+            42,
+        );
+        let mut graph = TxGraph::<ConfirmationBlockTime>::default();
+        let hash = BlockHash::all_zeros();
+        let _ = graph.insert_tx(tx.clone());
+        let _ = graph.insert_anchor(
+            tx.compute_txid(),
+            ConfirmationBlockTime {
+                block_id: BlockId { height: 120, hash },
+                confirmation_time: 1_200,
+            },
+        );
+        let mut last = std::collections::BTreeMap::new();
+        last.insert(KeychainKind::External, 2);
+        w.vault_wallet
+            .apply_update(bdk_wallet::Update {
+                tx_update: graph.into(),
+                chain: None,
+                last_active_indices: last,
+            })
+            .unwrap();
+        w.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new());
+
+        let funded = w
+            .dapp_address_candidates(Some(3))
+            .into_iter()
+            .find(|candidate| candidate.address == funded_address)
+            .expect("funded older address should be selectable");
+
+        assert_eq!(funded.derivation_index, 2);
+        assert_eq!(funded.clean_btc_sats, 42_000);
+        assert!(funded.eligible_payment);
+        assert!(w.sign_message(&funded.address, "connect").is_ok());
     }
 
     #[test]
@@ -134,7 +198,10 @@ mod tests {
         let w = unified();
         let tap = w.get_taproot_public_key(0).expect("taproot pubkey");
         assert!(hex::decode(&tap).is_ok(), "taproot pubkey is hex: {tap}");
-        assert!(matches!(tap.len(), 64 | 66), "x-only/compressed pubkey hex: {tap}");
+        assert!(
+            matches!(tap.len(), 64 | 66),
+            "x-only/compressed pubkey hex: {tap}"
+        );
 
         let dual = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0u8; 64]))
             .with_scheme(AddressScheme::Dual)
@@ -156,7 +223,10 @@ mod tests {
     fn sign_message_signs_own_address_and_rejects_foreign() {
         let w = unified();
         let own = w.peek_taproot_address(0).to_string();
-        assert!(w.sign_message(&own, "gm").is_ok(), "wallet signs its own address");
+        assert!(
+            w.sign_message(&own, "gm").is_ok(),
+            "wallet signs its own address"
+        );
 
         // A valid Regtest taproot address owned by a different seed must be rejected.
         let other = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([7u8; 64]))
@@ -164,14 +234,19 @@ mod tests {
             .build()
             .unwrap();
         let foreign = other.peek_taproot_address(0).to_string();
-        assert!(w.sign_message(&foreign, "gm").is_err(), "cannot sign a foreign address");
+        assert!(
+            w.sign_message(&foreign, "gm").is_err(),
+            "cannot sign a foreign address"
+        );
     }
 
     #[test]
     fn bip322_simple_signature_is_hex() {
         let w = unified();
         let own = w.peek_taproot_address(0).to_string();
-        let sig = w.sign_bip322_simple_hex(&own, "hello bip322").expect("bip322 sig");
+        let sig = w
+            .sign_bip322_simple_hex(&own, "hello bip322")
+            .expect("bip322 sig");
         assert!(hex::decode(&sig).is_ok() && !sig.is_empty());
     }
 

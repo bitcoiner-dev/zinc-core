@@ -135,7 +135,8 @@ mod tests {
     #[test]
     fn parse_rejects_wrong_word_count() {
         // 11 words: a valid-looking phrase with a bad length must fail the checksum.
-        let eleven = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let eleven =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         assert!(ZincMnemonic::parse(eleven).is_err());
     }
 }

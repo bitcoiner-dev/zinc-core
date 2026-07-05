@@ -1,11 +1,11 @@
 use crate::ordinals::shield::{
     analyze_psbt, analyze_psbt_with_scope, audit_psbt, is_safe_to_spend, WarningLevel,
 };
-use std::collections::HashSet;
 use bitcoin::psbt::{Input, Psbt};
 use bitcoin::transaction::Transaction;
 use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, Txid};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 // Helper to create a dummy PSBT
@@ -136,7 +136,9 @@ fn test_salvage_high_offset_burn_is_blocked() {
         "a mid/high-offset inscription that falls in the fee tail must be flagged Danger"
     );
     assert!(
-        result.inscriptions_burned.contains(&"Inscription 0".to_string()),
+        result
+            .inscriptions_burned
+            .contains(&"Inscription 0".to_string()),
         "the burned inscription must be reported so the gate can refuse it"
     );
 }
@@ -417,16 +419,20 @@ fn test_analyze_sighash_warning() {
 #[test]
 fn is_safe_to_spend_reflects_membership() {
     let op = OutPoint {
-        txid: Txid::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap(),
+        txid: Txid::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            .unwrap(),
         vout: 7,
     };
     let mut protected = HashSet::new();
-    assert!(is_safe_to_spend(&op, &protected), "unknown outpoint is spendable");
+    assert!(
+        is_safe_to_spend(&op, &protected),
+        "unknown outpoint is spendable"
+    );
     protected.insert(op);
-    assert!(!is_safe_to_spend(&op, &protected), "protected outpoint is not spendable");
+    assert!(
+        !is_safe_to_spend(&op, &protected),
+        "protected outpoint is not spendable"
+    );
 }
 
 #[test]

@@ -444,6 +444,8 @@ pub struct ZincBalance {
 
 /// Minimum sats kept with an inscription when estimating salvageable cardinal value.
 const MIN_SALVAGE_PADDING_SATS: u64 = 546;
+const DEFAULT_DAPP_ADDRESS_SCAN_DEPTH: u32 = 20;
+const DAPP_SIGN_ADDRESS_SEARCH_DEPTH: u32 = 1000;
 
 /// A single wallet UTXO with ordinal-awareness, for coin-control UIs (camelCase over WASM).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -475,6 +477,49 @@ pub struct UtxoItem {
     pub inscription_offsets: Vec<u64>,
     /// Conservative estimate of cardinal sats recoverable via salvage (0 unless inscription-bearing).
     pub cardinal_salvageable_sats: u64,
+}
+
+/// Address-level dApp connect candidate with core-owned role eligibility.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DappAddressCandidate {
+    /// Derived address shown to the user.
+    pub address: String,
+    /// Public key for the derived address, when available.
+    pub public_key: Option<String>,
+    /// Provider address type (`p2tr`, `p2wpkh`, `p2sh`, or `p2pkh`).
+    pub address_type: String,
+    /// Owning wallet role (`taproot` or `payment`).
+    pub wallet_role: String,
+    /// Keychain for this selectable address (`external` receive or `internal` change).
+    pub keychain: String,
+    /// Absolute derivation index within the active logical account and keychain.
+    pub derivation_index: u32,
+    /// Clean, non-protected BTC currently held by this address.
+    pub clean_btc_sats: u64,
+    /// Confirmed subset of `clean_btc_sats`, useful for default selection.
+    pub clean_confirmed_btc_sats: u64,
+    /// Count of protected assets/UTXOs known on this address.
+    pub protected_asset_count: u32,
+    /// Known inscription ids on this address.
+    pub inscription_ids: Vec<String>,
+    /// True only when ordinals protection and metadata have both completed.
+    pub classification_complete: bool,
+    /// True when this address may be exposed as the payment/BTC dApp address.
+    pub eligible_payment: bool,
+    /// True when this address may be exposed as the ordinals/collectibles dApp address.
+    pub eligible_ordinals: bool,
+    /// User-facing reason this address cannot be selected as payment.
+    pub payment_disabled_reason: Option<String>,
+    /// User-facing reason this address cannot be selected as ordinals.
+    pub ordinals_disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OwnedAddressMatch {
+    purpose: u32,
+    keychain: KeychainKind,
+    absolute_index: u32,
 }
 
 /// Account summary returned by discovery and account listing APIs.
@@ -676,6 +721,16 @@ impl ZincWallet {
         account: u32,
         index: u32,
     ) -> Result<String, String> {
+        self.derive_public_key_for_chain_internal(purpose, account, 0, index)
+    }
+
+    fn derive_public_key_for_chain_internal(
+        &self,
+        purpose: u32,
+        account: u32,
+        chain: u32,
+        index: u32,
+    ) -> Result<String, String> {
         use bitcoin::secp256k1::Secp256k1;
         let secp = Secp256k1::new();
 
@@ -683,7 +738,6 @@ impl ZincWallet {
             WalletKind::Seed { master_xprv } => {
                 let network = self.vault_wallet.network();
                 let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
-                let chain = 0; // External
 
                 let derivation_path = [
                     // SECURITY: return an error instead of panicking if a derivation index
@@ -1637,6 +1691,279 @@ impl ZincWallet {
         out
     }
 
+    /// Return address-level candidates for dApp payment/ordinals role selection.
+    ///
+    /// External receive addresses are scanned for unused ordinals slots; internal/change
+    /// addresses are included only when they already hold known UTXOs. Core owns eligibility
+    /// so UI code does not infer safety from address strings or local UTXO summaries.
+    pub fn dapp_address_candidates(&self, scan_depth: Option<u32>) -> Vec<DappAddressCandidate> {
+        let scan_depth = scan_depth.unwrap_or(DEFAULT_DAPP_ADDRESS_SCAN_DEPTH).max(1);
+        let mut out = Vec::new();
+
+        self.collect_dapp_address_candidates_from(
+            &self.vault_wallet,
+            "taproot",
+            "p2tr",
+            86,
+            scan_depth,
+            &mut out,
+        );
+
+        if let Some(payment_wallet) = &self.payment_wallet {
+            self.collect_dapp_address_candidates_from(
+                payment_wallet,
+                "payment",
+                self.payment_provider_address_type(),
+                self.dual_payment_purpose(),
+                scan_depth,
+                &mut out,
+            );
+        }
+
+        out
+    }
+
+    fn collect_dapp_address_candidates_from(
+        &self,
+        wallet: &Wallet,
+        wallet_role: &str,
+        address_type: &str,
+        purpose: u32,
+        scan_depth: u32,
+        out: &mut Vec<DappAddressCandidate>,
+    ) {
+        let active_receive_index = self.active_receive_index();
+        let mut indexed_keychains: std::collections::BTreeSet<(KeychainKind, u32)> = (0
+            ..scan_depth)
+            .map(|offset| {
+                (
+                    KeychainKind::External,
+                    active_receive_index.saturating_add(offset),
+                )
+            })
+            .collect();
+        for utxo in wallet.list_unspent() {
+            indexed_keychains.insert((utxo.keychain, utxo.derivation_index));
+        }
+
+        let classification_complete = self.ordinals_verified && self.ordinals_metadata_complete;
+        let is_taproot = address_type == "p2tr";
+        let account = self.active_derivation_account();
+
+        for (keychain, absolute_index) in indexed_keychains {
+            let address = wallet
+                .peek_address(keychain, absolute_index)
+                .address
+                .to_string();
+            let chain = match keychain {
+                KeychainKind::External => 0,
+                KeychainKind::Internal => 1,
+            };
+            let keychain_label = match keychain {
+                KeychainKind::External => "external",
+                KeychainKind::Internal => "internal",
+            };
+            let public_key = self
+                .derive_public_key_for_chain_internal(purpose, account, chain, absolute_index)
+                .ok();
+            let mut clean_btc_sats = 0u64;
+            let mut clean_confirmed_btc_sats = 0u64;
+            let mut protected_asset_count = 0u32;
+            let mut inscription_ids = Vec::new();
+
+            for utxo in wallet.list_unspent() {
+                if utxo.keychain != keychain || utxo.derivation_index != absolute_index {
+                    continue;
+                }
+
+                let mut utxo_inscription_ids = Vec::new();
+                for inscription in &self.inscriptions {
+                    if inscription.satpoint.outpoint == utxo.outpoint {
+                        utxo_inscription_ids.push(inscription.id.clone());
+                    }
+                }
+                let is_protected = self.inscribed_utxos.contains(&utxo.outpoint)
+                    || !utxo_inscription_ids.is_empty();
+
+                if is_protected {
+                    protected_asset_count = protected_asset_count
+                        .saturating_add(utxo_inscription_ids.len().max(1) as u32);
+                    inscription_ids.extend(utxo_inscription_ids);
+                } else {
+                    let value_sats = utxo.txout.value.to_sat();
+                    clean_btc_sats = clean_btc_sats.saturating_add(value_sats);
+                    if matches!(
+                        utxo.chain_position,
+                        bdk_chain::ChainPosition::Confirmed { .. }
+                    ) {
+                        clean_confirmed_btc_sats =
+                            clean_confirmed_btc_sats.saturating_add(value_sats);
+                    }
+                }
+            }
+
+            inscription_ids.sort();
+            inscription_ids.dedup();
+
+            let has_clean_btc = clean_btc_sats > 0;
+            let has_protected_assets = protected_asset_count > 0;
+            let is_mixed = has_clean_btc && has_protected_assets;
+            let eligible_payment =
+                classification_complete && has_clean_btc && !has_protected_assets;
+            let eligible_ordinals = classification_complete && is_taproot && !has_clean_btc;
+
+            let payment_disabled_reason = if eligible_payment {
+                None
+            } else if !classification_complete {
+                Some("Sync ordinals before connecting".to_string())
+            } else if is_mixed {
+                Some("Holds BTC and artifacts; split in coin control first".to_string())
+            } else if has_protected_assets {
+                Some("Holds inscriptions; split in coin control first".to_string())
+            } else {
+                Some("No spendable BTC".to_string())
+            };
+
+            let ordinals_disabled_reason = if eligible_ordinals {
+                None
+            } else if !classification_complete {
+                Some("Sync ordinals before connecting".to_string())
+            } else if !is_taproot {
+                Some("Collectibles address must be Taproot".to_string())
+            } else if is_mixed {
+                Some("Holds BTC and artifacts; split in coin control first".to_string())
+            } else if has_clean_btc {
+                Some("Holds regular BTC; split in coin control first".to_string())
+            } else {
+                None
+            };
+
+            out.push(DappAddressCandidate {
+                address,
+                public_key,
+                address_type: address_type.to_string(),
+                wallet_role: wallet_role.to_string(),
+                keychain: keychain_label.to_string(),
+                derivation_index: absolute_index,
+                clean_btc_sats,
+                clean_confirmed_btc_sats,
+                protected_asset_count,
+                inscription_ids,
+                classification_complete,
+                eligible_payment,
+                eligible_ordinals,
+                payment_disabled_reason,
+                ordinals_disabled_reason,
+            });
+        }
+    }
+
+    fn payment_provider_address_type(&self) -> &'static str {
+        match self.payment_address_type {
+            PaymentAddressType::NativeSegwit => "p2wpkh",
+            PaymentAddressType::NestedSegwit => "p2sh",
+            PaymentAddressType::Legacy => "p2pkh",
+        }
+    }
+
+    fn find_owned_address(&self, address: &str, scan_depth: u32) -> Option<OwnedAddressMatch> {
+        self.find_owned_address_in_wallet(&self.vault_wallet, address, 86, scan_depth)
+            .or_else(|| {
+                self.payment_wallet.as_ref().and_then(|wallet| {
+                    self.find_owned_address_in_wallet(
+                        wallet,
+                        address,
+                        self.dual_payment_purpose(),
+                        scan_depth,
+                    )
+                })
+            })
+    }
+
+    fn find_owned_address_in_wallet(
+        &self,
+        wallet: &Wallet,
+        address: &str,
+        purpose: u32,
+        scan_depth: u32,
+    ) -> Option<OwnedAddressMatch> {
+        let active_receive_index = self.active_receive_index();
+        let mut indexed_keychains: std::collections::BTreeSet<(KeychainKind, u32)> =
+            std::collections::BTreeSet::new();
+        for offset in 0..scan_depth.max(1) {
+            indexed_keychains.insert((KeychainKind::External, offset));
+            indexed_keychains.insert((KeychainKind::Internal, offset));
+            indexed_keychains.insert((
+                KeychainKind::External,
+                active_receive_index.saturating_add(offset),
+            ));
+        }
+        for utxo in wallet.list_unspent() {
+            indexed_keychains.insert((utxo.keychain, utxo.derivation_index));
+        }
+
+        indexed_keychains
+            .into_iter()
+            .find_map(|(keychain, absolute_index)| {
+                let candidate = wallet
+                    .peek_address(keychain, absolute_index)
+                    .address
+                    .to_string();
+                if candidate == address {
+                    Some(OwnedAddressMatch {
+                        purpose,
+                        keychain,
+                        absolute_index,
+                    })
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Reveal selected dApp addresses so selections are included in persistence.
+    pub fn confirm_dapp_address_selection(
+        &mut self,
+        payment_address: &str,
+        ordinals_address: &str,
+        scan_depth: Option<u32>,
+    ) -> Result<(), String> {
+        let scan_depth = scan_depth.unwrap_or(DEFAULT_DAPP_ADDRESS_SCAN_DEPTH).max(1);
+        let payment_match = self
+            .find_owned_address(payment_address, scan_depth)
+            .ok_or_else(|| "Selected BTC address is not owned by this wallet".to_string())?;
+        let ordinals_match = self
+            .find_owned_address(ordinals_address, scan_depth)
+            .ok_or_else(|| {
+                "Selected collectibles address is not owned by this wallet".to_string()
+            })?;
+
+        self.reveal_address_match(payment_match)?;
+        self.reveal_address_match(ordinals_match)?;
+        Ok(())
+    }
+
+    fn reveal_address_match(&mut self, address_match: OwnedAddressMatch) -> Result<(), String> {
+        let absolute_index = address_match.absolute_index;
+
+        if address_match.purpose == 86 {
+            let _revealed: Vec<_> = self
+                .vault_wallet
+                .reveal_addresses_to(address_match.keychain, absolute_index)
+                .collect();
+            return Ok(());
+        }
+
+        let payment_wallet = self
+            .payment_wallet
+            .as_mut()
+            .ok_or_else(|| "Payment wallet not initialized".to_string())?;
+        let _revealed: Vec<_> = payment_wallet
+            .reveal_addresses_to(address_match.keychain, absolute_index)
+            .collect();
+        Ok(())
+    }
+
     fn collect_utxos_from(&self, wallet: &Wallet, role: &str, tip: u32, out: &mut Vec<UtxoItem>) {
         for u in wallet.list_unspent() {
             let (confirmed, confirmations) = match &u.chain_position {
@@ -1670,8 +1997,7 @@ impl ZincWallet {
             // keeping MIN_SALVAGE_PADDING_SATS per inscription. Runes-only protected UTXOs report 0
             // (handled by dedicated flows). The Ordinal Shield re-verifies any salvage before signing.
             let cardinal_salvageable_sats = if has_inscription {
-                value_sats
-                    .saturating_sub(inscription_ids.len() as u64 * MIN_SALVAGE_PADDING_SATS)
+                value_sats.saturating_sub(inscription_ids.len() as u64 * MIN_SALVAGE_PADDING_SATS)
             } else {
                 0
             };
@@ -1730,7 +2056,8 @@ impl ZincWallet {
 
         if !self.ordinals_verified {
             return Err(ZincError::WalletError(
-                "Ordinals verification failed - safety lock engaged. Please retry sync.".to_string(),
+                "Ordinals verification failed - safety lock engaged. Please retry sync."
+                    .to_string(),
             ));
         }
         if outpoints.is_empty() {
@@ -1774,12 +2101,21 @@ impl ZincWallet {
                     "Inscription in {op} sits too close to the UTXO end to pad to {target_postage} sats"
                 )));
             }
-            metas.push(SalvageInput { op: *op, txo, offset });
+            metas.push(SalvageInput {
+                op: *op,
+                txo,
+                offset,
+            });
         }
 
         // Place the input with the largest trailing cardinal LAST: only the final output's value is
         // reduced by the fee, and that reduction must never shift an earlier inscription's sat.
-        metas.sort_by_key(|m| m.txo.value.to_sat().saturating_sub(m.offset + target_postage));
+        metas.sort_by_key(|m| {
+            m.txo
+                .value
+                .to_sat()
+                .saturating_sub(m.offset + target_postage)
+        });
 
         let ord_spk = ordinals_address.script_pubkey();
         let dest_spk = destination.script_pubkey();
@@ -1828,7 +2164,10 @@ impl ZincWallet {
         }
         let dummy_outputs: Vec<TxOut> = segments
             .iter()
-            .map(|(v, spk, _)| TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() })
+            .map(|(v, spk, _)| TxOut {
+                value: Amount::from_sat(*v),
+                script_pubkey: spk.clone(),
+            })
             .collect();
         let dummy_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -1842,11 +2181,14 @@ impl ZincWallet {
         let last_idx = segments.len() - 1;
         if !segments[last_idx].2 {
             return Err(ZincError::WalletError(
-                "Selected inscriptions have no cardinal sats above the dust threshold to salvage".to_string(),
+                "Selected inscriptions have no cardinal sats above the dust threshold to salvage"
+                    .to_string(),
             ));
         }
         let last_after_fee = segments[last_idx].0.checked_sub(fee).ok_or_else(|| {
-            ZincError::WalletError(format!("Salvage is too small to cover the network fee ({fee} sats)"))
+            ZincError::WalletError(format!(
+                "Salvage is too small to cover the network fee ({fee} sats)"
+            ))
         })?;
 
         let mut outputs: Vec<TxOut> = Vec::with_capacity(segments.len());
@@ -1855,14 +2197,22 @@ impl ZincWallet {
                 // Drop the final cardinal output if the fee leaves it below dust (absorbed into the
                 // fee); dropping the LAST output never shifts an inscription.
                 if last_after_fee >= dust {
-                    outputs.push(TxOut { value: Amount::from_sat(last_after_fee), script_pubkey: spk.clone() });
+                    outputs.push(TxOut {
+                        value: Amount::from_sat(last_after_fee),
+                        script_pubkey: spk.clone(),
+                    });
                 }
             } else {
-                outputs.push(TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() });
+                outputs.push(TxOut {
+                    value: Amount::from_sat(*v),
+                    script_pubkey: spk.clone(),
+                });
             }
         }
         if outputs.is_empty() {
-            return Err(ZincError::WalletError("Salvage produced no spendable outputs".to_string()));
+            return Err(ZincError::WalletError(
+                "Salvage produced no spendable outputs".to_string(),
+            ));
         }
 
         let real_inputs: Vec<TxIn> = metas
@@ -1971,8 +2321,9 @@ impl ZincWallet {
             }],
         };
 
-        let mut psbt = Psbt::from_unsigned_tx(tx)
-            .map_err(|e| ZincError::WalletError(format!("Failed to build consolidation PSBT: {e}")))?;
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| {
+            ZincError::WalletError(format!("Failed to build consolidation PSBT: {e}"))
+        })?;
         for (i, (_, txo)) in resolved.iter().enumerate() {
             psbt.inputs[i].witness_utxo = Some(txo.clone());
         }
@@ -1992,7 +2343,9 @@ impl ZincWallet {
         let dest_addr = Address::from_str(destination)
             .map_err(|e| ZincError::ConfigError(format!("Invalid destination address: {e}")))?
             .require_network(network)
-            .map_err(|e| ZincError::ConfigError(format!("Destination address network mismatch: {e}")))?;
+            .map_err(|e| {
+                ZincError::ConfigError(format!("Destination address network mismatch: {e}"))
+            })?;
         let mut ops = Vec::with_capacity(outpoints.len());
         for s in outpoints {
             ops.push(
@@ -2027,14 +2380,19 @@ impl ZincWallet {
 
         if !self.ordinals_verified {
             return Err(ZincError::WalletError(
-                "Ordinals verification failed - safety lock engaged. Please retry sync.".to_string(),
+                "Ordinals verification failed - safety lock engaged. Please retry sync."
+                    .to_string(),
             ));
         }
         if input_outpoints.is_empty() {
-            return Err(ZincError::WalletError("No inputs provided for send".to_string()));
+            return Err(ZincError::WalletError(
+                "No inputs provided for send".to_string(),
+            ));
         }
         if amount_sats == 0 {
-            return Err(ZincError::WalletError("Send amount must be greater than zero".to_string()));
+            return Err(ZincError::WalletError(
+                "Send amount must be greater than zero".to_string(),
+            ));
         }
 
         // Resolve every input together with the offset of its inscription (clean inputs carry none).
@@ -2069,9 +2427,17 @@ impl ZincWallet {
                         "Inscription in {op} sits too close to the UTXO end to pad to {target_postage} sats"
                     )));
                 }
-                inscribed.push(SendInput { op: *op, txo, offset });
+                inscribed.push(SendInput {
+                    op: *op,
+                    txo,
+                    offset,
+                });
             } else {
-                clean.push(SendInput { op: *op, txo, offset: 0 });
+                clean.push(SendInput {
+                    op: *op,
+                    txo,
+                    offset: 0,
+                });
             }
         }
 
@@ -2079,7 +2445,12 @@ impl ZincWallet {
         // that last inscribed input's trail + the clean inputs form the contiguous cardinal run the
         // recipient + change are paid from. Every earlier inscribed input's cardinal is stranded
         // between postage outputs and returns to the wallet as its own change.
-        inscribed.sort_by_key(|m| m.txo.value.to_sat().saturating_sub(m.offset + target_postage));
+        inscribed.sort_by_key(|m| {
+            m.txo
+                .value
+                .to_sat()
+                .saturating_sub(m.offset + target_postage)
+        });
         let ordered: Vec<&SendInput> = inscribed.iter().chain(clean.iter()).collect();
 
         let ord_spk = ordinals_address.script_pubkey();
@@ -2119,17 +2490,32 @@ impl ZincWallet {
             let trail = value - offset - target_postage;
             let mut postage = target_postage;
             if offset >= dust {
-                leading.push(TxOut { value: Amount::from_sat(offset), script_pubkey: change_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(offset),
+                    script_pubkey: change_spk.clone(),
+                });
             } else {
                 postage += offset;
             }
             if idx + 1 == inscribed_count {
-                leading.push(TxOut { value: Amount::from_sat(postage), script_pubkey: ord_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(postage),
+                    script_pubkey: ord_spk.clone(),
+                });
             } else if trail >= dust {
-                leading.push(TxOut { value: Amount::from_sat(postage), script_pubkey: ord_spk.clone() });
-                leading.push(TxOut { value: Amount::from_sat(trail), script_pubkey: change_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(postage),
+                    script_pubkey: ord_spk.clone(),
+                });
+                leading.push(TxOut {
+                    value: Amount::from_sat(trail),
+                    script_pubkey: change_spk.clone(),
+                });
             } else {
-                leading.push(TxOut { value: Amount::from_sat(postage + trail), script_pubkey: ord_spk.clone() });
+                leading.push(TxOut {
+                    value: Amount::from_sat(postage + trail),
+                    script_pubkey: ord_spk.clone(),
+                });
             }
         }
 
@@ -2143,8 +2529,14 @@ impl ZincWallet {
 
         // Fee from a dummy tx with the leading outputs + recipient + a change placeholder (worst case).
         let mut dummy_out = leading.clone();
-        dummy_out.push(TxOut { value: Amount::from_sat(amount_sats), script_pubkey: recipient_spk.clone() });
-        dummy_out.push(TxOut { value: Amount::from_sat(0), script_pubkey: change_spk.clone() });
+        dummy_out.push(TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient_spk.clone(),
+        });
+        dummy_out.push(TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: change_spk.clone(),
+        });
         let dummy_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -2161,10 +2553,16 @@ impl ZincWallet {
         })?;
 
         let mut outputs = leading;
-        outputs.push(TxOut { value: Amount::from_sat(amount_sats), script_pubkey: recipient_spk });
+        outputs.push(TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: recipient_spk,
+        });
         // Keep a change output only if it clears dust; otherwise the remainder is absorbed into the fee.
         if change >= dust {
-            outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
+            outputs.push(TxOut {
+                value: Amount::from_sat(change),
+                script_pubkey: change_spk,
+            });
         }
 
         let mut real_inputs = build_inputs();
@@ -2204,7 +2602,9 @@ impl ZincWallet {
             Address::from_str(s)
                 .map_err(|e| ZincError::ConfigError(format!("Invalid {what} address: {e}")))?
                 .require_network(network)
-                .map_err(|e| ZincError::ConfigError(format!("{what} address network mismatch: {e}")))
+                .map_err(|e| {
+                    ZincError::ConfigError(format!("{what} address network mismatch: {e}"))
+                })
         };
         let recipient_addr = parse_addr(recipient, "recipient")?;
         let ord_addr = parse_addr(ordinals_address, "ordinals")?;
@@ -2243,11 +2643,15 @@ impl ZincWallet {
         let ord_addr = Address::from_str(ordinals_address)
             .map_err(|e| ZincError::ConfigError(format!("Invalid ordinals address: {e}")))?
             .require_network(network)
-            .map_err(|e| ZincError::ConfigError(format!("Ordinals address network mismatch: {e}")))?;
+            .map_err(|e| {
+                ZincError::ConfigError(format!("Ordinals address network mismatch: {e}"))
+            })?;
         let dest_addr = Address::from_str(destination)
             .map_err(|e| ZincError::ConfigError(format!("Invalid destination address: {e}")))?
             .require_network(network)
-            .map_err(|e| ZincError::ConfigError(format!("Destination address network mismatch: {e}")))?;
+            .map_err(|e| {
+                ZincError::ConfigError(format!("Destination address network mismatch: {e}"))
+            })?;
         let mut ops = Vec::with_capacity(outpoints.len());
         for s in outpoints {
             ops.push(
@@ -2953,40 +3357,23 @@ impl ZincWallet {
             }
         }
 
-        // 1. Identify which wallet/keychain owns this address
-        let active_receive_index = self.active_receive_index();
-        let vault_addr = self
-            .vault_wallet
-            .peek_address(KeychainKind::External, active_receive_index)
-            .address
-            .to_string();
-
-        let (is_vault, is_payment) = if address == vault_addr {
-            (true, false)
-        } else if let Some(w) = &self.payment_wallet {
-            let pay_addr = w
-                .peek_address(KeychainKind::External, active_receive_index)
-                .address
-                .to_string();
-            (false, address == pay_addr)
-        } else {
-            (false, false)
-        };
-
-        if !is_vault && !is_payment {
-            return Err("Address not found in wallet".to_string());
-        }
+        let owned = self
+            .find_owned_address(address, DAPP_SIGN_ADDRESS_SEARCH_DEPTH)
+            .ok_or_else(|| "Address not found in wallet".to_string())?;
 
         // 2. Derive Key
         let secp = Secp256k1::new();
-        // Derivation path components
-        let (purpose, chain) = if is_vault {
-            (86, 0)
-        } else {
-            (self.dual_payment_purpose(), 0)
+        let chain = match owned.keychain {
+            KeychainKind::External => 0,
+            KeychainKind::Internal => 1,
         };
         let priv_key = self
-            .derive_private_key(purpose, chain, 0)
+            .derive_private_key_internal(
+                owned.purpose,
+                self.active_derivation_account(),
+                chain,
+                owned.absolute_index,
+            )
             .map_err(|_| ZincError::CapabilityMissing.to_string())?;
 
         // 3. Sign Message
@@ -3255,8 +3642,9 @@ impl ZincWallet {
 
                                 // SECURITY: avoid panic if the assembled taproot signature
                                 // is malformed; surface an error instead of aborting.
-                                let tap_sig = bitcoin::taproot::Signature::from_slice(&final_sig)
-                                    .map_err(|e| format!("Invalid taproot signature: {e}"))?;
+                                let tap_sig =
+                                    bitcoin::taproot::Signature::from_slice(&final_sig)
+                                        .map_err(|e| format!("Invalid taproot signature: {e}"))?;
                                 input.tap_script_sigs.insert((*pubkey, leaf_hash), tap_sig);
                                 key_found = true;
                             }

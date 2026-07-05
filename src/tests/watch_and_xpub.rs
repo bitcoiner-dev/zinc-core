@@ -100,7 +100,10 @@ mod tests {
             .with_xpub(&bad)
             .err()
             .unwrap();
-        assert!(err.contains("Unsupported extended public key prefix"), "{err}");
+        assert!(
+            err.contains("Unsupported extended public key prefix"),
+            "{err}"
+        );
     }
 
     #[test]
