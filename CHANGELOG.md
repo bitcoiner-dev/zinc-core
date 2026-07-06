@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-07-06
+
+### Added
+- Address-level dApp role candidates for Sparrow / `ord` wallet profiles, including
+  clean BTC sats, protected asset counts, inscription ids, derivation details, and
+  core-owned payment/ordinals eligibility.
+- WASM APIs `getDappAddressCandidates` and `confirmDappAddressSelection` for safe
+  dApp connect flows that bind explicit BTC and collectibles addresses.
+
+### Changed
+- Extended wallet address scanning/classification so Sparrow / `ord` profiles can
+  distinguish clean spendable BTC, inscription-only taproot addresses, empty taproot
+  addresses, and mixed unsafe addresses.
+
 ## [0.5.0] - 2026-06-28
 
 ### Added
