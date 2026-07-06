@@ -1708,7 +1708,7 @@ pub fn generate_secret_key_hex() -> Result<String, ZincError> {
         getrandom(&mut candidate)
             .map_err(|e| ZincError::OfferError(format!("failed to generate secret key: {e}")))?;
         if let Ok(secret_key) = SecretKey::from_slice(&candidate) {
-            return Ok(bytes_to_hex_lower(&secret_key.secret_bytes()));
+            return Ok(crate::crypto::bytes_to_hex_lower(&secret_key.secret_bytes()));
         }
     }
 }
@@ -1754,22 +1754,7 @@ fn ensure_event_tags_match(
     Ok(())
 }
 
-fn bytes_to_hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(nibble_to_hex(byte >> 4));
-        out.push(nibble_to_hex(byte & 0x0f));
-    }
-    out
-}
 
-fn nibble_to_hex(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => '0',
-    }
-}
 
 fn ensure_event_pairing_hash_matches(
     event: &NostrTransportEventV1,
@@ -2070,7 +2055,7 @@ fn domain_separated_digest(domain: &str, canonical_payload: &[u8]) -> Result<[u8
 }
 
 fn digest_hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::crypto::bytes_to_hex_lower(digest)
 }
 
 fn pubkey_hex_from_secret(secret_key: &SecretKey) -> String {
