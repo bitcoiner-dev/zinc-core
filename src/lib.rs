@@ -1731,6 +1731,74 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Resolve rune metadata (name, symbol, divisibility, parent inscription,
+    /// mint terms) for the given rune IDs or names.
+    ///
+    /// Serves hits from the wallet's cache and fetches misses from the ord
+    /// server, writing them back to the cache. Returns a JSON object
+    /// `{ resolved: { [id]: RuneInfo }, failed: string[] }` so callers can
+    /// degrade gracefully on partial network failures.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = resolveRuneInfo)]
+    pub fn resolve_rune_info(
+        &self,
+        ord_url: String,
+        ids: Vec<String>,
+    ) -> Result<js_sys::Promise, JsValue> {
+        self.check_vitality()?;
+        let inner_rc = self.inner.clone();
+
+        Ok(wasm_bindgen_futures::future_to_promise(async move {
+            let mut resolved: std::collections::HashMap<String, crate::ordinals::types::RuneInfo> =
+                std::collections::HashMap::new();
+            let mut misses: Vec<String> = Vec::new();
+
+            {
+                let inner = inner_rc
+                    .try_borrow()
+                    .map_err(|e| JsValue::from_str(&format!("Wallet busy (resolve_rune_info): {e}")))?;
+                for id in &ids {
+                    if let Some(info) = inner.rune_info(id) {
+                        resolved.insert(info.id.clone(), info);
+                    } else {
+                        misses.push(id.clone());
+                    }
+                }
+            }
+
+            let mut failed: Vec<String> = Vec::new();
+            if !misses.is_empty() {
+                let client = crate::ordinals::client::OrdClient::new(ord_url);
+                let mut fetched: Vec<crate::ordinals::types::RuneInfo> = Vec::new();
+                for id in &misses {
+                    match client.get_rune_info(id).await {
+                        Ok(info) => fetched.push(info),
+                        Err(_) => failed.push(id.clone()),
+                    }
+                }
+                if !fetched.is_empty() {
+                    if let Ok(mut inner) = inner_rc.try_borrow_mut() {
+                        inner.cache_rune_infos(fetched.clone());
+                    }
+                    for info in fetched {
+                        resolved.insert(info.id.clone(), info);
+                    }
+                }
+            }
+
+            let payload = serde_json::json!({
+                "resolved": resolved,
+                "failed": failed,
+            });
+            let serializer =
+                serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            use serde::Serialize;
+            payload
+                .serialize(&serializer)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        }))
+    }
+
     /// Return total, spendable, display-spendable, and inscribed balances.
     pub fn get_balance(&self) -> Result<JsValue, JsValue> {
         self.check_vitality()?;
@@ -2505,9 +2573,11 @@ impl ZincWasmWallet {
             let all_inscriptions = resolved.inscriptions;
             let protected_outpoints = resolved.protected_outpoints;
             let rune_balances = resolved.rune_balances;
+            let outpoint_runes = resolved.outpoint_runes;
+            let rune_infos = resolved.rune_infos;
             zinc_log_debug!(target: LOG_TARGET_WASM,
-                "sync_ordinals: resolved {} inscriptions, {} protected outpoints",
-                all_inscriptions.len(), protected_outpoints.len()
+                "sync_ordinals: resolved {} inscriptions, {} protected outpoints, {} rune outpoints",
+                all_inscriptions.len(), protected_outpoints.len(), outpoint_runes.len()
             );
 
             // 3. Apply Update (Borrow Mut)
@@ -2523,6 +2593,7 @@ impl ZincWasmWallet {
                             protected_outpoints,
                             rune_balances,
                         );
+                        inner.apply_outpoint_rune_holdings(outpoint_runes, rune_infos);
                         inner.is_syncing = false; // FINISHED
                         c
                     }

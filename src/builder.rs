@@ -395,6 +395,11 @@ pub struct ZincWallet {
     pub(crate) inscriptions: Vec<crate::ordinals::types::Inscription>,
     /// Cached read-only rune balances known to the wallet.
     pub(crate) rune_balances: Vec<crate::ordinals::types::RuneBalance>,
+    /// Per-outpoint rune holdings verified at last ord sync
+    /// (rune id `"block:tx"` -> raw amount in base units).
+    pub(crate) outpoint_runes: std::collections::HashMap<bitcoin::OutPoint, Vec<(String, u128)>>,
+    /// Rune metadata cache keyed by rune ID.
+    pub(crate) rune_info_cache: std::collections::HashMap<String, crate::ordinals::types::RuneInfo>,
     /// Whether ordinals protection state is currently verified.
     pub(crate) ordinals_verified: bool,
     /// Whether inscription metadata refresh has completed.
@@ -477,6 +482,9 @@ pub struct UtxoItem {
     pub inscription_offsets: Vec<u64>,
     /// Conservative estimate of cardinal sats recoverable via salvage (0 unless inscription-bearing).
     pub cardinal_salvageable_sats: u64,
+    /// Rune amounts known to sit in this UTXO (from the last verified ord sync).
+    #[serde(default)]
+    pub runes: Vec<crate::ordinals::runes::RuneAmount>,
 }
 
 /// Address-level dApp connect candidate with core-owned role eligibility.
@@ -849,6 +857,28 @@ impl ZincWallet {
     #[must_use]
     pub fn inscriptions(&self) -> &[crate::ordinals::types::Inscription] {
         &self.inscriptions
+    }
+
+    /// Look up cached rune metadata by canonical ID or (spaced) name.
+    #[must_use]
+    pub fn rune_info(&self, id_or_name: &str) -> Option<crate::ordinals::types::RuneInfo> {
+        if let Some(info) = self.rune_info_cache.get(id_or_name) {
+            return Some(info.clone());
+        }
+        self.rune_info_cache
+            .values()
+            .find(|info| info.spaced_rune == id_or_name)
+            .cloned()
+    }
+
+    /// Insert resolved rune metadata into the cache.
+    pub fn cache_rune_infos(
+        &mut self,
+        infos: impl IntoIterator<Item = crate::ordinals::types::RuneInfo>,
+    ) {
+        for info in infos {
+            self.rune_info_cache.insert(info.id.clone(), info);
+        }
     }
 
     /// Return the cached rune balances currently tracked by the wallet.
@@ -1398,6 +1428,33 @@ impl ZincWallet {
         self.inscriptions.len()
     }
 
+    /// Apply per-outpoint rune holdings and rune metadata from a verified ord
+    /// sync. Also back-fills canonical rune IDs onto the aggregated balances.
+    pub fn apply_outpoint_rune_holdings(
+        &mut self,
+        outpoint_runes: std::collections::HashMap<bitcoin::OutPoint, Vec<(String, u128)>>,
+        rune_infos: std::collections::HashMap<String, crate::ordinals::types::RuneInfo>,
+    ) {
+        zinc_log_info!(
+            target: LOG_TARGET_BUILDER,
+            "applying rune holdings: {} outpoints, {} rune infos",
+            outpoint_runes.len(),
+            rune_infos.len()
+        );
+        for balance in &mut self.rune_balances {
+            if balance.id.is_none() {
+                balance.id = rune_infos
+                    .values()
+                    .find(|info| info.spaced_rune == balance.rune)
+                    .map(|info| info.id.clone());
+            }
+        }
+        self.outpoint_runes = outpoint_runes;
+        // Merge rather than replace: infos for runes no longer held remain
+        // useful for resolveRuneInfo lookups.
+        self.rune_info_cache.extend(rune_infos);
+    }
+
     /// Apply cached inscription metadata from an untrusted caller boundary.
     ///
     /// This method updates metadata for UI rendering but intentionally does not
@@ -1415,6 +1472,7 @@ impl ZincWallet {
         self.inscribed_utxos.clear();
         self.inscriptions = inscriptions;
         self.rune_balances.clear();
+        self.outpoint_runes.clear();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = true;
 
@@ -2007,6 +2065,16 @@ impl ZincWallet {
                 KeychainKind::External => "external",
             };
 
+            let runes = self
+                .outpoint_runes
+                .get(&u.outpoint)
+                .map(|held| {
+                    held.iter()
+                        .map(|(id, amount)| self.enrich_rune_amount(id, *amount))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             out.push(UtxoItem {
                 txid: u.outpoint.txid.to_string(),
                 vout: u.outpoint.vout,
@@ -2021,6 +2089,7 @@ impl ZincWallet {
                 inscription_ids,
                 inscription_offsets,
                 cardinal_salvageable_sats,
+                runes,
             });
         }
     }
@@ -3219,9 +3288,94 @@ impl ZincWallet {
 
     /// Analyzes a PSBT for Ordinal Shield protection.
     /// Returns a JSON string containing the `AnalysisResult`.
+    /// Fills display metadata (name/divisibility/symbol) onto a rune amount
+    /// from the wallet's rune metadata cache.
+    fn enrich_rune_amount(&self, id: &str, amount: u128) -> crate::ordinals::runes::RuneAmount {
+        let mut rune_amount = crate::ordinals::runes::RuneAmount::new(id.to_string(), amount);
+        if let Some(info) = self.rune_info_cache.get(id) {
+            rune_amount.name = Some(info.spaced_rune.clone());
+            rune_amount.divisibility = Some(info.divisibility);
+            rune_amount.symbol.clone_from(&info.symbol);
+        }
+        rune_amount
+    }
+
+    fn enrich_rune_amounts(&self, amounts: &mut [crate::ordinals::runes::RuneAmount]) {
+        for rune_amount in amounts {
+            if let Some(info) = self.rune_info_cache.get(&rune_amount.rune_id) {
+                rune_amount.name = Some(info.spaced_rune.clone());
+                rune_amount.divisibility = Some(info.divisibility);
+                rune_amount.symbol.clone_from(&info.symbol);
+            }
+        }
+    }
+
+    /// Post-processes an analysis with wallet ownership context: descriptor-
+    /// true `is_mine` on inputs and `is_change` on outputs, rune display
+    /// metadata from the cache, and the "runes default-transfer to a foreign
+    /// output" Danger escalation the shield cannot decide without ownership.
+    fn apply_wallet_context_to_analysis(
+        &self,
+        analysis: &mut crate::ordinals::shield::AnalysisResult,
+    ) {
+        use bitcoin::ScriptBuf;
+
+        let script_is_mine = |hex: &str| -> Option<ScriptBuf> {
+            ScriptBuf::from_hex(hex).ok()
+        };
+        let is_mine = |spk: &ScriptBuf| -> bool {
+            self.vault_wallet.is_mine(spk.clone())
+                || self
+                    .payment_wallet
+                    .as_ref()
+                    .is_some_and(|wallet| wallet.is_mine(spk.clone()))
+        };
+        let is_change = |spk: &ScriptBuf| -> bool {
+            let internal = |wallet: &Wallet| {
+                wallet
+                    .derivation_of_spk(spk.clone())
+                    .is_some_and(|(keychain, _)| keychain == KeychainKind::Internal)
+            };
+            internal(&self.vault_wallet) || self.payment_wallet.as_ref().is_some_and(internal)
+        };
+
+        for input in &mut analysis.inputs {
+            if let Some(spk) = script_is_mine(&input.script_pubkey) {
+                input.is_mine = input.is_mine || is_mine(&spk);
+            }
+            self.enrich_rune_amounts(&mut input.runes);
+        }
+
+        let mut default_transfer_target_is_mine = true;
+        let mut first_non_op_return_seen = false;
+        for output in &mut analysis.outputs {
+            if let Some(spk) = script_is_mine(&output.script_pubkey) {
+                output.is_change = output.is_change || is_change(&spk);
+                if !first_non_op_return_seen && !output.is_op_return {
+                    first_non_op_return_seen = true;
+                    default_transfer_target_is_mine = is_mine(&spk);
+                }
+            }
+            self.enrich_rune_amounts(&mut output.runes);
+        }
+
+        if let Some(actions) = &mut analysis.rune_actions {
+            self.enrich_rune_amounts(&mut actions.burned);
+            if actions.default_transfer_without_runestone && !default_transfer_target_is_mine {
+                analysis.warning_level = crate::ordinals::shield::WarningLevel::Danger;
+                analysis.warnings.push(
+                    "Runes on the inputs would default-transfer to an output that does not belong to this wallet.".to_string(),
+                );
+            }
+        }
+    }
+
+    /// Analyze a base64 PSBT with the wallet's full offline context
+    /// (inscriptions, per-outpoint rune holdings, cached mint terms,
+    /// descriptor ownership) and return the analysis as JSON.
     pub fn analyze_psbt(&self, psbt_base64: &str) -> Result<String, String> {
         // Use explicit path to avoid re-export issues if any
-        use crate::ordinals::shield::analyze_psbt;
+        use crate::ordinals::shield::{analyze_psbt_with_context, ShieldContext};
         use base64::Engine;
         use std::collections::HashMap;
 
@@ -3300,12 +3454,37 @@ impl ZincWallet {
             items.sort_by_key(|(_, offset)| *offset);
         }
 
-        let result = match analyze_psbt(&psbt, &known_inscriptions, self.vault_wallet.network()) {
+        // Rune context, entirely from the verified sync caches (no network).
+        let mut known_runes: crate::ordinals::shield::KnownRunes = HashMap::new();
+        for (outpoint, held) in &self.outpoint_runes {
+            known_runes.insert((outpoint.txid, outpoint.vout), held.clone());
+        }
+        let mut mint_terms: HashMap<String, u128> = HashMap::new();
+        for (id, info) in &self.rune_info_cache {
+            if let Some(amount) = info
+                .terms_amount
+                .as_ref()
+                .and_then(|value| value.parse::<u128>().ok())
+            {
+                mint_terms.insert(id.clone(), amount);
+            }
+        }
+
+        let ctx = ShieldContext {
+            known_inscriptions: &known_inscriptions,
+            known_runes: &known_runes,
+            input_scope: None,
+            network: self.vault_wallet.network(),
+            mint_terms: &mint_terms,
+        };
+        let mut result = match analyze_psbt_with_context(&psbt, &ctx) {
             Ok(r) => r,
             Err(e) => {
                 return Err(e.to_string());
             }
         };
+
+        self.apply_wallet_context_to_analysis(&mut result);
 
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
@@ -4014,6 +4193,8 @@ impl WalletBuilder {
             inscribed_utxos: std::collections::HashSet::default(),
             inscriptions: Vec::new(),
             rune_balances: Vec::new(),
+            outpoint_runes: std::collections::HashMap::new(),
+            rune_info_cache: std::collections::HashMap::new(),
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             kind,
@@ -4149,6 +4330,8 @@ impl WalletBuilder {
             inscribed_utxos: std::collections::HashSet::default(),
             inscriptions: Vec::new(),
             rune_balances: Vec::new(),
+            outpoint_runes: std::collections::HashMap::new(),
+            rune_info_cache: std::collections::HashMap::new(),
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             kind: WalletKind::Hardware {

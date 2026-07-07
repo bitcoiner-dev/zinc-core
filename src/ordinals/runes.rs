@@ -82,8 +82,9 @@ pub struct RuneMintSummary {
 
 /// Summary of the runestone (or cenotaph) carried by a transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // Independent protocol flags on a serde contract type.
 pub struct RuneActions {
-    /// True when an OP_RETURN runestone payload is present.
+    /// True when an `OP_RETURN` runestone payload is present.
     pub has_runestone: bool,
     /// True when the payload is a cenotaph: ALL input runes are burned.
     pub is_cenotaph: bool,
@@ -102,11 +103,11 @@ pub struct RuneActions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer: Option<u32>,
     /// Rune amounts this transaction would burn (cenotaph, allocation to the
-    /// OP_RETURN output, or no eligible non-OP_RETURN output).
+    /// `OP_RETURN` output, or no eligible non-`OP_RETURN` output).
     #[serde(default)]
     pub burned: Vec<RuneAmount>,
     /// True when inputs carry runes but the transaction has no runestone: the
-    /// protocol default moves ALL input runes to the first non-OP_RETURN
+    /// protocol default moves ALL input runes to the first non-`OP_RETURN`
     /// output.
     #[serde(default)]
     pub default_transfer_without_runestone: bool,
@@ -159,6 +160,7 @@ fn spaced_rune_name(etching: &ordinals::Etching) -> Option<String> {
 ///   non-OP_RETURN output; if that target is missing they are burned.
 /// - An unknown mint amount is never guessed: the minted rune's flows are
 ///   simulated from input holdings alone (a lower bound) and flagged.
+#[allow(clippy::too_many_lines)] // One cohesive pass over the allocation spec.
 pub(crate) fn simulate_rune_flow(
     tx: &Transaction,
     input_holdings: &[Vec<(RuneId, u128)>],
@@ -225,9 +227,10 @@ pub(crate) fn simulate_rune_flow(
                     rune_id: mint.to_string(),
                     amount: mint_amount.map(|amount| amount.to_string()),
                 });
-                match mint_amount {
-                    Some(amount) => burn(&mut burned, mint, amount),
-                    None => actions.mint_amount_unknown = true,
+                if let Some(amount) = mint_amount {
+                    burn(&mut burned, mint, amount);
+                } else {
+                    actions.mint_amount_unknown = true;
                 }
             }
             if let Some(rune) = cenotaph.etching {
