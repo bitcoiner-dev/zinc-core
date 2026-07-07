@@ -25,7 +25,7 @@ fn wallet() -> ZincWasmWallet {
         PHRASE,
         Some("unified".to_string()),
         None,
-        Some(0),
+        Some(0), None, None,
     )
     .expect("seed wallet")
 }
@@ -103,7 +103,7 @@ fn new_encrypted_builds_a_usable_wallet() {
         "pw",
         Some("unified".to_string()),
         None,
-        Some(0),
+        Some(0), None, None,
     )
     .expect("new_encrypted");
     let accts = to_json(w.get_accounts(1).expect("accounts"));
@@ -123,7 +123,7 @@ fn new_encrypted_with_wrong_password_errors() {
         "nope",
         Some("unified".to_string()),
         None,
-        Some(0)
+        Some(0), None, None,
     )
     .is_err());
 }
