@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-07-07
+
+### Added
+- Runes protocol support for the Ordinal Shield: runestone/cenotaph decoding via
+  the canonical `ordinals` crate and rune allocation simulation matching ord's
+  `RuneUpdater` semantics (`ordinals::runes` module).
+- `analyze_psbt_with_context` + `ShieldContext`/`KnownRunes`: rune-aware PSBT
+  analysis with per-input/per-output `RuneAmount` annotations, a `RuneActions`
+  summary (etch/mint/edicts/cenotaph/burns), warning escalation (rune burns and
+  cenotaphs are `Danger`), fee-rate estimation (`fee_rate_sat_vb`), and dust
+  flags. The placeholder rune id `"0:0"` denotes the rune being etched by the
+  analyzed transaction.
+- `OrdClient::get_rune_info` (`/rune/<id-or-name>`) and per-outpoint rune
+  holdings on `ResolvedAssets` (`outpoint_runes`, `rune_infos`), joined
+  name→ID at sync time and failing closed when a rune id cannot be resolved.
+- Wallet: `apply_outpoint_rune_holdings`, `rune_info`/`cache_rune_infos`,
+  `UtxoItem.runes`; `analyze_psbt` now runs with full rune context and applies
+  descriptor-true `is_mine`/`is_change` plus rune display metadata.
+- WASM: `resolveRuneInfo(ordUrl, ids)` returning `{ resolved, failed }`;
+  `syncOrdinals` threads rune holdings through.
+- `RuneBalance` gains an optional canonical `id`.
+
+### Changed
+- **Breaking (struct literals):** `AnalysisResult`, `InputInfo`, `OutputInfo`,
+  `RuneBalance`, `ResolvedAssets`, and `UtxoItem` gained fields; struct-literal
+  construction must be updated. Serialized wire shapes remain backward
+  compatible (new fields are optional/defaulted).
+- MSRV raised from 1.77 to 1.80 (required by the `ordinals` dependency).
+
 ## [0.6.0] - 2026-07-06
 
 ### Added
