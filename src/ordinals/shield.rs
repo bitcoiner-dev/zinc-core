@@ -1,5 +1,7 @@
 use crate::ordinals::error::OrdError;
+use crate::ordinals::runes::{simulate_rune_flow, RuneActions, RuneAmount};
 use bitcoin::{OutPoint, Psbt, Txid};
+use ordinals::{Artifact, RuneId, Runestone};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -55,6 +57,9 @@ pub struct InputInfo {
     pub is_mine: bool,
     /// Inscription ids known on this input.
     pub inscriptions: Vec<String>,
+    /// Rune amounts known to sit on this input's outpoint (wallet cache).
+    #[serde(default)]
+    pub runes: Vec<RuneAmount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +79,16 @@ pub struct OutputInfo {
     pub is_change: bool,
     /// Inscription ids mapped into this output.
     pub inscriptions: Vec<String>,
+    /// Simulated rune amounts this output would receive.
+    #[serde(default)]
+    pub runes: Vec<RuneAmount>,
+    /// True when the script is OP_RETURN (runes allocated here are burned).
+    #[serde(default)]
+    pub is_op_return: bool,
+    /// True when the value is below the script's minimal non-dust threshold.
+    /// Always `false` for OP_RETURN outputs.
+    #[serde(default)]
+    pub is_dust: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +114,17 @@ pub struct AnalysisResult {
     #[serde(default)]
     /// Output metadata used for analysis explainability.
     pub outputs: Vec<OutputInfo>,
+    /// Runestone/cenotaph summary. `None` when the transaction has no
+    /// runestone and no analyzed input holds runes (or when rune context was
+    /// not provided).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rune_actions: Option<RuneActions>,
+    /// Estimated fee rate in sat/vB. `None` when a witness size cannot be
+    /// estimated for some input. For unsigned PSBTs this assumes single-key
+    /// spends (taproot key-path, P2WPKH); script-path and multisig spends
+    /// will be underestimated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_rate_sat_vb: Option<f64>,
 }
 
 /// Checks if a UTXO is safe to spend (not inscribed).
@@ -115,6 +141,176 @@ pub fn analyze_psbt(
     network: bitcoin::Network,
 ) -> Result<AnalysisResult, OrdError> {
     analyze_psbt_with_scope(psbt, known_inscriptions, None, network)
+}
+
+/// Per-outpoint rune holdings, keyed like `known_inscriptions`. Values are
+/// `("block:tx" rune id, raw amount in base units)`.
+pub type KnownRunes = HashMap<(Txid, u32), Vec<(String, u128)>>;
+
+/// Wallet-cached knowledge bundled for offline PSBT analysis.
+pub struct ShieldContext<'a> {
+    /// Inscriptions known per spent outpoint.
+    pub known_inscriptions: &'a HashMap<(Txid, u32), Vec<(String, u64)>>,
+    /// Rune holdings known per spent outpoint.
+    pub known_runes: &'a KnownRunes,
+    /// Optional input scope for partial-signing flows.
+    pub input_scope: Option<&'a [usize]>,
+    /// Network used for address rendering.
+    pub network: bitcoin::Network,
+    /// Cached per-mint amounts keyed by rune id `"block:tx"`, used to resolve
+    /// mint amounts offline when the terms are known.
+    pub mint_terms: &'a HashMap<String, u128>,
+}
+
+/// Analyze a PSBT with full wallet context: inscription sat flow plus rune
+/// flow simulation, fee-rate estimation, and dust flags.
+///
+/// This wraps [`analyze_psbt_with_scope`] and post-processes its result; the
+/// legacy entry points remain available and rune-blind.
+pub fn analyze_psbt_with_context(
+    psbt: &Psbt,
+    ctx: &ShieldContext<'_>,
+) -> Result<AnalysisResult, OrdError> {
+    let mut analysis =
+        analyze_psbt_with_scope(psbt, ctx.known_inscriptions, ctx.input_scope, ctx.network)?;
+    let tx = &psbt.unsigned_tx;
+
+    analysis.fee_rate_sat_vb = estimate_fee_rate_sat_vb(psbt, analysis.fee_sats);
+
+    // Per-input rune holdings from the wallet cache.
+    let mut input_holdings: Vec<Vec<(RuneId, u128)>> = Vec::with_capacity(tx.input.len());
+    let mut any_input_runes = false;
+    for (index, input) in tx.input.iter().enumerate() {
+        let key = (input.previous_output.txid, input.previous_output.vout);
+        let mut holdings: Vec<(RuneId, u128)> = Vec::new();
+        if let Some(entries) = ctx.known_runes.get(&key) {
+            for (id, amount) in entries {
+                if let Ok(rune_id) = id.parse::<RuneId>() {
+                    holdings.push((rune_id, *amount));
+                }
+            }
+        }
+        if !holdings.is_empty() {
+            any_input_runes = true;
+            if let Some(info) = analysis.inputs.get_mut(index) {
+                info.runes = holdings
+                    .iter()
+                    .map(|(id, amount)| RuneAmount::new(id.to_string(), *amount))
+                    .collect();
+            }
+        }
+        input_holdings.push(holdings);
+    }
+
+    let artifact = Runestone::decipher(tx);
+    if artifact.is_none() && !any_input_runes {
+        return Ok(analysis);
+    }
+
+    // Partial scope cannot see unscoped inputs' runes: never emit exact
+    // amounts that might be wrong.
+    if ctx.input_scope.is_some() {
+        analysis.warnings.push(
+            "Rune flow is not simulated under partial-scope analysis; rune movement may be incomplete.".to_string(),
+        );
+        if analysis.warning_level == WarningLevel::Safe {
+            analysis.warning_level = WarningLevel::Warn;
+        }
+        return Ok(analysis);
+    }
+
+    let mint_amount = artifact
+        .as_ref()
+        .and_then(Artifact::mint)
+        .and_then(|id| ctx.mint_terms.get(&id.to_string()).copied());
+
+    let flow = simulate_rune_flow(tx, &input_holdings, mint_amount);
+
+    for (vout, entries) in flow.output_runes.iter().enumerate() {
+        if entries.is_empty() {
+            continue;
+        }
+        if let Some(info) = analysis.outputs.get_mut(vout) {
+            info.runes = entries
+                .iter()
+                .map(|(id, amount)| RuneAmount::new(id.clone(), *amount))
+                .collect();
+        }
+    }
+
+    analysis.warnings.extend(flow.warnings);
+    let escalate_to_warn = flow.actions.etching.is_some()
+        || flow.actions.mint_amount_unknown
+        || flow.actions.default_transfer_without_runestone;
+    if flow.danger {
+        analysis.warning_level = WarningLevel::Danger;
+    } else if escalate_to_warn && analysis.warning_level == WarningLevel::Safe {
+        analysis.warning_level = WarningLevel::Warn;
+    }
+    analysis.rune_actions = Some(flow.actions);
+
+    Ok(analysis)
+}
+
+/// Estimates the fee rate in sat/vB for a possibly-unsigned PSBT.
+///
+/// Uses actual final witnesses when present; otherwise estimates witness
+/// weight per input script type (taproot key-path ≈ 66 WU, P2WPKH ≈ 108 WU,
+/// legacy P2PKH scriptsig ≈ 107 bytes). Returns `None` for input types whose
+/// spend size cannot be estimated (P2WSH, bare/unknown scripts) rather than
+/// reporting a wrong number.
+fn estimate_fee_rate_sat_vb(psbt: &Psbt, fee_sats: u64) -> Option<f64> {
+    let tx = &psbt.unsigned_tx;
+    if fee_sats == 0 {
+        return Some(0.0);
+    }
+    let base_weight = tx.weight().to_wu();
+    let mut witness_weight: u64 = 0;
+    let mut any_witness = false;
+
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        if let Some(witness) = input.final_script_witness.as_ref() {
+            witness_weight += witness.size() as u64;
+            any_witness = true;
+            continue;
+        }
+        let script_pubkey = input
+            .witness_utxo
+            .as_ref()
+            .map(|utxo| utxo.script_pubkey.clone())
+            .or_else(|| {
+                input.non_witness_utxo.as_ref().and_then(|prev| {
+                    prev.output
+                        .get(tx.input[index].previous_output.vout as usize)
+                        .map(|output| output.script_pubkey.clone())
+                })
+            })?;
+
+        if script_pubkey.is_p2tr() {
+            // count(1) + len(1) + schnorr sig(64)
+            witness_weight += 66;
+            any_witness = true;
+        } else if script_pubkey.is_p2wpkh() {
+            // count(1) + sig(1+72) + pubkey(1+33)
+            witness_weight += 108;
+            any_witness = true;
+        } else if script_pubkey.is_p2pkh() {
+            // scriptsig sig(1+72) + pubkey(1+33) + push overhead; base data
+            // counts 4 WU per byte.
+            witness_weight += 107 * 4;
+        } else {
+            return None;
+        }
+    }
+
+    let marker_flag_weight = if any_witness { 2 } else { 0 };
+    let total_weight = base_weight + witness_weight + marker_flag_weight;
+    let vsize = total_weight.div_ceil(4);
+    if vsize == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some(fee_sats as f64 / vsize as f64)
 }
 
 fn normalize_input_scope(
@@ -381,6 +577,7 @@ pub fn analyze_psbt_with_scope(
             address,
             is_mine: false, // Don't know without wallet context
             inscriptions: input_inscriptions_ids,
+            runes: Vec::new(), // Filled by analyze_psbt_with_context
         });
 
         // Look for Ordinal envelopes in the witness/tap_scripts
@@ -601,6 +798,7 @@ pub fn analyze_psbt_with_scope(
             }
         }
 
+        let is_op_return = output.script_pubkey.is_op_return();
         outputs_info.push(OutputInfo {
             vout: vout_u32,
             value: output_value,
@@ -608,6 +806,10 @@ pub fn analyze_psbt_with_scope(
             address,
             is_change: false, // Don't know
             inscriptions: output_inscriptions,
+            runes: Vec::new(), // Filled by analyze_psbt_with_context
+            is_op_return,
+            is_dust: !is_op_return
+                && output_value < output.script_pubkey.minimal_non_dust().to_sat(),
         });
 
         current_output_offset += output_value;
@@ -675,6 +877,8 @@ pub fn analyze_psbt_with_scope(
         warnings,
         inputs: inputs_info,
         outputs: outputs_info,
+        rune_actions: None,     // Filled by analyze_psbt_with_context
+        fee_rate_sat_vb: None,  // Filled by analyze_psbt_with_context
     })
 }
 
