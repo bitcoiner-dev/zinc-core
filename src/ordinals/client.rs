@@ -1,5 +1,5 @@
 use crate::ordinals::error::OrdError;
-use crate::ordinals::types::{Inscription, RuneBalance};
+use crate::ordinals::types::{Inscription, RuneBalance, RuneInfo};
 use bitcoin::OutPoint;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer};
@@ -80,6 +80,63 @@ pub struct ResolvedAssets {
     pub protected_outpoints: HashSet<OutPoint>,
     /// Aggregated rune balances.
     pub rune_balances: Vec<RuneBalance>,
+    /// Per-outpoint rune holdings keyed by rune ID `"block:tx"` (base units).
+    pub outpoint_runes: std::collections::HashMap<OutPoint, Vec<(String, u128)>>,
+    /// Metadata for each distinct rune seen, keyed by rune ID.
+    pub rune_infos: std::collections::HashMap<String, RuneInfo>,
+}
+
+#[derive(Deserialize)]
+struct RuneInfoTermsResponse {
+    #[serde(default, deserialize_with = "deserialize_json_value_or_default")]
+    amount: serde_json::Value,
+    #[serde(default, deserialize_with = "deserialize_json_value_or_default")]
+    cap: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct RuneInfoEntryResponse {
+    #[serde(default)]
+    spaced_rune: Option<String>,
+    #[serde(default)]
+    divisibility: Option<u8>,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    terms: Option<RuneInfoTermsResponse>,
+}
+
+#[derive(Deserialize)]
+struct RuneInfoResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    entry: Option<RuneInfoEntryResponse>,
+    #[serde(default)]
+    mintable: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_json_value_or_default")]
+    parent: serde_json::Value,
+}
+
+/// Renders a JSON number-or-string amount as a decimal string, tolerating both
+/// shapes ord has used across versions. Returns `None` for anything else.
+fn json_amount_to_decimal_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn json_parent_to_inscription_id(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        serde_json::Value::Object(map) => map
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -232,6 +289,9 @@ fn merge_rune_balances(entries: impl IntoIterator<Item = RuneBalance>) -> Vec<Ru
             if existing.symbol.is_none() {
                 existing.symbol = entry.symbol;
             }
+            if existing.id.is_none() {
+                existing.id = entry.id;
+            }
             continue;
         }
 
@@ -242,6 +302,7 @@ fn merge_rune_balances(entries: impl IntoIterator<Item = RuneBalance>) -> Vec<Ru
                 amount: normalized_amount,
                 divisibility: entry.divisibility,
                 symbol: entry.symbol,
+                id: entry.id,
             },
         );
     }
@@ -278,6 +339,7 @@ fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
                                 amount,
                                 divisibility: None,
                                 symbol,
+                                id: None,
                             })
                         }
                         _ => None,
@@ -317,6 +379,7 @@ fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
                                 amount,
                                 divisibility,
                                 symbol,
+                                id: None,
                             })
                         }
                         other => {
@@ -326,6 +389,7 @@ fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
                                 amount,
                                 divisibility: None,
                                 symbol: None,
+                                id: None,
                             })
                         }
                     }
@@ -498,6 +562,60 @@ impl OrdClient {
         Ok(merge_rune_balances(collected))
     }
 
+    /// Fetch rune metadata from ord-compatible `/rune/<id-or-name>`.
+    ///
+    /// Accepts either the canonical `"block:tx"` ID or the (spaced or
+    /// unspaced) rune name. Fails when the response carries no rune ID, since
+    /// ID-less metadata cannot be joined to runestone edicts.
+    pub async fn get_rune_info(&self, id_or_name: &str) -> Result<RuneInfo, OrdError> {
+        let url = format!("{}/rune/{}", self.base_url, id_or_name);
+        let response = self
+            .http_client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| OrdError::RequestFailed(format!("Rune info request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(OrdError::RequestFailed(format!(
+                "API Error (Rune {id_or_name}): {}",
+                response.status()
+            )));
+        }
+
+        let parsed = response.json::<RuneInfoResponse>().await.map_err(|e| {
+            OrdError::RequestFailed(format!("Failed to parse rune info JSON for {id_or_name}: {e}"))
+        })?;
+
+        let id = parsed
+            .id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                OrdError::RequestFailed(format!(
+                    "Rune info for {id_or_name} is missing the rune id"
+                ))
+            })?;
+        let entry = parsed.entry;
+        let spaced_rune = entry
+            .as_ref()
+            .and_then(|e| e.spaced_rune.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| id_or_name.to_string());
+        let terms = entry.as_ref().and_then(|e| e.terms.as_ref());
+
+        Ok(RuneInfo {
+            id,
+            spaced_rune,
+            divisibility: entry.as_ref().and_then(|e| e.divisibility).unwrap_or(0),
+            symbol: entry.as_ref().and_then(|e| e.symbol.clone()),
+            parent: json_parent_to_inscription_id(&parsed.parent),
+            terms_amount: terms.and_then(|t| json_amount_to_decimal_string(&t.amount)),
+            terms_cap: terms.and_then(|t| json_amount_to_decimal_string(&t.cap)),
+            mintable: parsed.mintable.unwrap_or(false),
+        })
+    }
+
     /// Bulk-fetch output metadata for many outpoints in ONE request via ord's `POST /outputs`.
     /// Each returned entry carries its own `outpoint`, so callers can match results to requests.
     /// Internal helper for `resolve_assets_for_outpoints` (returns the crate-private response type).
@@ -538,6 +656,7 @@ impl OrdClient {
     /// Fails closed: if the bulk response does not cover every requested outpoint, returns an error so
     /// the ordinals state is never marked verified on partial data (a silently-missing output could
     /// hide a protected/inscribed UTXO from the send-safety set).
+    #[allow(clippy::too_many_lines)] // One cohesive bulk-resolution pass.
     pub async fn resolve_assets_for_outpoints(
         &self,
         outpoints: &[String],
@@ -573,18 +692,88 @@ impl OrdClient {
         let mut protected_outpoints = HashSet::new();
         let mut inscription_ids: Vec<String> = Vec::new();
         let mut rune_balances: Vec<RuneBalance> = Vec::new();
+        // Per-outpoint rune amounts, still keyed by NAME (ord's /outputs shape).
+        let mut outpoint_rune_names: Vec<(OutPoint, Vec<(String, u128)>)> = Vec::new();
         for e in &entries {
+            let outpoint = e
+                .outpoint
+                .as_deref()
+                .and_then(|s| s.parse::<OutPoint>().ok());
             if e.has_protected_assets() {
-                if let Some(op) = e
-                    .outpoint
-                    .as_deref()
-                    .and_then(|s| s.parse::<OutPoint>().ok())
-                {
+                if let Some(op) = outpoint {
                     protected_outpoints.insert(op);
                 }
             }
             inscription_ids.extend(e.inscriptions.iter().cloned());
-            rune_balances.extend(parse_runes_balances_value(&e.runes));
+            let entry_balances = parse_runes_balances_value(&e.runes);
+            if let Some(op) = outpoint {
+                let mut held: Vec<(String, u128)> = Vec::new();
+                for balance in &entry_balances {
+                    let Ok(amount) = balance.amount.parse::<u128>() else {
+                        return Err(OrdError::RequestFailed(format!(
+                            "Unparseable rune amount '{}' for {} on {op}; refusing partial rune state",
+                            balance.amount, balance.rune
+                        )));
+                    };
+                    held.push((balance.rune.clone(), amount));
+                }
+                if !held.is_empty() {
+                    outpoint_rune_names.push((op, held));
+                }
+            }
+            rune_balances.extend(entry_balances);
+        }
+
+        // 2b. Resolve metadata (incl. the ID the runestone protocol uses) for
+        // every distinct rune name seen. Fails closed: a rune UTXO whose ID
+        // cannot be resolved would otherwise simulate as rune-free, which is
+        // the burn-masking failure mode.
+        let mut distinct_names: Vec<String> = Vec::new();
+        for (_, held) in &outpoint_rune_names {
+            for (name, _) in held {
+                if !distinct_names.contains(name) {
+                    distinct_names.push(name.clone());
+                }
+            }
+        }
+        const RUNE_INFO_BATCH: usize = 8;
+        let mut rune_infos: std::collections::HashMap<String, RuneInfo> =
+            std::collections::HashMap::new();
+        let mut id_by_name: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for chunk in distinct_names.chunks(RUNE_INFO_BATCH) {
+            let info_futures = chunk.iter().map(|name| self.get_rune_info(name.as_str()));
+            for result in futures_util::future::join_all(info_futures).await {
+                let info = result?;
+                id_by_name.insert(info.spaced_rune.clone(), info.id.clone());
+                rune_infos.insert(info.id.clone(), info);
+            }
+        }
+        // Some ord deployments key /outputs runes by unspaced name; bridge by
+        // comparing names with spacers stripped when the direct match misses.
+        let mut outpoint_runes: std::collections::HashMap<OutPoint, Vec<(String, u128)>> =
+            std::collections::HashMap::new();
+        for (op, held) in outpoint_rune_names {
+            let mut resolved: Vec<(String, u128)> = Vec::new();
+            for (name, amount) in held {
+                let id = id_by_name.get(&name).cloned().or_else(|| {
+                    let normalized: String = name.chars().filter(|c| *c != '•').collect();
+                    id_by_name
+                        .iter()
+                        .find(|(candidate, _)| {
+                            candidate.chars().filter(|c| *c != '•').collect::<String>()
+                                == normalized
+                        })
+                        .map(|(_, id)| id.clone())
+                });
+                let Some(id) = id else {
+                    return Err(OrdError::RequestFailed(format!(
+                        "Could not resolve rune id for '{name}' on {op}; refusing partial rune state"
+                    )));
+                };
+                resolved.push((id, amount));
+            }
+            outpoint_runes.insert(op, resolved);
         }
 
         // 3. Parallel per-inscription details (number/content_type/satpoint offset for display + shield).
@@ -599,10 +788,20 @@ impl OrdClient {
             }
         }
 
+        // Back-fill canonical IDs onto the aggregated balances.
+        let mut merged_balances = merge_rune_balances(rune_balances);
+        for balance in &mut merged_balances {
+            if balance.id.is_none() {
+                balance.id = id_by_name.get(&balance.rune).cloned();
+            }
+        }
+
         Ok(ResolvedAssets {
             inscriptions,
             protected_outpoints,
-            rune_balances: merge_rune_balances(rune_balances),
+            rune_balances: merged_balances,
+            outpoint_runes,
+            rune_infos,
         })
     }
 

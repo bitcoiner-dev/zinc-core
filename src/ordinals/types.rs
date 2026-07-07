@@ -112,6 +112,36 @@ pub struct RuneBalance {
     pub divisibility: Option<u8>,
     /// Optional rune symbol metadata from ord responses.
     pub symbol: Option<String>,
+    /// Canonical rune ID (`"block:tx"`) when resolved via rune metadata lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// Rune metadata resolved from ord-compatible `/rune/<id-or-name>` responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuneInfo {
+    /// Canonical rune ID (`"block:tx"`).
+    pub id: String,
+    /// Spaced rune name (for example `DOG•GO•TO•THE•MOON`).
+    pub spaced_rune: String,
+    /// Divisibility (number of decimal places).
+    pub divisibility: u8,
+    /// Symbol, when declared by the etching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Parent inscription id, when the etching has one (used as the rune's icon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Per-mint amount from open-mint terms (base units, decimal string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_amount: Option<String>,
+    /// Mint cap from open-mint terms (decimal string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_cap: Option<String>,
+    /// Whether ord currently reports the rune as mintable.
+    #[serde(default)]
+    pub mintable: bool,
 }
 
 // Fallback for missing Satpoints (default to all zeros? Or option?)

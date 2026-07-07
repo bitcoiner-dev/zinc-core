@@ -135,6 +135,7 @@ mod tests {
             amount: "340282366920938463463374607431768211456".to_string(),
             divisibility: Some(8),
             symbol: Some("¤".to_string()),
+            id: None,
         };
 
         let json = to_string(&rb).expect("serialize");
