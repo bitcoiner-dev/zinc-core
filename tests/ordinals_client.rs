@@ -255,4 +255,151 @@ mod tests {
             .expect("offer submission succeeds");
         m.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn get_rune_info_parses_ord_shape() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/rune/DOG%E2%80%A2GO%E2%80%A2TO%E2%80%A2THE%E2%80%A2MOON")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "840000:3",
+                    "mintable": false,
+                    "parent": "e79134080a83fe3e0e06ed6990c5a9b63b362313341745707a2bff7d788a1375i0",
+                    "entry": {
+                        "spaced_rune": "DOG•GO•TO•THE•MOON",
+                        "divisibility": 5,
+                        "symbol": "🐕",
+                        "terms": { "amount": 100, "cap": "1000" }
+                    }
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = OrdClient::new(server.url());
+        let info = client
+            .get_rune_info("DOG•GO•TO•THE•MOON")
+            .await
+            .expect("rune info resolves");
+
+        assert_eq!(info.id, "840000:3");
+        assert_eq!(info.spaced_rune, "DOG•GO•TO•THE•MOON");
+        assert_eq!(info.divisibility, 5);
+        assert_eq!(info.symbol.as_deref(), Some("🐕"));
+        assert_eq!(
+            info.parent.as_deref(),
+            Some("e79134080a83fe3e0e06ed6990c5a9b63b362313341745707a2bff7d788a1375i0")
+        );
+        assert_eq!(info.terms_amount.as_deref(), Some("100"));
+        assert_eq!(info.terms_cap.as_deref(), Some("1000"));
+        assert!(!info.mintable);
+    }
+
+    #[tokio::test]
+    async fn get_rune_info_without_id_fails() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/rune/NAMELESS")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{ "entry": { "spaced_rune": "NAMELESS" } }"#)
+            .create_async()
+            .await;
+
+        let client = OrdClient::new(server.url());
+        let err = client
+            .get_rune_info("NAMELESS")
+            .await
+            .expect_err("id-less rune info must fail");
+        assert!(err.to_string().contains("missing the rune id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_assets_emits_outpoint_runes_keyed_by_id() {
+        let mut server = Server::new_async().await;
+        let outpoint = "1111111111111111111111111111111111111111111111111111111111111111:0";
+        let _outputs = server
+            .mock("POST", "/outputs")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"[{{
+                    "outpoint": "{outpoint}",
+                    "address": "bc1qtest",
+                    "value": 546,
+                    "inscriptions": [],
+                    "runes": {{ "DOG•GO•TO•THE•MOON": {{ "amount": 1200, "divisibility": 5, "symbol": "🐕" }} }}
+                }}]"#
+            ))
+            .create_async()
+            .await;
+        let _rune = server
+            .mock("GET", "/rune/DOG%E2%80%A2GO%E2%80%A2TO%E2%80%A2THE%E2%80%A2MOON")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "840000:3",
+                    "mintable": false,
+                    "entry": { "spaced_rune": "DOG•GO•TO•THE•MOON", "divisibility": 5 }
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = OrdClient::new(server.url());
+        let resolved = client
+            .resolve_assets_for_outpoints(&[outpoint.to_string()])
+            .await
+            .expect("assets resolve");
+
+        let op: bitcoin::OutPoint = outpoint.parse().unwrap();
+        assert_eq!(
+            resolved.outpoint_runes.get(&op),
+            Some(&vec![("840000:3".to_string(), 1_200u128)])
+        );
+        assert!(resolved.rune_infos.contains_key("840000:3"));
+        assert_eq!(
+            resolved.rune_balances[0].id.as_deref(),
+            Some("840000:3")
+        );
+        assert!(resolved.protected_outpoints.contains(&op));
+    }
+
+    #[tokio::test]
+    async fn resolve_assets_fails_closed_when_rune_info_unavailable() {
+        let mut server = Server::new_async().await;
+        let outpoint = "2222222222222222222222222222222222222222222222222222222222222222:0";
+        let _outputs = server
+            .mock("POST", "/outputs")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"[{{
+                    "outpoint": "{outpoint}",
+                    "address": "bc1qtest",
+                    "value": 546,
+                    "inscriptions": [],
+                    "runes": {{ "GHOST•RUNE": {{ "amount": 1, "divisibility": 0 }} }}
+                }}]"#
+            ))
+            .create_async()
+            .await;
+        let _rune = server
+            .mock("GET", "/rune/GHOST%E2%80%A2RUNE")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = OrdClient::new(server.url());
+        let err = client
+            .resolve_assets_for_outpoints(&[outpoint.to_string()])
+            .await
+            .expect_err("unresolvable rune id must fail the sync");
+        assert!(err.to_string().contains("API Error (Rune"), "{err}");
+    }
 }
