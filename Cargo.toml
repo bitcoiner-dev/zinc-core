@@ -1,8 +1,8 @@
 [package]
 name = "zinc-core"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.80"
 license = "MIT"
 description = "Core Rust library for Zinc Bitcoin + Ordinals wallet"
 readme = "README.md"
@@ -45,6 +45,7 @@ log = "0.4"
 bdk_wallet = "2.3.0"
 bdk_chain = "0.23"
 bitcoin = { version = "0.32", default-features = false, features = ["secp-lowmemory", "secp-recovery", "std"] }
+ordinals = "0.0.15"
 
 # BIP-39 & Crypto
 bip39 = { version = "2.1", features = ["zeroize"] }
