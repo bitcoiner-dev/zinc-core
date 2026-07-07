@@ -3194,3 +3194,16 @@ impl ZincWasmWallet {
 // `tests/wasm_*.rs`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod tests;
+
+/// Quickly converts a byte slice to a hex string.
+/// PERFORMANCE OPTIMIZATION (Bolt):
+/// Replaces formatting allocations and UTF-8 checks with direct nibble lookup map.
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX_CHARS[(byte >> 4) as usize]);
+        out.push(HEX_CHARS[(byte & 0x0f) as usize]);
+    }
+    String::from_utf8(out).unwrap()
+}
