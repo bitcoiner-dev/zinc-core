@@ -190,7 +190,7 @@ pub(crate) fn simulate_rune_flow(
     let artifact = Runestone::decipher(tx);
 
     let mut burned: BTreeMap<RuneId, u128> = BTreeMap::new();
-    let mut burn = |map: &mut BTreeMap<RuneId, u128>, id: RuneId, amount: u128| {
+    let burn = |map: &mut BTreeMap<RuneId, u128>, id: RuneId, amount: u128| {
         if amount > 0 {
             let entry = map.entry(id).or_insert(0);
             *entry = entry.saturating_add(amount);
