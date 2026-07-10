@@ -1943,11 +1943,10 @@ impl ZincWasmWallet {
             let (sync_req, sync_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
-                        if inner.is_syncing {
+                        if !inner.try_begin_sync(js_sys::Date::now()) {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Sync already in progress, skipping.");
                             return Err(JsValue::from_str("Wallet Busy: Sync already in progress"));
                         }
-                        inner.is_syncing = true;
                         zinc_log_debug!(target: LOG_TARGET_WASM, "borrow successful, preparing requests");
                         // Consume any pending full-rescan request: full scan once, then incremental.
                         let force_full = inner.force_next_full;
@@ -2102,6 +2101,7 @@ impl ZincWasmWallet {
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "FAILED TO BORROW MUT INNER: {:?}", e);
+                        ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
                         return Err(JsValue::from_str(&format!(
                             "Failed to borrow wallet inner state (mut): {}",
                             e
@@ -2483,18 +2483,33 @@ impl ZincWasmWallet {
             let (outpoints, wallet_height, sync_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
-                        if inner.is_syncing {
+                        if !inner.try_begin_sync(js_sys::Date::now()) {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Ord sync skipped: Wallet is busy syncing.");
                             return Err(JsValue::from_str(
                                 "Wallet Busy: Operation already in progress",
                             ));
                         }
-                        inner.is_syncing = true;
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collecting UTXO outpoints...");
                         // Inscriptions/runes are UTXO-bound, so we bulk-query exactly our own outpoints
                         // (POST /outputs) — one request instead of per-address + per-output round-trips.
                         let ops = inner.collect_utxo_outpoints();
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collected {} outpoints", ops.len());
+                        // A wallet with zero outpoints but a non-empty inscription list is almost
+                        // certainly not chain-synced yet (fresh instance, failed/foreign changeset
+                        // load, mid-rescan) — resolving an empty outpoint list would "verify" an
+                        // empty ordinals state and wipe real inscriptions. Fail unverified instead
+                        // and let a later sync (after BDK has UTXOs) settle it.
+                        if ops.is_empty() && !inner.inscriptions.is_empty() {
+                            inner.ordinals_verified = false;
+                            inner.is_syncing = false;
+                            zinc_log_info!(target: LOG_TARGET_WASM,
+                                "sync_ordinals: wallet has no outpoints but {} known inscriptions; refusing empty verify",
+                                inner.inscriptions.len()
+                            );
+                            return Err(JsValue::from_str(
+                                "Ordinals sync skipped: wallet has no UTXOs yet (not chain-synced?)",
+                            ));
+                        }
                         let height = inner.vault_wallet.local_chain().tip().height();
                         (ops, height, inner.account_generation())
                     }
@@ -2541,6 +2556,10 @@ impl ZincWasmWallet {
                             "sync_ordinals: Failed to borrow mut for lag update: {}",
                             e
                         );
+                        ZincWasmWallet::clear_syncing_if_generation_matches(
+                            &inner_rc,
+                            sync_generation,
+                        );
                     }
                 }
                 return Err(JsValue::from_str(&format!(
@@ -2549,23 +2568,56 @@ impl ZincWasmWallet {
                 )));
             }
 
-            // 2b. Resolve inscriptions + runes + protected outpoints in ONE bulk pass: a single
+            // 2b. Restrict the bulk query to outpoints ord is guaranteed to have indexed:
+            // confirmed at a height ≤ ord's indexed height. Ord 404s the WHOLE bulk request
+            // when any requested outpoint is unknown to it, and the wallet always holds
+            // unknowable outpoints right after a send/inscribe (unconfirmed change/postage) or
+            // during ord's allowed 1-block lag — querying those wedged every ordinals sync
+            // for the entire pending window and blanked the artifacts UI.
+            // Excluded outpoints match the pre-bulk (address-based) semantics: mempool outputs
+            // were invisible to ord there too, and they get classified on a later sync once
+            // confirmed and indexed.
+            let total_outpoints = outpoints.len();
+            let queryable_outpoints: Vec<String> = outpoints
+                .into_iter()
+                .filter_map(|(op, confirmation_height)| match confirmation_height {
+                    Some(height) if height <= ord_height => Some(op),
+                    _ => None,
+                })
+                .collect();
+            if queryable_outpoints.len() < total_outpoints {
+                zinc_log_debug!(target: LOG_TARGET_WASM,
+                    "sync_ordinals: skipping {} outpoint(s) not yet indexable by ord (unconfirmed or above ord height {})",
+                    total_outpoints - queryable_outpoints.len(),
+                    ord_height
+                );
+            }
+
+            // 2c. Resolve inscriptions + runes + protected outpoints in ONE bulk pass: a single
             // `POST /outputs` over our own UTXO outpoints (batched/concurrent) yields inscription ids +
             // runes + protected status, then per-inscription details are fetched in parallel. This
             // replaces the old per-address + per-output round-trip storm (the "ages to populate" cause).
             // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
             // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
-            let resolved = match client.resolve_assets_for_outpoints(&outpoints).await {
+            let resolved = match client.resolve_assets_for_outpoints(&queryable_outpoints).await {
                 Ok(r) => r,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);
-                    if let Ok(mut inner) = inner_rc.try_borrow_mut() {
-                        if inner.account_generation() != sync_generation {
-                            return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                    match inner_rc.try_borrow_mut() {
+                        Ok(mut inner) => {
+                            if inner.account_generation() != sync_generation {
+                                return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                            }
+                            inner.ordinals_verified = false;
+                            inner.is_syncing = false;
                         }
-                        inner.ordinals_verified = false;
-                        inner.is_syncing = false;
+                        Err(_) => {
+                            ZincWasmWallet::clear_syncing_if_generation_matches(
+                                &inner_rc,
+                                sync_generation,
+                            );
+                        }
                     }
                     return Err(JsValue::from_str(&e.to_string()));
                 }
@@ -2599,6 +2651,10 @@ impl ZincWasmWallet {
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: FAILED TO BORROW MUT: {:?}", e);
+                        ZincWasmWallet::clear_syncing_if_generation_matches(
+                            &inner_rc,
+                            sync_generation,
+                        );
                         return Err(JsValue::from_str(&format!("Failed to borrow mut: {}", e)));
                     }
                 }
