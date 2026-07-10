@@ -409,6 +409,12 @@ pub struct ZincWallet {
     /// Guard flag used to prevent overlapping sync operations.
     #[allow(dead_code)]
     pub(crate) is_syncing: bool,
+    /// Timestamp (ms) when the sync latch was last acquired. Used to detect a latch held by an
+    /// abandoned sync future (e.g. a hung network fetch whose JS caller gave up) so it cannot
+    /// wedge syncing forever. The latch is advisory dedup only — state safety comes from
+    /// `account_generation` checks plus `RefCell` serialization, not from this flag.
+    #[allow(dead_code)]
+    pub(crate) sync_latch_started_at_ms: f64,
     /// Monotonic generation used to invalidate stale async operations.
     pub(crate) account_generation: u64,
     /// When set, the next `prepare_requests` returns a Full (gap-limit) scan instead of an
@@ -449,6 +455,11 @@ pub struct ZincBalance {
 
 /// Minimum sats kept with an inscription when estimating salvageable cardinal value.
 const MIN_SALVAGE_PADDING_SATS: u64 = 546;
+/// Age after which a held sync latch is considered abandoned and may be taken over.
+/// JS callers give up on sync futures after 60s (BDK) / 30s (ordinals); anything holding
+/// the latch past this is a hung fetch, not a live sync.
+#[allow(dead_code)]
+pub(crate) const SYNC_LATCH_STALE_MS: f64 = 120_000.0;
 const DEFAULT_DAPP_ADDRESS_SCAN_DEPTH: u32 = 20;
 const DAPP_SIGN_ADDRESS_SEARCH_DEPTH: u32 = 1000;
 
@@ -905,6 +916,28 @@ impl ZincWallet {
         self.is_syncing
     }
 
+    /// Try to acquire the sync latch. Returns `false` when another sync is genuinely in
+    /// progress. A latch older than [`SYNC_LATCH_STALE_MS`] is treated as abandoned (its
+    /// future was dropped by the caller or is stuck on a dead connection) and taken over,
+    /// so a single hung sync cannot permanently block all future syncs.
+    #[allow(dead_code)]
+    pub(crate) fn try_begin_sync(&mut self, now_ms: f64) -> bool {
+        if self.is_syncing {
+            let held_for_ms = now_ms - self.sync_latch_started_at_ms;
+            if held_for_ms < SYNC_LATCH_STALE_MS {
+                return false;
+            }
+            zinc_log_info!(
+                target: LOG_TARGET_BUILDER,
+                "sync latch held for {:.0}ms; assuming abandoned sync and taking over",
+                held_for_ms
+            );
+        }
+        self.is_syncing = true;
+        self.sync_latch_started_at_ms = now_ms;
+        true
+    }
+
     /// Return whether ordinals protection data is verified.
     #[must_use]
     pub fn ordinals_verified(&self) -> bool {
@@ -957,6 +990,22 @@ impl ZincWallet {
 
     fn dual_payment_purpose(&self) -> u32 {
         self.payment_address_type.purpose()
+    }
+
+    /// Ensure the wallet's primary receive paths (external index 0) are in BDK's REVEALED
+    /// set. The wallet's UX pins receiving to index 0 via `peek_*` helpers — and peeking
+    /// does NOT reveal — so without this no incremental sync
+    /// (`start_sync_with_revealed_spks`) ever queries the primary address, and anything
+    /// received there (e.g. a dapp inscribe's reveal postage) stays undiscovered until a
+    /// full rescan. Idempotent: revealing up to an already-revealed index is a no-op.
+    pub(crate) fn ensure_primary_spks_revealed(&mut self) {
+        let _: Vec<_> = self
+            .vault_wallet
+            .reveal_addresses_to(KeychainKind::External, 0)
+            .collect();
+        if let Some(w) = &mut self.payment_wallet {
+            let _: Vec<_> = w.reveal_addresses_to(KeychainKind::External, 0).collect();
+        }
     }
 
     /// Return `true` when wallet state indicates a full scan is needed.
@@ -1235,6 +1284,12 @@ impl ZincWallet {
         self.account_generation += 1;
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = false;
+        // In-flight syncs of the old generation bail on the generation check without clearing
+        // the latch, so release it here or the new account could never sync.
+        self.is_syncing = false;
+        // The rebuilt wallets start with nothing revealed; restore the primary-receive
+        // invariant so incremental syncs keep covering index 0.
+        self.ensure_primary_spks_revealed();
 
         Ok(())
     }
@@ -1369,10 +1424,13 @@ impl ZincWallet {
         addresses
     }
 
-    /// All wallet outpoints ("txid:vout") across vault + payment keychains, from the BDK UTXO set.
+    /// All wallet outpoints ("txid:vout") across vault + payment keychains, from the BDK UTXO set,
+    /// each paired with its confirmation height (`None` while unconfirmed).
     /// These are the only outputs that can hold our inscriptions/runes, so the ordinals sync can
     /// bulk-query exactly these via `POST /outputs` — one request instead of per-address/per-output.
-    pub fn collect_utxo_outpoints(&self) -> Vec<String> {
+    /// Callers must restrict the ord query to outpoints confirmed at heights ord has indexed:
+    /// ord 404s the whole bulk request when ANY requested outpoint is unknown to it.
+    pub fn collect_utxo_outpoints(&self) -> Vec<(String, Option<u32>)> {
         let mut outpoints = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -1380,7 +1438,15 @@ impl ZincWallet {
             for u in wallet.list_unspent() {
                 let op = u.outpoint.to_string();
                 if seen.insert(op.clone()) {
-                    outpoints.push(op);
+                    // Ord only indexes confirmed outputs, so callers need each outpoint's
+                    // confirmation height to know whether ord can be expected to know it.
+                    let confirmation_height = match &u.chain_position {
+                        bdk_chain::ChainPosition::Confirmed { anchor, .. } => {
+                            Some(anchor.block_id.height)
+                        }
+                        bdk_chain::ChainPosition::Unconfirmed { .. } => None,
+                    };
+                    outpoints.push((op, confirmation_height));
                 }
             }
         };
@@ -4179,7 +4245,7 @@ impl WalletBuilder {
                 (None, None)
             };
 
-        Ok(ZincWallet {
+        let mut wallet = ZincWallet {
             vault_wallet,
             payment_wallet,
             scheme: self.scheme,
@@ -4199,9 +4265,12 @@ impl WalletBuilder {
             ordinals_metadata_complete: false,
             kind,
             is_syncing: false,
+            sync_latch_started_at_ms: 0.0,
             account_generation: 0,
             force_next_full: false,
-        })
+        };
+        wallet.ensure_primary_spks_revealed();
+        Ok(wallet)
     }
 
     /// Build a hardware wallet profile from public descriptors.
@@ -4316,7 +4385,7 @@ impl WalletBuilder {
             (None, None)
         };
 
-        Ok(ZincWallet {
+        let mut wallet = ZincWallet {
             vault_wallet,
             payment_wallet,
             scheme,
@@ -4340,9 +4409,12 @@ impl WalletBuilder {
                 payment_external: payment_external_desc,
             },
             is_syncing: false,
+            sync_latch_started_at_ms: 0.0,
             account_generation: 0,
             force_next_full: false,
-        })
+        };
+        wallet.ensure_primary_spks_revealed();
+        Ok(wallet)
     }
 }
 
@@ -4394,5 +4466,48 @@ mod tests {
             explicit_start,
         );
         assert_eq!(req.start_time(), explicit_start);
+    }
+
+    #[test]
+    fn sync_latch_blocks_live_sync_and_takes_over_stale_one() {
+        use bdk_wallet::bitcoin::bip32::Xpriv;
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
+        let mut wallet = WalletBuilder::new(Network::Signet)
+            .kind(WalletKind::Seed { master_xprv })
+            .build()
+            .unwrap();
+
+        let t0 = 1_000.0;
+        assert!(wallet.try_begin_sync(t0));
+        assert!(wallet.is_syncing());
+
+        // A live latch (younger than the stale threshold) blocks a second sync.
+        assert!(!wallet.try_begin_sync(t0 + SYNC_LATCH_STALE_MS - 1.0));
+
+        // A latch past the stale threshold is treated as abandoned and taken over.
+        assert!(wallet.try_begin_sync(t0 + SYNC_LATCH_STALE_MS));
+        assert!(wallet.is_syncing());
+    }
+
+    #[test]
+    fn account_switch_releases_sync_latch() {
+        use bdk_wallet::bitcoin::bip32::Xpriv;
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
+        let mut wallet = WalletBuilder::new(Network::Signet)
+            .kind(WalletKind::Seed { master_xprv })
+            .build()
+            .unwrap();
+
+        assert!(wallet.try_begin_sync(1_000.0));
+        let generation_before = wallet.account_generation();
+
+        wallet.reset_sync_state().expect("reset succeeds");
+
+        assert!(!wallet.is_syncing());
+        assert_eq!(wallet.account_generation(), generation_before + 1);
     }
 }

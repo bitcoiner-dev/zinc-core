@@ -84,6 +84,60 @@ mod tests {
     }
 
     #[test]
+    fn primary_receive_spk_is_revealed_for_incremental_sync() {
+        // The wallet pins receiving to external index 0 via peek helpers, which do NOT
+        // reveal. If index 0 is not in BDK's revealed set, incremental syncs
+        // (start_sync_with_revealed_spks) never query the primary address and receives
+        // to it stay invisible until a full rescan.
+        let w = unified();
+        assert_eq!(
+            w.vault_wallet.derivation_index(KeychainKind::External),
+            Some(0),
+            "external index 0 must be revealed at construction"
+        );
+
+        // start_sync_with_revealed_spks includes every revealed spk by contract, so the
+        // revealed index above is what guarantees incremental syncs query the primary
+        // address. (A fresh wallet still full-scans first — tip is at genesis.)
+    }
+
+    #[test]
+    fn reset_sync_state_restores_primary_reveal() {
+        let mut w = unified();
+        w.reset_sync_state().expect("reset succeeds");
+        assert_eq!(
+            w.vault_wallet.derivation_index(KeychainKind::External),
+            Some(0),
+            "rebuilt wallet must re-reveal external index 0"
+        );
+    }
+
+    #[test]
+    fn collect_utxo_outpoints_pairs_confirmation_heights() {
+        let mut w = unified();
+        let ops = fund(&mut w, &[(10_000, true), (30_000, false)]);
+
+        let collected = w.collect_utxo_outpoints();
+        assert_eq!(collected.len(), 2, "both UTXOs are collected");
+
+        let confirmed = collected
+            .iter()
+            .find(|(op, _)| *op == ops[0].to_string())
+            .expect("confirmed outpoint present");
+        assert_eq!(
+            confirmed.1,
+            Some(100),
+            "confirmed UTXO carries its anchor height"
+        );
+
+        let unconfirmed = collected
+            .iter()
+            .find(|(op, _)| *op == ops[1].to_string())
+            .expect("unconfirmed outpoint present");
+        assert_eq!(unconfirmed.1, None, "unconfirmed UTXO has no height");
+    }
+
+    #[test]
     fn get_balance_excludes_inscribed_from_spendable() {
         let mut w = unified();
         let ops = fund(&mut w, &[(10_000, true), (50_000, true)]);
