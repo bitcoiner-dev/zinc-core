@@ -243,3 +243,14 @@ mod tests {
         assert_ne!(&*k1a, &*k2);
     }
 }
+
+// PERFORMANCE OPTIMIZATION (Bolt): Fast hex encoding without formatting allocations
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX_CHARS[(b >> 4) as usize]);
+        out.push(HEX_CHARS[(b & 0x0f) as usize]);
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
