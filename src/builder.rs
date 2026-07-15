@@ -141,6 +141,64 @@ impl TryFrom<CreatePsbtTransportRequest> for CreatePsbtRequest {
     }
 }
 
+/// Exact Rune transfer contract carried across UI/WASM/signing boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuneTransferIntent {
+    /// Canonical Rune ID in `block:tx` form.
+    pub rune_id: String,
+    /// Raw base-unit amount as a decimal string.
+    pub amount: String,
+    /// Network-checked recipient address.
+    pub recipient: String,
+    /// Output which must receive exactly `amount` of `rune_id`.
+    pub recipient_vout: u32,
+}
+
+/// Transport-safe request for constructing a Rune transfer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRuneTransferRequest {
+    /// Canonical Rune ID in `block:tx` form.
+    pub rune_id: String,
+    /// Raw base-unit amount as a decimal string.
+    pub amount: String,
+    /// Recipient address.
+    pub recipient: String,
+    /// Fee rate in sat/vB.
+    pub fee_rate_sat_vb: u64,
+    /// Optional postage override. Defaults to 546 sats and is raised to the
+    /// scripts' minimum non-dust value when necessary.
+    #[serde(default)]
+    pub postage_sats: Option<u64>,
+}
+
+/// Audited Rune transfer construction result.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuneTransferResult {
+    /// Unsigned PSBT encoded as base64.
+    pub psbt: String,
+    /// Exact fee in satoshis.
+    pub fee_sats: u64,
+    /// Estimated signed virtual size.
+    pub vsize: u64,
+    /// Postage attached to recipient and Rune change outputs.
+    pub postage_sats: u64,
+    /// Deterministically selected Rune-bearing inputs.
+    pub rune_input_outpoints: Vec<String>,
+    /// Additional cardinal-only inputs selected to pay postage/fees.
+    pub cardinal_input_outpoints: Vec<String>,
+    /// Intent callers must pass back to `signPsbt`.
+    pub intent: RuneTransferIntent,
+    /// Wallet-owned Rune change output, when needed.
+    pub rune_change_vout: Option<u32>,
+    /// Intent-aware Shield analysis. Canonical exact sends use Rune default
+    /// transfer; its generic foreign-output warning is removed only after the
+    /// exact intent has passed engine validation.
+    pub analysis: crate::ordinals::shield::AnalysisResult,
+}
+
 /// Address derivation mode for a wallet account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressScheme {
@@ -2798,6 +2856,495 @@ impl ZincWallet {
         Ok(Self::encode_psbt_base64(&psbt))
     }
 
+    /// Construct an ord-compatible Rune transfer and prove its allocation
+    /// before returning it. Input and output selection mirrors ord's wallet:
+    /// Rune UTXOs are accumulated in outpoint order, inscription-bearing
+    /// outputs are excluded, and a runestone plus Rune-change output is only
+    /// emitted when target or non-target Rune change must return to the wallet.
+    pub fn create_rune_transfer(
+        &self,
+        request: &CreateRuneTransferRequest,
+    ) -> Result<RuneTransferResult, ZincError> {
+        use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        use ordinals::{Artifact, Edict, RuneId, Runestone};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        if !self.ordinals_verified {
+            return Err(ZincError::WalletError(
+                "Ordinals verification failed - safety lock engaged. Please retry sync."
+                    .to_string(),
+            ));
+        }
+        if self.kind.is_watch() {
+            return Err(ZincError::CapabilityMissing);
+        }
+
+        let rune_id = request.rune_id.parse::<RuneId>().map_err(|e| {
+            ZincError::ConfigError(format!("Invalid Rune ID `{}`: {e}", request.rune_id))
+        })?;
+        let amount = request.amount.parse::<u128>().map_err(|e| {
+            ZincError::ConfigError(format!("Invalid Rune amount `{}`: {e}", request.amount))
+        })?;
+        if amount == 0 {
+            return Err(ZincError::ConfigError(
+                "Rune amount must be greater than zero".to_string(),
+            ));
+        }
+        let fee_rate = FeeRate::from_sat_per_vb(request.fee_rate_sat_vb)
+            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let recipient = Address::from_str(&request.recipient)
+            .map_err(|e| ZincError::ConfigError(format!("Invalid recipient address: {e}")))?
+            .require_network(self.vault_wallet.network())
+            .map_err(|e| ZincError::ConfigError(format!("Recipient network mismatch: {e}")))?;
+
+        let mut owned: BTreeMap<bitcoin::OutPoint, TxOut> = BTreeMap::new();
+        for utxo in self.vault_wallet.list_unspent() {
+            owned.insert(utxo.outpoint, utxo.txout.clone());
+        }
+        if let Some(wallet) = &self.payment_wallet {
+            for utxo in wallet.list_unspent() {
+                owned.insert(utxo.outpoint, utxo.txout.clone());
+            }
+        }
+
+        let inscription_outpoints: BTreeSet<bitcoin::OutPoint> = self
+            .inscriptions
+            .iter()
+            .map(|inscription| inscription.satpoint.outpoint)
+            .collect();
+        let canonical_id = rune_id.to_string();
+        let mut rune_inputs: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
+        let mut input_rune_balances: BTreeMap<RuneId, u128> = BTreeMap::new();
+
+        let mut rune_candidates: Vec<_> = self.outpoint_runes.iter().collect();
+        rune_candidates.sort_by_key(|(outpoint, _)| **outpoint);
+        for (outpoint, held) in rune_candidates {
+            let target_on_output = held
+                .iter()
+                .filter(|(id, _)| id == &canonical_id)
+                .try_fold(0_u128, |total, (_, value)| total.checked_add(*value))
+                .ok_or_else(|| ZincError::WalletError("Rune balance overflow".to_string()))?;
+            if target_on_output == 0 {
+                continue;
+            }
+            if inscription_outpoints.contains(outpoint) {
+                continue;
+            }
+            let txout = owned.get(outpoint).cloned().ok_or_else(|| {
+                ZincError::WalletError(format!(
+                    "Rune-bearing UTXO is no longer available in the wallet: {outpoint}"
+                ))
+            })?;
+            for (id, value) in held {
+                let parsed = id.parse::<RuneId>().map_err(|e| {
+                    ZincError::WalletError(format!(
+                        "Verified Rune cache contains invalid ID `{id}` on {outpoint}: {e}"
+                    ))
+                })?;
+                let entry = input_rune_balances.entry(parsed).or_default();
+                *entry = entry
+                    .checked_add(*value)
+                    .ok_or_else(|| ZincError::WalletError("Rune balance overflow".to_string()))?;
+            }
+            rune_inputs.push((*outpoint, txout));
+            if input_rune_balances
+                .get(&rune_id)
+                .copied()
+                .unwrap_or_default()
+                >= amount
+            {
+                break;
+            }
+        }
+
+        let selected_target = input_rune_balances
+            .get(&rune_id)
+            .copied()
+            .unwrap_or_default();
+        if selected_target < amount {
+            return Err(ZincError::WalletError(format!(
+                "Insufficient Rune balance for {canonical_id}: have {selected_target}, need {amount}"
+            )));
+        }
+        let needs_rune_change = selected_target > amount || input_rune_balances.len() > 1;
+
+        let active_index = self.active_receive_index();
+        let rune_change_address = self.peek_taproot_address(active_index);
+        let btc_change_address = self
+            .peek_payment_address(active_index)
+            .unwrap_or_else(|| rune_change_address.clone());
+        let recipient_script = recipient.script_pubkey();
+        let rune_change_script = rune_change_address.script_pubkey();
+        let btc_change_script = btc_change_address.script_pubkey();
+        let postage = request.postage_sats.unwrap_or(546).max(
+            recipient_script
+                .minimal_non_dust()
+                .to_sat()
+                .max(rune_change_script.minimal_non_dust().to_sat()),
+        );
+
+        let recipient_vout = if needs_rune_change { 2 } else { 0 };
+        let runestone = needs_rune_change.then(|| Runestone {
+            edicts: vec![Edict {
+                id: rune_id,
+                amount,
+                output: recipient_vout,
+            }],
+            ..Runestone::default()
+        });
+
+        let mut base_outputs = if let Some(runestone) = &runestone {
+            vec![
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: runestone.encipher(),
+                },
+                TxOut {
+                    value: Amount::from_sat(postage),
+                    script_pubkey: rune_change_script,
+                },
+                TxOut {
+                    value: Amount::from_sat(postage),
+                    script_pubkey: recipient_script,
+                },
+            ]
+        } else {
+            vec![TxOut {
+                value: Amount::from_sat(postage),
+                script_pubkey: recipient_script,
+            }]
+        };
+
+        let selected_rune_outpoints: BTreeSet<_> =
+            rune_inputs.iter().map(|(outpoint, _)| *outpoint).collect();
+        let mut cardinal_candidates: Vec<(bitcoin::OutPoint, TxOut)> = owned
+            .into_iter()
+            .filter(|(outpoint, _)| {
+                !selected_rune_outpoints.contains(outpoint)
+                    && !self.inscribed_utxos.contains(outpoint)
+                    && !self.outpoint_runes.contains_key(outpoint)
+            })
+            .collect();
+        cardinal_candidates.sort_by_key(|(outpoint, _)| *outpoint);
+
+        let mut selected_inputs = rune_inputs.clone();
+        let mut cardinal_inputs = Vec::new();
+        let base_output_value = postage
+            .checked_mul(if needs_rune_change { 2 } else { 1 })
+            .ok_or_else(|| ZincError::WalletError("Postage overflow".to_string()))?;
+
+        let estimate_vsize = |inputs: &[(bitcoin::OutPoint, TxOut)], outputs: &[TxOut]| -> u64 {
+            let dummy_inputs = inputs
+                .iter()
+                .map(|(outpoint, txout)| {
+                    let mut witness = Witness::new();
+                    if txout.script_pubkey.is_p2tr() {
+                        witness.push(vec![0_u8; 64]);
+                    } else {
+                        witness.push(vec![0_u8; 72]);
+                        witness.push(vec![0_u8; 33]);
+                    }
+                    TxIn {
+                        previous_output: *outpoint,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness,
+                    }
+                })
+                .collect();
+            Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: dummy_inputs,
+                output: outputs.to_vec(),
+            }
+            .vsize() as u64
+        };
+
+        let (outputs, fee_sats, vsize) = loop {
+            let total_input = selected_inputs.iter().try_fold(0_u64, |total, (_, txout)| {
+                total.checked_add(txout.value.to_sat())
+            });
+            let total_input = total_input
+                .ok_or_else(|| ZincError::WalletError("Input value overflow".to_string()))?;
+            let no_change_vsize = estimate_vsize(&selected_inputs, &base_outputs);
+            let no_change_fee = no_change_vsize
+                .checked_mul(fee_rate.to_sat_per_vb_ceil())
+                .ok_or_else(|| ZincError::WalletError("Fee overflow".to_string()))?;
+
+            if total_input >= base_output_value.saturating_add(no_change_fee) {
+                let mut with_change = base_outputs.clone();
+                with_change.push(TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: btc_change_script.clone(),
+                });
+                let with_change_vsize = estimate_vsize(&selected_inputs, &with_change);
+                let with_change_fee = with_change_vsize
+                    .checked_mul(fee_rate.to_sat_per_vb_ceil())
+                    .ok_or_else(|| ZincError::WalletError("Fee overflow".to_string()))?;
+                let btc_change = total_input
+                    .checked_sub(base_output_value.saturating_add(with_change_fee))
+                    .unwrap_or_default();
+                if btc_change >= btc_change_script.minimal_non_dust().to_sat() {
+                    if let Some(output) = with_change.last_mut() {
+                        output.value = Amount::from_sat(btc_change);
+                    }
+                    break (with_change, with_change_fee, with_change_vsize);
+                }
+
+                // Any sub-dust remainder is fee, matching Core's funding behavior.
+                let actual_fee = total_input.saturating_sub(base_output_value);
+                break (base_outputs.clone(), actual_fee, no_change_vsize);
+            }
+
+            let Some(next) = cardinal_candidates.first().cloned() else {
+                return Err(ZincError::WalletError(format!(
+                    "Insufficient cardinal BTC for Rune postage and fees at {} sat/vB",
+                    request.fee_rate_sat_vb
+                )));
+            };
+            cardinal_candidates.remove(0);
+            cardinal_inputs.push(next.clone());
+            selected_inputs.push(next);
+        };
+        base_outputs = outputs;
+
+        let tx_inputs = selected_inputs
+            .iter()
+            .map(|(outpoint, _)| TxIn {
+                previous_output: *outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            })
+            .collect();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: tx_inputs,
+            output: base_outputs,
+        };
+        if let Some(expected) = runestone {
+            if Runestone::decipher(&tx) != Some(Artifact::Runestone(expected)) {
+                return Err(ZincError::WalletError(
+                    "Constructed runestone failed canonical round-trip verification".to_string(),
+                ));
+            }
+        }
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| {
+            ZincError::WalletError(format!("Failed to build Rune transfer PSBT: {e}"))
+        })?;
+        for (index, (_, txout)) in selected_inputs.iter().enumerate() {
+            psbt.inputs[index].witness_utxo = Some(txout.clone());
+        }
+
+        let intent = RuneTransferIntent {
+            rune_id: canonical_id,
+            amount: amount.to_string(),
+            recipient: recipient.to_string(),
+            recipient_vout,
+        };
+        self.validate_rune_transfer_psbt(&psbt, &intent)
+            .map_err(ZincError::WalletError)?;
+        let analysis = self
+            .analyze_validated_rune_transfer_psbt(&psbt, &intent)
+            .map_err(ZincError::WalletError)?;
+
+        Ok(RuneTransferResult {
+            psbt: Self::encode_psbt_base64(&psbt),
+            fee_sats,
+            vsize,
+            postage_sats: postage,
+            rune_input_outpoints: rune_inputs
+                .iter()
+                .map(|(outpoint, _)| outpoint.to_string())
+                .collect(),
+            cardinal_input_outpoints: cardinal_inputs
+                .iter()
+                .map(|(outpoint, _)| outpoint.to_string())
+                .collect(),
+            intent,
+            rune_change_vout: needs_rune_change.then_some(1),
+            analysis,
+        })
+    }
+
+    /// Return Shield analysis normalized for an already-proven internal Rune
+    /// intent. This only suppresses the two generic default-transfer warnings
+    /// generated by the exact-send shape used by ord.
+    pub fn analyze_validated_rune_transfer_psbt(
+        &self,
+        psbt: &Psbt,
+        intent: &RuneTransferIntent,
+    ) -> Result<crate::ordinals::shield::AnalysisResult, String> {
+        self.validate_rune_transfer_psbt(psbt, intent)?;
+        let analysis_json = self.analyze_psbt(&Self::encode_psbt_base64(psbt))?;
+        let mut analysis: crate::ordinals::shield::AnalysisResult =
+            serde_json::from_str(&analysis_json)
+                .map_err(|e| format!("Failed to decode Rune Shield analysis: {e}"))?;
+        let is_exact_default_transfer = analysis
+            .rune_actions
+            .as_ref()
+            .is_some_and(|actions| actions.default_transfer_without_runestone);
+        if is_exact_default_transfer {
+            analysis.warnings.retain(|warning| {
+                !warning.contains("transaction has no runestone")
+                    && !warning.contains("default-transfer to an output that does not belong")
+            });
+            analysis.warning_level = crate::ordinals::shield::WarningLevel::Safe;
+        }
+        Ok(analysis)
+    }
+
+    /// Re-run the full Rune allocation simulation and enforce the exact
+    /// transfer contract. This is used both after construction and immediately
+    /// before signing, so a mutated PSBT cannot redirect or burn Rune change.
+    pub fn validate_rune_transfer_psbt(
+        &self,
+        psbt: &Psbt,
+        intent: &RuneTransferIntent,
+    ) -> Result<(), String> {
+        use bitcoin::ScriptBuf;
+        use ordinals::RuneId;
+        use std::collections::BTreeMap;
+
+        let rune_id = intent
+            .rune_id
+            .parse::<RuneId>()
+            .map_err(|e| format!("Invalid Rune intent ID: {e}"))?
+            .to_string();
+        let requested = intent
+            .amount
+            .parse::<u128>()
+            .map_err(|e| format!("Invalid Rune intent amount: {e}"))?;
+        if requested == 0 {
+            return Err("Rune transfer amount must be greater than zero".to_string());
+        }
+        let recipient = Address::from_str(&intent.recipient)
+            .map_err(|e| format!("Invalid Rune intent recipient: {e}"))?
+            .require_network(self.vault_wallet.network())
+            .map_err(|e| format!("Rune intent recipient network mismatch: {e}"))?;
+        let recipient_index = usize::try_from(intent.recipient_vout)
+            .map_err(|_| "Rune recipient output index is invalid".to_string())?;
+        let recipient_output = psbt
+            .unsigned_tx
+            .output
+            .get(recipient_index)
+            .ok_or_else(|| "Rune recipient output is missing".to_string())?;
+        if recipient_output.script_pubkey != recipient.script_pubkey() {
+            return Err("Rune recipient output does not match the approved address".to_string());
+        }
+
+        let analysis_json = self.analyze_psbt(&Self::encode_psbt_base64(psbt))?;
+        let analysis: crate::ordinals::shield::AnalysisResult =
+            serde_json::from_str(&analysis_json)
+                .map_err(|e| format!("Failed to decode Rune Shield analysis: {e}"))?;
+        if !analysis.inscriptions_burned.is_empty()
+            || analysis
+                .inputs
+                .iter()
+                .any(|input| !input.inscriptions.is_empty())
+        {
+            return Err(
+                "Rune transfers cannot spend inscription-bearing inputs or burn inscriptions"
+                    .to_string(),
+            );
+        }
+        let actions = analysis
+            .rune_actions
+            .as_ref()
+            .ok_or_else(|| "Rune transfer has no verifiable Rune allocation".to_string())?;
+        if actions.is_cenotaph {
+            return Err("Rune transfer is a cenotaph and would burn its inputs".to_string());
+        }
+        if !actions.burned.is_empty() {
+            return Err("Rune transfer would burn Rune balances".to_string());
+        }
+        if actions.etching.is_some() || actions.mint.is_some() {
+            return Err("Rune transfer unexpectedly contains an etching or mint".to_string());
+        }
+        if actions.has_runestone && actions.edict_count != 1 {
+            return Err("Rune transfer must contain exactly one transfer edict".to_string());
+        }
+
+        let mut input_totals: BTreeMap<String, u128> = BTreeMap::new();
+        for input in &analysis.inputs {
+            for rune in &input.runes {
+                let amount = rune
+                    .amount
+                    .parse::<u128>()
+                    .map_err(|e| format!("Invalid analyzed Rune input amount: {e}"))?;
+                *input_totals.entry(rune.rune_id.clone()).or_default() = input_totals
+                    .get(&rune.rune_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(amount)
+                    .ok_or_else(|| "Analyzed Rune input amount overflow".to_string())?;
+            }
+        }
+        if input_totals.get(&rune_id).copied().unwrap_or_default() < requested {
+            return Err("Rune inputs do not cover the approved amount".to_string());
+        }
+
+        let is_mine = |script: &ScriptBuf| {
+            self.vault_wallet.is_mine(script.clone())
+                || self
+                    .payment_wallet
+                    .as_ref()
+                    .is_some_and(|wallet| wallet.is_mine(script.clone()))
+        };
+        let mut output_totals: BTreeMap<String, u128> = BTreeMap::new();
+        let mut recipient_amount = 0_u128;
+        for output in &analysis.outputs {
+            let output_index = usize::try_from(output.vout)
+                .map_err(|_| "Analyzed Rune output index is invalid".to_string())?;
+            let txout = psbt
+                .unsigned_tx
+                .output
+                .get(output_index)
+                .ok_or_else(|| "Analyzed Rune output is missing".to_string())?;
+            for rune in &output.runes {
+                let amount = rune
+                    .amount
+                    .parse::<u128>()
+                    .map_err(|e| format!("Invalid analyzed Rune output amount: {e}"))?;
+                *output_totals.entry(rune.rune_id.clone()).or_default() = output_totals
+                    .get(&rune.rune_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(amount)
+                    .ok_or_else(|| "Analyzed Rune output amount overflow".to_string())?;
+
+                if output_index == recipient_index {
+                    if rune.rune_id != rune_id {
+                        return Err(
+                            "Rune recipient output would receive an unapproved Rune".to_string()
+                        );
+                    }
+                    recipient_amount = recipient_amount
+                        .checked_add(amount)
+                        .ok_or_else(|| "Rune recipient amount overflow".to_string())?;
+                } else if !is_mine(&txout.script_pubkey) {
+                    return Err(
+                        "Rune change would be sent to an output not owned by this wallet"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if recipient_amount != requested {
+            return Err(format!(
+                "Rune recipient amount mismatch: approved {requested}, transaction sends {recipient_amount}"
+            ));
+        }
+        if input_totals != output_totals {
+            return Err("Rune inputs and outputs do not balance exactly".to_string());
+        }
+
+        Ok(())
+    }
+
     /// Create an unsigned PSBT for sending BTC.
     pub fn create_psbt_tx(&mut self, request: &CreatePsbtRequest) -> Result<Psbt, ZincError> {
         if !self.ordinals_verified {
@@ -3083,6 +3630,25 @@ impl ZincWallet {
         let signed_base64 = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
 
         Ok(signed_base64)
+    }
+
+    /// Sign an internally constructed Rune transfer after revalidating the
+    /// exact recipient, amount, Rune change ownership, and zero-burn contract.
+    pub fn sign_rune_transfer_psbt(
+        &mut self,
+        psbt_base64: &str,
+        intent: &RuneTransferIntent,
+        options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|e| format!("Invalid base64: {e}"))?;
+        let psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| format!("Invalid PSBT: {e}"))?;
+        self.validate_rune_transfer_psbt(&psbt, intent)
+            .map_err(|e| format!("Security Violation: {e}"))?;
+        self.sign_psbt(psbt_base64, options)
     }
 
     /// Prepare a PSBT for external signing (e.g. on a hardware wallet).
