@@ -61,8 +61,9 @@ pub mod sign_intent;
 
 // Re-exports for convenience
 pub use builder::{
-    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest, DerivationMode,
-    DiscoveryAccountPlan, DiscoveryContext, PaymentAddressType, ProfileMode, ScanPolicy, Seed64,
+    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest,
+    CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan, DiscoveryContext,
+    PaymentAddressType, ProfileMode, RuneTransferIntent, RuneTransferResult, ScanPolicy, Seed64,
     SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, WalletKind, ZincBalance,
     ZincPersistence, ZincSyncRequest, ZincWallet,
 };
@@ -2702,6 +2703,32 @@ impl ZincWasmWallet {
         self.create_psbt_with_transport(transport, "createPsbt")
     }
 
+    /// Build and fully audit an unsigned Rune transfer.
+    ///
+    /// Raw Rune quantities are decimal strings and never cross the WASM
+    /// boundary as JavaScript numbers.
+    #[wasm_bindgen(js_name = createRuneTransfer)]
+    pub fn create_rune_transfer_request(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+
+        let request: crate::builder::CreateRuneTransferRequest =
+            serde_wasm_bindgen::from_value(request)
+                .map_err(|e| JsValue::from_str(&format!("Invalid Rune transfer request: {e}")))?;
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let result = inner
+                    .create_rune_transfer(&request)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                serde_wasm_bindgen::to_value(&result).map_err(|e| {
+                    JsValue::from_str(&format!("Failed to serialize Rune transfer result: {e}"))
+                })
+            }
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (createRuneTransfer): {e}"
+            ))),
+        }
+    }
+
     /// Build an unsigned "sat surgery" / salvage PSBT (base64): recover cardinal sats from the given
     /// inscription UTXOs, keeping each inscription padded. The caller MUST verify the result with
     /// `analyzePsbt` (Ordinal Shield) before signing.
@@ -2878,6 +2905,39 @@ impl ZincWasmWallet {
                 .sign_psbt(psbt_base64, sign_opts)
                 .map_err(JsValue::from),
             Err(e) => Err(JsValue::from_str(&format!("Wallet busy (sign_psbt): {e}"))),
+        }
+    }
+
+    /// Sign a Rune transfer only after revalidating its exact engine-issued
+    /// intent against the current PSBT bytes.
+    #[wasm_bindgen(js_name = signRuneTransferPsbt)]
+    pub fn sign_rune_transfer_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+        options: JsValue,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        let intent: crate::builder::RuneTransferIntent = serde_wasm_bindgen::from_value(intent)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Rune transfer intent: {e}")))?;
+        let sign_options: Option<crate::builder::SignOptions> =
+            if options.is_null() || options.is_undefined() {
+                None
+            } else {
+                Some(
+                    serde_wasm_bindgen::from_value(options)
+                        .map_err(|e| JsValue::from_str(&format!("Invalid options: {e}")))?,
+                )
+            };
+
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .sign_rune_transfer_psbt(psbt_base64, &intent, sign_options)
+                .map_err(JsValue::from),
+            Err(e) => Err(JsValue::from_str(&format!(
+                "Wallet busy (signRuneTransferPsbt): {e}"
+            ))),
         }
     }
 
