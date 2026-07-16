@@ -1008,6 +1008,21 @@ impl ZincWallet {
         self.ordinals_metadata_complete
     }
 
+    /// Height of the wallet's local chain tip. Lets hosts that orchestrate
+    /// ordinals syncs outside the wallet lock run the same indexer-lag check
+    /// as [`Self::sync_ordinals_protection`].
+    #[must_use]
+    pub fn chain_tip_height(&self) -> u32 {
+        self.vault_wallet.local_chain().tip().height()
+    }
+
+    /// Fail-closed marker: drop ordinals protection verification. For hosts
+    /// that detect a lagging ord indexer during a lock-free ordinals refresh —
+    /// mirrors what the in-wallet sync methods do on that error path.
+    pub fn mark_ordinals_unverified(&mut self) {
+        self.ordinals_verified = false;
+    }
+
     /// Return `true` when the wallet uses unified addressing.
     pub fn is_unified(&self) -> bool {
         self.scheme == AddressScheme::Unified

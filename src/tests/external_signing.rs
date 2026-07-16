@@ -388,4 +388,23 @@ mod tests {
             "enriched taproot input must be signable"
         );
     }
+
+    /// Accessors for hosts that orchestrate ordinals syncs outside the wallet
+    /// lock: tip height for the indexer-lag check, and the fail-closed
+    /// unverified marker.
+    #[test]
+    fn host_ordinals_orchestration_accessors() {
+        let (mut wallet, _) = setup();
+        // setup() applies tx anchors but never extends the local chain.
+        assert_eq!(wallet.chain_tip_height(), 0);
+
+        wallet.apply_verified_ordinals_update(
+            Vec::new(),
+            std::collections::HashSet::new(),
+            Vec::new(),
+        );
+        assert!(wallet.ordinals_verified());
+        wallet.mark_ordinals_unverified();
+        assert!(!wallet.ordinals_verified());
+    }
 }
