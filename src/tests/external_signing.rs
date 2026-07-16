@@ -302,4 +302,90 @@ mod tests {
         psbt.inputs[0].witness_utxo = Some(prev.output[0].clone());
         (wallet, b64(&psbt.serialize()))
     }
+
+    // ---- enrich_psbt_key_origins ----
+
+    #[test]
+    fn enrich_adds_taproot_key_origins_to_planner_shaped_psbt() {
+        // setup()'s PSBT is planner-shaped: witness_utxo only, no key origins.
+        let (wallet, unsigned) = setup();
+        let before = decode(&unsigned);
+        assert!(before.inputs[0].tap_internal_key.is_none());
+        assert!(before.inputs[0].tap_key_origins.is_empty());
+
+        let enriched = wallet.enrich_psbt_key_origins(&unsigned).expect("enrich");
+        let psbt = decode(&enriched);
+        assert!(
+            psbt.inputs[0].tap_internal_key.is_some(),
+            "taproot input must gain an internal key"
+        );
+        assert!(
+            !psbt.inputs[0].tap_key_origins.is_empty(),
+            "taproot input must gain a key origin (device fingerprint + path)"
+        );
+        // Unsigned tx is untouched — enrichment only annotates.
+        assert_eq!(psbt.unsigned_tx, before.unsigned_tx);
+    }
+
+    #[test]
+    fn enrich_is_idempotent() {
+        let (wallet, unsigned) = setup();
+        let once = wallet.enrich_psbt_key_origins(&unsigned).expect("enrich");
+        let twice = wallet.enrich_psbt_key_origins(&once).expect("re-enrich");
+        // Re-running over an already-enriched PSBT yields the same origins.
+        let a = decode(&once);
+        let b = decode(&twice);
+        assert_eq!(a.inputs[0].tap_internal_key, b.inputs[0].tap_internal_key);
+        assert_eq!(a.inputs[0].tap_key_origins, b.inputs[0].tap_key_origins);
+    }
+
+    #[test]
+    fn enrich_leaves_foreign_input_untouched() {
+        let (wallet, _) = setup();
+        // A PSBT spending an outpoint the wallet does not own, with a foreign spk.
+        let foreign_prev = dummy_tx(10_000, ScriptBuf::from_bytes(vec![0x51, 0x01, 0x01]), 9);
+        let unsigned = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(foreign_prev.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bdk_wallet::bitcoin::Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: foreign_prev.output[0].script_pubkey.clone(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned).unwrap();
+        psbt.inputs[0].witness_utxo = Some(foreign_prev.output[0].clone());
+        let enriched = wallet
+            .enrich_psbt_key_origins(&b64(&psbt.serialize()))
+            .expect("enrich");
+        let out = decode(&enriched);
+        assert!(out.inputs[0].tap_internal_key.is_none());
+        assert!(out.inputs[0].tap_key_origins.is_empty());
+    }
+
+    #[test]
+    fn enrich_rejects_garbage() {
+        let (wallet, _) = setup();
+        assert!(wallet.enrich_psbt_key_origins("not base64!!!").is_err());
+        assert!(wallet.enrich_psbt_key_origins(&b64(b"not a psbt")).is_err());
+    }
+
+    /// After enrichment a hardware-shaped (planner) PSBT is signable by the seed wallet —
+    /// proves the metadata is coherent end to end.
+    #[test]
+    fn enriched_psbt_is_signable() {
+        let (mut wallet, unsigned) = setup();
+        let enriched = wallet.enrich_psbt_key_origins(&unsigned).expect("enrich");
+        let signed = sign_all(&mut wallet, &enriched);
+        let psbt = decode(&signed);
+        assert!(
+            psbt.inputs[0].tap_key_sig.is_some(),
+            "enriched taproot input must be signable"
+        );
+    }
 }

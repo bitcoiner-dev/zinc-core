@@ -3778,6 +3778,98 @@ impl ZincWallet {
         Ok(base64::engine::general_purpose::STANDARD.encode(&prepared_bytes))
     }
 
+    /// Fill the derivation metadata an external signer (e.g. a Ledger) needs on
+    /// every wallet-owned input:
+    /// - taproot inputs gain `tap_internal_key` + `tap_key_origins`,
+    /// - segwit-v0 inputs gain `bip32_derivation` **and** `non_witness_utxo`
+    ///   (the Ledger Bitcoin app refuses to sign a segwit-v0 input that carries
+    ///   only `witness_utxo` — a fee-attack defense).
+    ///
+    /// `witness_utxo` is backfilled from owned UTXOs first so the script can be
+    /// resolved. Inputs whose script the wallet does not own are left untouched.
+    /// Idempotent: a PSBT already built by BDK (whose descriptors carry the key
+    /// origins) is unchanged. Needed because the hand-rolled planners
+    /// (`plan_consolidate_tx`, `plan_salvage_tx`, `create_rune_transfer`) attach
+    /// only `witness_utxo`.
+    pub fn enrich_psbt_key_origins(&self, psbt_base64: &str) -> Result<String, String> {
+        use base64::Engine;
+        use bdk_wallet::miniscript::psbt::PsbtExt;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|e| format!("Invalid base64: {e}"))?;
+        let mut psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| format!("Invalid PSBT: {e}"))?;
+
+        // Backfill witness_utxo from owned UTXOs so the spk resolves (mirrors
+        // prepare_external_sign_psbt's known-utxo pass).
+        let mut known_utxos = std::collections::HashMap::new();
+        let collect_utxos = |w: &Wallet, map: &mut std::collections::HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
+            for utxo in w.list_unspent() {
+                map.insert(utxo.outpoint, utxo.txout);
+            }
+        };
+        collect_utxos(&self.vault_wallet, &mut known_utxos);
+        if let Some(w) = &self.payment_wallet {
+            collect_utxos(w, &mut known_utxos);
+        }
+
+        let input_count = psbt.unsigned_tx.input.len();
+        for i in 0..input_count {
+            let outpoint = psbt.unsigned_tx.input[i].previous_output;
+            if psbt.inputs[i].witness_utxo.is_none() && psbt.inputs[i].non_witness_utxo.is_none() {
+                if let Some(txout) = known_utxos.get(&outpoint) {
+                    psbt.inputs[i].witness_utxo = Some(txout.clone());
+                }
+            }
+
+            // Resolve this input's script_pubkey.
+            let spk = match psbt.inputs[i]
+                .witness_utxo
+                .as_ref()
+                .map(|txout| txout.script_pubkey.clone())
+                .or_else(|| {
+                    psbt.inputs[i]
+                        .non_witness_utxo
+                        .as_ref()
+                        .and_then(|tx| tx.output.get(outpoint.vout as usize))
+                        .map(|txout| txout.script_pubkey.clone())
+                }) {
+                Some(spk) => spk,
+                None => continue, // foreign / unresolvable input
+            };
+
+            // Find the owning wallet (vault first, then payment) and its
+            // definite descriptor for this spk, then let miniscript populate the
+            // key-origin / internal-key metadata (checked: it re-derives the spk).
+            for wallet in std::iter::once(&self.vault_wallet).chain(self.payment_wallet.as_ref()) {
+                let Some((keychain, child)) = wallet.derivation_of_spk(spk.clone()) else {
+                    continue;
+                };
+                let descriptor = wallet.public_descriptor(keychain);
+                let derived = descriptor
+                    .at_derivation_index(child)
+                    .map_err(|e| format!("Derivation index error: {e}"))?;
+                let is_taproot = matches!(
+                    derived.desc_type(),
+                    bdk_wallet::miniscript::descriptor::DescriptorType::Tr
+                );
+                psbt.update_input_with_descriptor(i, &derived)
+                    .map_err(|e| format!("Failed to enrich input {i}: {e}"))?;
+
+                // Non-taproot inputs additionally need the full previous tx.
+                if !is_taproot {
+                    if let Some(wallet_tx) = wallet.get_tx(outpoint.txid) {
+                        psbt.inputs[i].non_witness_utxo =
+                            Some(wallet_tx.tx_node.tx.as_ref().clone());
+                    }
+                }
+                break;
+            }
+        }
+
+        Ok(base64::engine::general_purpose::STANDARD.encode(psbt.serialize()))
+    }
+
     /// Verify a PSBT that was signed externally (e.g. by a hardware wallet).
     ///
     /// Ensures unsigned transaction bytes are unchanged and only expected inputs
