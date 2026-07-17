@@ -156,8 +156,21 @@ mod tests {
     // ---------- plan_consolidate_tx ----------
 
     #[test]
+    fn consolidate_requires_ordinals_verified() {
+        // Defaults to ordinals_verified = false: the safety lock must engage —
+        // an unverified inscribed_utxos set can be empty while inscriptions sit
+        // in the selection, so a sweep would burn their postage.
+        let (w, addr, ops) = funded_wallet(&[40_000]);
+        wallet_err(
+            w.plan_consolidate_tx(&ops, fee1(), &addr),
+            "safety lock",
+        );
+    }
+
+    #[test]
     fn consolidate_rejects_empty_outpoints() {
-        let (w, addr, _) = funded_wallet(&[40_000]);
+        let (mut w, addr, _) = funded_wallet(&[40_000]);
+        w.ordinals_verified = true;
         wallet_err(
             w.plan_consolidate_tx(&[], fee1(), &addr),
             "No UTXOs selected for consolidation",
@@ -166,7 +179,8 @@ mod tests {
 
     #[test]
     fn consolidate_rejects_unknown_utxo() {
-        let (w, addr, _) = funded_wallet(&[40_000]);
+        let (mut w, addr, _) = funded_wallet(&[40_000]);
+        w.ordinals_verified = true;
         wallet_err(
             w.plan_consolidate_tx(&[foreign_outpoint(0xBB)], fee1(), &addr),
             "not found in wallet",
@@ -176,7 +190,8 @@ mod tests {
     #[test]
     fn consolidate_rejects_dust_after_fee() {
         // 600 sat - fee lands below the 546 dust floor → rejected.
-        let (w, addr, ops) = funded_wallet(&[600]);
+        let (mut w, addr, ops) = funded_wallet(&[600]);
+        w.ordinals_verified = true;
         wallet_err(
             w.plan_consolidate_tx(&ops, fee1(), &addr),
             "Insufficient funds for consolidation",
@@ -304,7 +319,8 @@ mod tests {
     #[test]
     fn consolidate_base64_happy_path_round_trips_through_strings() {
         use base64::Engine;
-        let (w, addr, ops) = funded_wallet(&[40_000, 60_000]);
+        let (mut w, addr, ops) = funded_wallet(&[40_000, 60_000]);
+        w.ordinals_verified = true;
         let dest = addr.to_string();
         let op_strs: Vec<String> = ops.iter().map(ToString::to_string).collect();
         let b64 = w

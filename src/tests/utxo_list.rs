@@ -323,6 +323,7 @@ mod tests {
         let op2 = OutPoint::new(tx2.compute_txid(), 0);
         let fee_rate = FeeRate::from_sat_per_vb(1).unwrap();
 
+        builder.ordinals_verified = true;
         let psbt = builder
             .plan_consolidate_tx(&[op1, op2], fee_rate, &addr)
             .expect("consolidate psbt");

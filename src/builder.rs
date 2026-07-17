@@ -2460,6 +2460,16 @@ impl ZincWallet {
     ) -> Result<Psbt, ZincError> {
         use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
+        // The inscribed-outpoint refusal below is only as good as the ord data
+        // behind `inscribed_utxos`; without a verified sync that set can be
+        // empty while inscriptions sit in the selection, so a sweep would burn
+        // their postage. Same safety lock as plan_salvage_tx / send-with-salvage.
+        if !self.ordinals_verified {
+            return Err(ZincError::WalletError(
+                "Ordinals verification failed - safety lock engaged. Please retry sync."
+                    .to_string(),
+            ));
+        }
         if outpoints.is_empty() {
             return Err(ZincError::WalletError(
                 "No UTXOs selected for consolidation".to_string(),
