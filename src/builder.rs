@@ -781,6 +781,9 @@ pub struct WalletBuilder {
     persistence: Option<ZincPersistence>,
     account_index: u32,
     scan_policy: ScanPolicy,
+    // Private → semver-free. Set via with_layout(); overrides the default
+    // BIP-86/84 descriptor derivation for Seed wallets.
+    custom_layout: Option<crate::layout::LayoutSpec>,
 }
 
 impl ZincWallet {
@@ -4633,6 +4636,7 @@ impl WalletBuilder {
             persistence: None,
             account_index: 0,
             scan_policy: ScanPolicy::default(),
+            custom_layout: None,
         }
     }
 
@@ -4672,6 +4676,25 @@ impl WalletBuilder {
         }
 
         self.kind = Some(WalletKind::WatchAddress(addr));
+        Ok(self)
+    }
+
+    /// Adopt a discovered derivation layout: descriptors come from the
+    /// layout's branches instead of the default BIP-86/84 pair, and scheme /
+    /// derivation mode / payment address type are forced to what the layout
+    /// implies. Seed wallets only — a layout describes how a seed was used.
+    pub fn with_layout(mut self, layout: crate::layout::LayoutSpec) -> Result<Self, String> {
+        layout.validate()?;
+        self.derivation_mode = layout.derivation_mode;
+        self.scheme = if layout.payment.is_some() {
+            AddressScheme::Dual
+        } else {
+            AddressScheme::Unified
+        };
+        if let Some(payment_type) = layout.implied_payment_address_type() {
+            self.payment_address_type = payment_type;
+        }
+        self.custom_layout = Some(layout);
         Ok(self)
     }
 
@@ -4817,12 +4840,40 @@ impl WalletBuilder {
             DerivationMode::Index => 0,
         };
 
-        let (vault_ext, vault_int, payment_ext, payment_int) = kind.derive_descriptors(
-            scheme,
-            self.payment_address_type,
-            self.network,
-            derivation_account,
-        );
+        let (vault_ext, vault_int, payment_ext, payment_int) = match &self.custom_layout {
+            Some(layout) => {
+                let WalletKind::Seed { master_xprv } = &kind else {
+                    return Err("Custom layouts are only supported for seed wallets".to_string());
+                };
+                let coin_type = u32::from(self.network != Network::Bitcoin);
+                let vault_path = format!(
+                    "{master_xprv}/{}'/{coin_type}'/{derivation_account}'",
+                    layout.vault.purpose
+                );
+                let vault_ext = layout.vault.script.descriptor(&vault_path, 0);
+                let vault_int = layout.vault.script.descriptor(&vault_path, 1);
+                let (payment_ext, payment_int) = match &layout.payment {
+                    Some(branch) => {
+                        let path = format!(
+                            "{master_xprv}/{}'/{coin_type}'/{derivation_account}'",
+                            branch.purpose
+                        );
+                        (
+                            Some(branch.script.descriptor(&path, 0)),
+                            Some(branch.script.descriptor(&path, 1)),
+                        )
+                    }
+                    None => (None, None),
+                };
+                (vault_ext, vault_int, payment_ext, payment_int)
+            }
+            None => kind.derive_descriptors(
+                scheme,
+                self.payment_address_type,
+                self.network,
+                derivation_account,
+            ),
+        };
 
         // 1. Vault (Taproot) wallet
         let (vault_wallet, loaded_vault_changeset) = if let Some(p) = &self.persistence {

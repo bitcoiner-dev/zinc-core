@@ -33,6 +33,8 @@ mod logging;
 pub mod builder;
 pub mod crypto;
 pub mod error;
+/// Derivation-layout descriptions for multi-layout discovery.
+pub mod layout;
 /// Transaction history models and wallet history helpers.
 pub mod history;
 pub mod keys;
@@ -69,6 +71,7 @@ pub use builder::{
 };
 pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
+pub use layout::{derive_layout_addresses, BranchSpec, LayoutAddresses, LayoutSpec, ScriptKind};
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use listing::{
     create_listing, create_listing_purchase, finalize_listing_purchase, finalize_listing_sale,
