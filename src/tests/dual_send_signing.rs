@@ -140,7 +140,7 @@ fn assert_payment_send_finalizes_correctly(payment_type: PaymentAddressType) {
         .expect("recipient payment address")
         .to_string();
 
-    let request = CreatePsbtRequest::from_parts(&recipient, 40_000, 1).expect("request");
+    let request = CreatePsbtRequest::from_parts(&recipient, 40_000, 1.0).expect("request");
     let unsigned_psbt = wallet
         .create_psbt_base64(&request)
         .expect("create send psbt");

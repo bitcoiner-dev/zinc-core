@@ -52,7 +52,7 @@ mod tests {
 
         // Use a wallet-owned address so parsing/network checks don't mask the safety-lock assertion.
         let recipient = wallet.peek_taproot_address(0).to_string();
-        let request = CreatePsbtRequest::from_parts(&recipient, 1000, 1).unwrap();
+        let request = CreatePsbtRequest::from_parts(&recipient, 1000, 1.0).unwrap();
         let result = wallet.create_psbt_base64(&request);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

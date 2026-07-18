@@ -2746,7 +2746,7 @@ impl ZincWasmWallet {
         #[serde(rename_all = "camelCase")]
         struct PlanSalvageRequest {
             outpoints: Vec<String>,
-            fee_rate_sat_vb: u64,
+            fee_rate_sat_vb: f64,
             target_postage: u64,
             ordinals_address: String,
             destination: String,
@@ -2782,7 +2782,7 @@ impl ZincWasmWallet {
         #[serde(rename_all = "camelCase")]
         struct PlanConsolidateRequest {
             outpoints: Vec<String>,
-            fee_rate_sat_vb: u64,
+            fee_rate_sat_vb: f64,
             destination: String,
         }
 
@@ -2814,7 +2814,7 @@ impl ZincWasmWallet {
             input_outpoints: Vec<String>,
             recipient: String,
             amount_sats: u64,
-            fee_rate_sat_vb: u64,
+            fee_rate_sat_vb: f64,
             target_postage: u64,
             ordinals_address: String,
             change_address: String,
@@ -2881,7 +2881,7 @@ impl ZincWasmWallet {
             crate::builder::CreatePsbtTransportRequest {
                 recipient: recipient.to_string(),
                 amount_sats,
-                fee_rate_sat_vb,
+                fee_rate_sat_vb: fee_rate_sat_vb as f64,
             },
             "create_psbt",
         )

@@ -89,6 +89,25 @@ impl TryFrom<&[u8]> for Seed64 {
     }
 }
 
+/// Convert a possibly-fractional sat/vB fee rate into a [`FeeRate`] without
+/// losing sub-sat precision (1 sat/vB = 250 sat/kwu). Rounds up at kwu
+/// granularity, so the effective rate never falls below the requested one.
+pub fn fee_rate_from_sat_per_vb_f64(rate_sat_vb: f64) -> Result<FeeRate, ZincError> {
+    if !rate_sat_vb.is_finite() || rate_sat_vb <= 0.0 || rate_sat_vb > 100_000.0 {
+        return Err(ZincError::ConfigError(format!(
+            "Invalid fee rate: {rate_sat_vb} sat/vB"
+        )));
+    }
+    Ok(FeeRate::from_sat_per_kwu((rate_sat_vb * 250.0).ceil() as u64))
+}
+
+/// Fee in sats for a transaction of `vsize` vbytes at `rate`, rounding up at
+/// kwu precision instead of re-rounding the rate to whole sat/vB.
+#[must_use]
+pub fn fee_for_vsize(rate: FeeRate, vsize: u64) -> u64 {
+    rate.fee_vb(vsize).map_or(u64::MAX, Amount::to_sat)
+}
+
 /// Typed request for PSBT creation in native Rust flows.
 #[derive(Debug, Clone)]
 pub struct CreatePsbtRequest {
@@ -105,13 +124,12 @@ impl CreatePsbtRequest {
     pub fn from_parts(
         recipient: &str,
         amount_sats: u64,
-        fee_rate_sat_vb: u64,
+        fee_rate_sat_vb: f64,
     ) -> Result<Self, ZincError> {
         let recipient = recipient
             .parse::<Address<NetworkUnchecked>>()
             .map_err(|e| ZincError::ConfigError(format!("Invalid address: {e}")))?;
-        let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
-            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let fee_rate = fee_rate_from_sat_per_vb_f64(fee_rate_sat_vb)?;
 
         Ok(Self {
             recipient,
@@ -129,8 +147,8 @@ pub struct CreatePsbtTransportRequest {
     pub recipient: String,
     /// Amount in satoshis.
     pub amount_sats: u64,
-    /// Fee rate in sat/vB.
-    pub fee_rate_sat_vb: u64,
+    /// Fee rate in sat/vB. Fractional (sub-sat) rates are supported.
+    pub fee_rate_sat_vb: f64,
 }
 
 impl TryFrom<CreatePsbtTransportRequest> for CreatePsbtRequest {
@@ -165,8 +183,8 @@ pub struct CreateRuneTransferRequest {
     pub amount: String,
     /// Recipient address.
     pub recipient: String,
-    /// Fee rate in sat/vB.
-    pub fee_rate_sat_vb: u64,
+    /// Fee rate in sat/vB. Fractional (sub-sat) rates are supported.
+    pub fee_rate_sat_vb: f64,
     /// Optional postage override. Defaults to 546 sats and is raised to the
     /// scripts' minimum non-dust value when necessary.
     #[serde(default)]
@@ -2386,7 +2404,7 @@ impl ZincWallet {
             input: dummy_inputs,
             output: dummy_outputs,
         };
-        let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
+        let fee = fee_for_vsize(fee_rate, dummy_tx.vsize() as u64);
 
         // The final output must be cardinal, so the fee never touches a postage (inscription) output.
         let last_idx = segments.len() - 1;
@@ -2517,7 +2535,7 @@ impl ZincWallet {
                 script_pubkey: dest_spk.clone(),
             }],
         };
-        let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
+        let fee = fee_for_vsize(fee_rate, dummy_tx.vsize() as u64);
 
         let consolidated = total_input
             .checked_sub(fee)
@@ -2555,12 +2573,11 @@ impl ZincWallet {
     pub fn plan_consolidate_base64(
         &self,
         outpoints: &[String],
-        fee_rate_sat_vb: u64,
+        fee_rate_sat_vb: f64,
         destination: &str,
     ) -> Result<String, ZincError> {
         let network = self.vault_wallet.network();
-        let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
-            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let fee_rate = fee_rate_from_sat_per_vb_f64(fee_rate_sat_vb)?;
         let dest_addr = Address::from_str(destination)
             .map_err(|e| ZincError::ConfigError(format!("Invalid destination address: {e}")))?
             .require_network(network)
@@ -2764,7 +2781,7 @@ impl ZincWallet {
             input: build_inputs(),
             output: dummy_out,
         };
-        let fee = (dummy_tx.vsize() as u64).saturating_mul(fee_rate.to_sat_per_vb_ceil());
+        let fee = fee_for_vsize(fee_rate, dummy_tx.vsize() as u64);
 
         let change = pool.checked_sub(amount_sats + fee).ok_or_else(|| {
             ZincError::WalletError(format!(
@@ -2811,14 +2828,13 @@ impl ZincWallet {
         input_outpoints: &[String],
         recipient: &str,
         amount_sats: u64,
-        fee_rate_sat_vb: u64,
+        fee_rate_sat_vb: f64,
         target_postage: u64,
         ordinals_address: &str,
         change_address: &str,
     ) -> Result<String, ZincError> {
         let network = self.vault_wallet.network();
-        let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
-            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let fee_rate = fee_rate_from_sat_per_vb_f64(fee_rate_sat_vb)?;
         let parse_addr = |s: &str, what: &str| -> Result<Address, ZincError> {
             Address::from_str(s)
                 .map_err(|e| ZincError::ConfigError(format!("Invalid {what} address: {e}")))?
@@ -2853,14 +2869,13 @@ impl ZincWallet {
     pub fn plan_salvage_base64(
         &self,
         outpoints: &[String],
-        fee_rate_sat_vb: u64,
+        fee_rate_sat_vb: f64,
         target_postage: u64,
         ordinals_address: &str,
         destination: &str,
     ) -> Result<String, ZincError> {
         let network = self.vault_wallet.network();
-        let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
-            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let fee_rate = fee_rate_from_sat_per_vb_f64(fee_rate_sat_vb)?;
         let ord_addr = Address::from_str(ordinals_address)
             .map_err(|e| ZincError::ConfigError(format!("Invalid ordinals address: {e}")))?
             .require_network(network)
@@ -2918,8 +2933,7 @@ impl ZincWallet {
                 "Rune amount must be greater than zero".to_string(),
             ));
         }
-        let fee_rate = FeeRate::from_sat_per_vb(request.fee_rate_sat_vb)
-            .ok_or_else(|| ZincError::ConfigError("Invalid fee rate".to_string()))?;
+        let fee_rate = fee_rate_from_sat_per_vb_f64(request.fee_rate_sat_vb)?;
         let recipient = Address::from_str(&request.recipient)
             .map_err(|e| ZincError::ConfigError(format!("Invalid recipient address: {e}")))?
             .require_network(self.vault_wallet.network())
@@ -3096,8 +3110,9 @@ impl ZincWallet {
             let total_input = total_input
                 .ok_or_else(|| ZincError::WalletError("Input value overflow".to_string()))?;
             let no_change_vsize = estimate_vsize(&selected_inputs, &base_outputs);
-            let no_change_fee = no_change_vsize
-                .checked_mul(fee_rate.to_sat_per_vb_ceil())
+            let no_change_fee = fee_rate
+                .fee_vb(no_change_vsize)
+                .map(Amount::to_sat)
                 .ok_or_else(|| ZincError::WalletError("Fee overflow".to_string()))?;
 
             if total_input >= base_output_value.saturating_add(no_change_fee) {
@@ -3107,8 +3122,9 @@ impl ZincWallet {
                     script_pubkey: btc_change_script.clone(),
                 });
                 let with_change_vsize = estimate_vsize(&selected_inputs, &with_change);
-                let with_change_fee = with_change_vsize
-                    .checked_mul(fee_rate.to_sat_per_vb_ceil())
+                let with_change_fee = fee_rate
+                    .fee_vb(with_change_vsize)
+                    .map(Amount::to_sat)
                     .ok_or_else(|| ZincError::WalletError("Fee overflow".to_string()))?;
                 let btc_change = total_input
                     .checked_sub(base_output_value.saturating_add(with_change_fee))
@@ -3451,7 +3467,7 @@ impl ZincWallet {
         amount_sats: u64,
         fee_rate_sat_vb: u64,
     ) -> Result<String, String> {
-        let request = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate_sat_vb)
+        let request = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate_sat_vb as f64)
             .map_err(|e| e.to_string())?;
         self.create_psbt_base64(&request).map_err(|e| e.to_string())
     }

@@ -33,7 +33,7 @@ fn test_create_psbt_basic() {
     // Target address (valid regtest address)
     let recipient = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
     let amount_sats = 10_000;
-    let fee_rate = 1; // 1 sat/vB
+    let fee_rate = 1.0; // 1 sat/vB
 
     let request = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate)
         .expect("valid request parts");
@@ -56,7 +56,7 @@ fn test_create_psbt_invalid_address() {
     // Invalid address
     let recipient = "not-a-valid-address";
     let amount_sats = 10_000;
-    let fee_rate = 1;
+    let fee_rate = 1.0;
 
     let result = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate);
 
@@ -88,7 +88,7 @@ fn test_create_psbt_wrong_network() {
     // Mainnet address (wrong network)
     let recipient = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     let amount_sats = 10_000;
-    let fee_rate = 1;
+    let fee_rate = 1.0;
 
     let request = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate)
         .expect("request should parse for wrong-network assertion");
@@ -147,7 +147,7 @@ fn test_create_psbt_wrapper_matches_typed_path_error_surface() {
     let fee_rate = 1;
 
     let request =
-        CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate).expect("valid request");
+        CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate as f64).expect("valid request");
     let typed_err = wallet
         .create_psbt_base64(&request)
         .expect_err("empty wallet should fail");
