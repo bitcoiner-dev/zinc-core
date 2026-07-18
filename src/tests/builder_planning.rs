@@ -278,11 +278,11 @@ mod tests {
 
     #[test]
     fn consolidate_base64_rejects_overflowing_fee_rate() {
-        // `FeeRate::from_sat_per_vb` only returns None on overflow (0 is a valid rate),
-        // so an absurd sat/vB is what trips the "Invalid fee rate" guard.
+        // `fee_rate_from_sat_per_vb_f64` rejects non-finite, non-positive, and absurd
+        // (> 100k sat/vB) rates; an absurd value trips the "Invalid fee rate" guard.
         let (w, _, _) = funded_wallet(&[40_000]);
         config_err(
-            w.plan_consolidate_base64(&[], u64::MAX, "ignored"),
+            w.plan_consolidate_base64(&[], f64::MAX, "ignored"),
             "Invalid fee rate",
         );
     }
@@ -291,7 +291,7 @@ mod tests {
     fn consolidate_base64_rejects_bad_address() {
         let (w, _, _) = funded_wallet(&[40_000]);
         config_err(
-            w.plan_consolidate_base64(&[], 1, "not-an-address"),
+            w.plan_consolidate_base64(&[], 1.0, "not-an-address"),
             "Invalid destination address",
         );
     }
@@ -301,7 +301,7 @@ mod tests {
         // Regtest wallet, but a valid mainnet address → network mismatch.
         let (w, _, _) = funded_wallet(&[40_000]);
         config_err(
-            w.plan_consolidate_base64(&[], 1, "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"),
+            w.plan_consolidate_base64(&[], 1.0, "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"),
             "network mismatch",
         );
     }
@@ -311,7 +311,7 @@ mod tests {
         let (w, addr, _) = funded_wallet(&[40_000]);
         let dest = addr.to_string();
         config_err(
-            w.plan_consolidate_base64(&["not-an-outpoint".to_string()], 1, &dest),
+            w.plan_consolidate_base64(&["not-an-outpoint".to_string()], 1.0, &dest),
             "Invalid outpoint",
         );
     }
@@ -324,7 +324,7 @@ mod tests {
         let dest = addr.to_string();
         let op_strs: Vec<String> = ops.iter().map(ToString::to_string).collect();
         let b64 = w
-            .plan_consolidate_base64(&op_strs, 1, &dest)
+            .plan_consolidate_base64(&op_strs, 1.0, &dest)
             .expect("consolidate base64");
         // The wrapper returns a STANDARD-base64 PSBT spending both inputs into one output.
         let raw = base64::engine::general_purpose::STANDARD

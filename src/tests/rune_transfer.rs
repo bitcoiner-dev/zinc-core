@@ -94,7 +94,7 @@ mod tests {
             rune_id: DOG.to_string(),
             amount: amount.to_string(),
             recipient: recipient.to_string(),
-            fee_rate_sat_vb: 1,
+            fee_rate_sat_vb: 1.0,
             postage_sats: Some(546),
         }
     }
