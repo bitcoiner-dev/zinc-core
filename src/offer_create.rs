@@ -80,7 +80,7 @@ pub fn create_offer(
     validate_request(wallet, request)?;
 
     let wallet_network = wallet.vault_wallet.network();
-    let expected_seller_payout_address = wallet
+    let local_payment_address = wallet
         .peek_payment_address(0)
         .ok_or_else(|| ZincError::WalletError("Payment wallet not initialized".to_string()))?;
     let seller_input_address = request
@@ -99,10 +99,30 @@ pub fn create_offer(
         .map_err(|e| {
             ZincError::OfferError(format!("seller payout address network mismatch: {e}"))
         })?;
-    if seller_payout_address.script_pubkey() != expected_seller_payout_address.script_pubkey() {
-        return Err(ZincError::OfferError(format!(
-            "seller_payout_address must match wallet main payment address {expected_seller_payout_address}"
-        )));
+    // This module builds a BUYER-funded offer: the local wallet funds and signs
+    // the buyer inputs, receives the inscription at output[0], and drains change
+    // to itself. Output[1] is the counterparty's payout and must therefore NOT
+    // be one of our own addresses — paying ourselves would hand the seller an
+    // offer that takes their inscription and gives them nothing.
+    if seller_payout_address.script_pubkey() == local_payment_address.script_pubkey() {
+        return Err(ZincError::OfferError(
+            "seller_payout_address must not be this wallet's own payment address; \
+             the payout belongs to the seller"
+                .to_string(),
+        ));
+    }
+    if wallet
+        .vault_wallet
+        .is_mine(seller_payout_address.script_pubkey())
+        || wallet
+            .payment_wallet
+            .as_ref()
+            .is_some_and(|w| w.is_mine(seller_payout_address.script_pubkey()))
+    {
+        return Err(ZincError::OfferError(
+            "seller_payout_address belongs to this wallet; the payout belongs to the seller"
+                .to_string(),
+        ));
     }
 
     let buyer_receive_address = wallet

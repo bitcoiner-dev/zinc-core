@@ -80,7 +80,7 @@ fn funded_unified_wallet(mark_ordinals_verified: bool) -> crate::ZincWallet {
     wallet
 }
 
-fn sample_request(wallet: &crate::ZincWallet) -> CreateOfferRequest {
+fn sample_request(_wallet: &crate::ZincWallet) -> CreateOfferRequest {
     let seller_seed = [9u8; 64];
     let mut seller_wallet =
         WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seller_seed))
@@ -91,6 +91,12 @@ fn sample_request(wallet: &crate::ZincWallet) -> CreateOfferRequest {
         .next_taproot_address()
         .expect("seller address")
         .to_string();
+    // The payout belongs to the SELLER — a different wallet entirely. The
+    // local wallet is the buyer: it funds and signs the buyer inputs.
+    let seller_payout_address = seller_wallet
+        .peek_payment_address(0)
+        .expect("seller payment address")
+        .to_string();
 
     let seller_txid =
         Txid::from_str("6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799")
@@ -100,10 +106,7 @@ fn sample_request(wallet: &crate::ZincWallet) -> CreateOfferRequest {
             .to_string(),
         seller_outpoint: OutPoint::new(seller_txid, 0),
         seller_input_address: seller_input_address.clone(),
-        seller_payout_address: wallet
-            .peek_payment_address(0)
-            .expect("main payment address")
-            .to_string(),
+        seller_payout_address,
         seller_output_value_sats: 330,
         ask_sats: 1_000,
         fee_rate_sat_vb: 1,
@@ -289,7 +292,13 @@ fn create_offer_preserves_ord_input_and_output_ordering() {
 }
 
 #[test]
-fn create_offer_rejects_non_main_seller_payout_address() {
+fn create_offer_rejects_payout_to_our_own_address() {
+    // create_offer builds a BUYER-funded offer: the local wallet funds and
+    // signs the buyer inputs, receives the inscription at output[0] and drains
+    // change to itself. Output[1] is the seller's payout, so routing it back to
+    // one of our own addresses would produce an offer that takes the seller's
+    // inscription and pays them nothing. This previously not only passed but
+    // was REQUIRED.
     let mut wallet = funded_unified_wallet(true);
 
     let seller_seed = [11u8; 64];
@@ -302,11 +311,11 @@ fn create_offer_rejects_non_main_seller_payout_address() {
         .next_taproot_address()
         .expect("seller taproot address")
         .to_string();
-    let non_main_seller_payout_address = seller_wallet
-        .get_payment_address()
-        .expect("seller payment address")
+
+    let our_own_payout_address = wallet
+        .peek_payment_address(0)
+        .expect("main payment address")
         .to_string();
-    assert_ne!(seller_input_address, non_main_seller_payout_address);
 
     let seller_txid =
         Txid::from_str("95fd55da0385b869a2a7f67eee798f64abcfc85929ae52407d4f8e5983c98757")
@@ -315,8 +324,8 @@ fn create_offer_rejects_non_main_seller_payout_address() {
         inscription_id: "95fd55da0385b869a2a7f67eee798f64abcfc85929ae52407d4f8e5983c98757i1"
             .to_string(),
         seller_outpoint: OutPoint::new(seller_txid, 1),
-        seller_input_address: seller_input_address.clone(),
-        seller_payout_address: non_main_seller_payout_address.clone(),
+        seller_input_address,
+        seller_payout_address: our_own_payout_address,
         seller_output_value_sats: 330,
         ask_sats: 123_456,
         fee_rate_sat_vb: 1,
@@ -328,8 +337,7 @@ fn create_offer_rejects_non_main_seller_payout_address() {
 
     let err = wallet.create_offer(&request).expect_err("must fail");
     assert!(
-        err.to_string()
-            .contains("seller_payout_address must match wallet main payment address"),
+        err.to_string().contains("belongs to the seller"),
         "unexpected error: {err}"
     );
 }
