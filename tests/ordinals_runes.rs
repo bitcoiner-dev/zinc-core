@@ -96,6 +96,7 @@ fn analyze(
         input_scope,
         network: bitcoin::Network::Bitcoin,
         mint_terms,
+        assets_verified: true,
     };
     analyze_psbt_with_context(psbt, &ctx).expect("analysis should succeed")
 }
@@ -324,6 +325,7 @@ fn mixed_inscription_and_rune_input_reports_both() {
         input_scope: None,
         network: bitcoin::Network::Bitcoin,
         mint_terms: &terms,
+        assets_verified: true,
     };
     let analysis = analyze_psbt_with_context(&psbt, &ctx).expect("analysis");
 

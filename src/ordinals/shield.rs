@@ -138,6 +138,20 @@ pub struct AnalysisResult {
     /// this field is read as untrustworthy rather than trusted.
     #[serde(default)]
     pub sat_flow_reliable: bool,
+    /// Whether the inscription set this analysis was measured against came
+    /// from a completed, successful ordinals resolve.
+    ///
+    /// When `false` the wallet's inscription cache is empty, stale, or was
+    /// never confirmed by the indexer, so `inscriptions_burned: []` means
+    /// "nothing known" rather than "nothing at risk". Every transaction-
+    /// BUILDING path already refuses to run in this state ("safety lock
+    /// engaged"); the dapp-facing analyze path cannot refuse, so it reports
+    /// the condition instead. Approval UIs should badge or block on it.
+    ///
+    /// Defaults to `false` on deserialize: an unverified reading is the safe
+    /// interpretation of a payload that predates this field.
+    #[serde(default)]
+    pub assets_verified: bool,
 }
 
 /// Checks if a UTXO is safe to spend (not inscribed).
@@ -173,6 +187,14 @@ pub struct ShieldContext<'a> {
     /// Cached per-mint amounts keyed by rune id `"block:tx"`, used to resolve
     /// mint amounts offline when the terms are known.
     pub mint_terms: &'a HashMap<String, u128>,
+    /// Whether `known_inscriptions` / `known_runes` came from a completed,
+    /// successful ordinals resolve (the wallet's `ordinals_verified` state).
+    ///
+    /// Pass `false` whenever the caches are empty, stale, or unconfirmed. An
+    /// empty cache is otherwise indistinguishable from a verified-clean
+    /// transaction, which is exactly what a hostile or lagging ord indexer
+    /// would exploit.
+    pub assets_verified: bool,
 }
 
 /// Analyze a PSBT with full wallet context: inscription sat flow plus rune
@@ -186,6 +208,7 @@ pub fn analyze_psbt_with_context(
 ) -> Result<AnalysisResult, OrdError> {
     let mut analysis =
         analyze_psbt_with_scope(psbt, ctx.known_inscriptions, ctx.input_scope, ctx.network)?;
+    apply_asset_verification(&mut analysis, ctx.assets_verified);
     let tx = &psbt.unsigned_tx;
 
     // A suppressed fee is not a zero fee; do not derive a rate from it.
@@ -268,6 +291,30 @@ pub fn analyze_psbt_with_context(
     analysis.rune_actions = Some(flow.actions);
 
     Ok(analysis)
+}
+
+/// Records whether the inscription/rune caches behind an analysis were
+/// actually verified, and downgrades the verdict when they were not.
+///
+/// The shield's clean verdict is only as good as the asset data it was
+/// measured against. With an empty or stale cache the sat-flow simulation
+/// finds nothing to move and reports `warning_level: Safe` with
+/// `inscriptions_burned: []` — indistinguishable from a genuinely clean
+/// transaction. Every transaction-building path in this crate refuses to run
+/// unverified; the dapp-facing analyze path cannot refuse, so it must say so.
+pub fn apply_asset_verification(analysis: &mut AnalysisResult, assets_verified: bool) {
+    analysis.assets_verified = assets_verified;
+    if assets_verified {
+        return;
+    }
+
+    analysis.warnings.push(
+        "Inscription and rune data for this wallet is unverified. A clean result here does not mean this transaction is safe."
+            .to_string(),
+    );
+    if analysis.warning_level == WarningLevel::Safe {
+        analysis.warning_level = WarningLevel::Warn;
+    }
 }
 
 /// Estimates the fee rate in sat/vB for a possibly-unsigned PSBT.
@@ -935,6 +982,10 @@ pub fn analyze_psbt_with_scope(
         rune_actions: None,    // Filled by analyze_psbt_with_context
         fee_rate_sat_vb: None, // Filled by analyze_psbt_with_context
         sat_flow_reliable,
+        // This entry point has no wallet context and therefore no way to know
+        // whether the inscription set it was handed is verified. Callers that
+        // do know must say so via apply_asset_verification (or ShieldContext).
+        assets_verified: false,
     })
 }
 
