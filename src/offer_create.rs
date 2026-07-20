@@ -218,7 +218,14 @@ pub fn create_offer(
         nonce: request.nonce,
     };
 
-    let plan = prepare_offer_acceptance(&offer, request.created_at_unix)?;
+    // Self-check the PSBT we just built against the payout script we put in
+    // output[1]. This is the creator validating its own work, not a seller
+    // accepting a counterparty's offer.
+    let plan = prepare_offer_acceptance(
+        &offer,
+        request.created_at_unix,
+        seller_payout_address.script_pubkey().as_script(),
+    )?;
     Ok(OfferCreateResultV1 {
         psbt: signed_psbt,
         seller_address: seller_payout_address.to_string(),
