@@ -4559,10 +4559,31 @@ impl ZincWallet {
 
     /// Derive the pairing signer secret key hex for this account.
     ///
-    /// Uses the first taproot external key path: `m/86'/coin'/account'/0/0`.
-    pub fn get_pairing_secret_key_hex(&self) -> Result<String, String> {
-        let key = self.derive_private_key(86, 0, 0)?;
-        Ok(hex::encode(key.secret_bytes()))
+    /// Uses a dedicated identity branch: `m/86'/coin'/account'/2/0`.
+    ///
+    /// SECURITY: this used to return `m/86'/coin'/account'/0/0` — the key whose
+    /// BIP-86 tweak produces the wallet's primary funded taproot address. Its
+    /// x-only pubkey is published as `NostrTransportEventV1.pubkey` and carried
+    /// in cleartext as `wallet_pubkey_hex` in `PairingAckV1` / `SignIntentV1`,
+    /// so anyone who saw a pairing message could derive the user's taproot
+    /// address and read off their balance, inscriptions and full history. A
+    /// published identity must not double as a spending key.
+    ///
+    /// Chain index 2 is outside BIP-44's external (0) and internal (1)
+    /// keychains, so no descriptor this wallet builds ever derives it and the
+    /// identity key can never hold funds.
+    pub fn get_pairing_secret_key_hex(&self) -> Result<zeroize::Zeroizing<String>, String> {
+        const PAIRING_IDENTITY_CHAIN: u32 = 2;
+        const PAIRING_IDENTITY_INDEX: u32 = 0;
+
+        let account = self.active_derivation_account();
+        let key = self.derive_private_key_internal(
+            86,
+            account,
+            PAIRING_IDENTITY_CHAIN,
+            PAIRING_IDENTITY_INDEX,
+        )?;
+        Ok(zeroize::Zeroizing::new(hex::encode(key.secret_bytes())))
     }
     /// Derive the taproot public key for this account at `index`.
     pub fn get_taproot_public_key(&self, index: u32) -> Result<String, String> {
