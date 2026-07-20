@@ -7,7 +7,7 @@
 use crate::{OfferEnvelopeV1, ZincError};
 use base64::Engine;
 use bdk_wallet::bitcoin::psbt::{Input, Psbt};
-use bdk_wallet::bitcoin::OutPoint;
+use bdk_wallet::bitcoin::{OutPoint, Script};
 use serde::{Deserialize, Serialize};
 
 /// Acceptance metadata derived from a validated offer payload.
@@ -22,9 +22,23 @@ pub struct OfferAcceptancePlanV1 {
 }
 
 /// Validate offer acceptance prerequisites and return signing plan metadata.
+///
+/// `expected_payout_script` is the accepting wallet's own payout scriptPubKey
+/// and MUST be derived locally — never read out of the offer envelope. The
+/// counterparty authored both the PSBT and the envelope, so any expectation
+/// taken from the offer is one the attacker chose.
+///
+/// SECURITY: this used to validate output *values* only, and never once
+/// referenced a script_pubkey. A hostile counterparty could craft an offer
+/// whose amounts validate perfectly while output[1] pays an address they
+/// control — the seller signs their inscription away and receives nothing.
+/// The value check protects nothing on its own because `ask_sats` comes from
+/// the attacker's own envelope, so it is trivially self-consistent.
+/// `src/listing.rs` already binds the payout script this way.
 pub fn prepare_offer_acceptance(
     offer: &OfferEnvelopeV1,
     now_unix: i64,
+    expected_payout_script: &Script,
 ) -> Result<OfferAcceptancePlanV1, ZincError> {
     let offer_id = offer.offer_id_hex()?;
     if now_unix >= offer.expires_at_unix {
@@ -71,7 +85,13 @@ pub fn prepare_offer_acceptance(
         )));
     }
 
-    validate_ord_layout(offer, &psbt, seller_input_index, seller_outpoint)?;
+    validate_ord_layout(
+        offer,
+        &psbt,
+        seller_input_index,
+        seller_outpoint,
+        expected_payout_script,
+    )?;
 
     if psbt
         .inputs
@@ -122,7 +142,14 @@ fn validate_ord_layout(
     psbt: &Psbt,
     seller_input_index: usize,
     seller_outpoint: OutPoint,
+    expected_payout_script: &Script,
 ) -> Result<(), ZincError> {
+    if expected_payout_script.is_empty() {
+        return Err(ZincError::OfferError(
+            "expected payout script must not be empty".to_string(),
+        ));
+    }
+
     let seller_input = psbt
         .inputs
         .get(seller_input_index)
@@ -176,6 +203,15 @@ fn validate_ord_layout(
             expected_seller_payout,
             seller_payout_out.value.to_sat()
         )));
+    }
+
+    // The correct amount paid to the wrong address is a total loss. Bind the
+    // payout to the script the accepting wallet supplied, mirroring
+    // `listing.rs`.
+    if seller_payout_out.script_pubkey.as_script() != expected_payout_script {
+        return Err(ZincError::OfferError(
+            "seller payout output does not pay this wallet's payout script".to_string(),
+        ));
     }
 
     Ok(())

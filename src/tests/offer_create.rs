@@ -168,8 +168,18 @@ fn create_offer_builds_ord_compatible_psbt_and_offer_envelope() {
         );
     }
 
-    let plan = prepare_offer_acceptance(&created.offer, request.created_at_unix + 1)
-        .expect("acceptance plan");
+    let payout_script = request
+        .seller_payout_address
+        .parse::<bdk_wallet::bitcoin::Address<bdk_wallet::bitcoin::address::NetworkUnchecked>>()
+        .expect("payout address")
+        .assume_checked()
+        .script_pubkey();
+    let plan = prepare_offer_acceptance(
+        &created.offer,
+        request.created_at_unix + 1,
+        payout_script.as_script(),
+    )
+    .expect("acceptance plan");
     assert_eq!(plan.seller_input_index, seller_input_index);
 }
 

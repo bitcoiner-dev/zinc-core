@@ -10,6 +10,17 @@ use bdk_wallet::bitcoin::{
 const ASK_SATS: u64 = 100_000;
 const SELLER_POSTAGE_SATS: u64 = 330;
 
+/// The accepting wallet's own payout script. Derived locally in production,
+/// never read out of the offer envelope.
+fn expected_payout_script() -> ScriptBuf {
+    ScriptBuf::from_hex("0014000102030405060708090a0b0c0d0e0f1011121314").expect("valid script")
+}
+
+/// A script the attacker controls.
+fn attacker_payout_script() -> ScriptBuf {
+    ScriptBuf::from_hex("0014ffeeddccbbaa99887766554433221100ffeeddcc").expect("valid script")
+}
+
 fn sample_seller_txid() -> Txid {
     Txid::from_slice(&[0x11; 32]).expect("valid txid")
 }
@@ -46,6 +57,22 @@ fn psbt_base64(
     include_duplicate_seller_input: bool,
     seller_signed: bool,
     buyer_signed: bool,
+) -> String {
+    psbt_base64_paying(
+        seller_outpoint,
+        include_duplicate_seller_input,
+        seller_signed,
+        buyer_signed,
+        expected_payout_script(),
+    )
+}
+
+fn psbt_base64_paying(
+    seller_outpoint: OutPoint,
+    include_duplicate_seller_input: bool,
+    seller_signed: bool,
+    buyer_signed: bool,
+    payout_script: ScriptBuf,
 ) -> String {
     let mut inputs = vec![
         TxIn {
@@ -85,7 +112,7 @@ fn psbt_base64(
             },
             TxOut {
                 value: Amount::from_sat(ASK_SATS + SELLER_POSTAGE_SATS),
-                script_pubkey: ScriptBuf::new(),
+                script_pubkey: payout_script,
             },
         ],
     };
@@ -117,7 +144,7 @@ fn prepare_offer_acceptance_returns_plan_for_valid_offer() {
     let psbt = psbt_base64(seller_outpoint, false, false, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let plan = prepare_offer_acceptance(&offer, now_unix).expect("valid acceptance plan");
+    let plan = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect("valid acceptance plan");
 
     assert_eq!(plan.seller_input_index, 0);
     assert_eq!(plan.input_count, 2);
@@ -134,7 +161,7 @@ fn prepare_offer_acceptance_rejects_expired_offer() {
     let psbt = psbt_base64(seller_outpoint, false, false, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix - 1);
 
-    let err = prepare_offer_acceptance(&offer, now_unix).expect_err("expired offer");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("expired offer");
     assert!(err.to_string().contains("offer has expired"));
 }
 
@@ -152,7 +179,7 @@ fn prepare_offer_acceptance_rejects_missing_seller_input() {
     let psbt = psbt_base64(seller_outpoint_in_psbt, false, false, true);
     let offer = build_offer(now_unix, seller_outpoint_in_offer, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix).expect_err("missing seller input");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("missing seller input");
     assert!(err.to_string().contains("contains no seller input"));
 }
 
@@ -166,7 +193,7 @@ fn prepare_offer_acceptance_rejects_duplicate_seller_input() {
     let psbt = psbt_base64(seller_outpoint, true, false, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix).expect_err("duplicate seller inputs");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("duplicate seller inputs");
     assert!(err.to_string().contains("contains 2 seller inputs"));
 }
 
@@ -180,7 +207,7 @@ fn prepare_offer_acceptance_rejects_signed_seller_input() {
     let psbt = psbt_base64(seller_outpoint, false, true, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix).expect_err("signed seller input");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("signed seller input");
     assert!(err.to_string().contains("seller input"));
     assert!(err.to_string().contains("must be unsigned"));
 }
@@ -195,7 +222,7 @@ fn prepare_offer_acceptance_rejects_unsigned_buyer_input() {
     let psbt = psbt_base64(seller_outpoint, false, false, false);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix).expect_err("unsigned buyer input");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("unsigned buyer input");
     assert!(err.to_string().contains("buyer input"));
     assert!(err.to_string().contains("must be signed"));
 }
@@ -221,8 +248,59 @@ fn prepare_offer_acceptance_rejects_seller_input_not_first() {
     let encoded = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
     let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix).expect_err("seller input must be first");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("seller input must be first");
     assert!(err.to_string().contains("must be first input"));
+}
+
+/// A hostile counterparty crafts an offer whose amounts validate perfectly but
+/// whose payout output pays an address they control. The value checks are
+/// self-consistent because ask_sats comes from the attacker's own envelope, so
+/// only the script binding catches this — without it the seller signs their
+/// inscription away for nothing.
+#[test]
+fn prepare_offer_acceptance_rejects_payout_to_a_foreign_script() {
+    let now_unix = 1_800_000_000;
+    let seller_outpoint = OutPoint {
+        txid: sample_seller_txid(),
+        vout: 0,
+    };
+
+    let encoded = psbt_base64_paying(
+        seller_outpoint,
+        false,
+        false,
+        true,
+        attacker_payout_script(),
+    );
+    let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
+
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("a payout to a foreign script must be rejected");
+    assert!(
+        err.to_string()
+            .contains("does not pay this wallet's payout script"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The expectation must come from the local wallet. An empty script would let
+/// a caller accidentally opt out of the binding entirely.
+#[test]
+fn prepare_offer_acceptance_rejects_empty_expected_payout_script() {
+    let now_unix = 1_800_000_000;
+    let seller_outpoint = OutPoint {
+        txid: sample_seller_txid(),
+        vout: 0,
+    };
+    let encoded = psbt_base64(seller_outpoint, false, false, true);
+    let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
+
+    let err = prepare_offer_acceptance(&offer, now_unix, ScriptBuf::new().as_script())
+        .expect_err("an empty expectation must be rejected");
+    assert!(
+        err.to_string().contains("must not be empty"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -247,7 +325,7 @@ fn prepare_offer_acceptance_rejects_non_ord_output_layout() {
     let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
 
     let err =
-        prepare_offer_acceptance(&offer, now_unix).expect_err("must reject non-canonical outputs");
+        prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("must reject non-canonical outputs");
     assert!(err
         .to_string()
         .contains("buyer postage output must be first"));
