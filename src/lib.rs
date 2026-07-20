@@ -3068,6 +3068,13 @@ impl ZincWasmWallet {
         }
 
         // 2. Perform Audit
+        //
+        // NOTE: this is the warn-only pre-popup gate — it only decides whether
+        // the PSBT is analyzable at all, so the wallet's `ordinals_verified`
+        // state cannot change its Ok/Err outcome. The verification state is
+        // surfaced to the approval UI through `analyzePsbt`, whose
+        // `AnalysisResult.assets_verified` distinguishes "verified clean" from
+        // "nothing known". Do not treat an Ok here as a clean bill of health.
         let allowed_inputs = sign_opts.as_ref().and_then(|o| o.sign_inputs.as_deref());
 
         crate::ordinals::shield::audit_psbt(

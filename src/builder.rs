@@ -4244,6 +4244,11 @@ impl ZincWallet {
             input_scope: None,
             network: self.vault_wallet.network(),
             mint_terms: &mint_terms,
+            // Every tx-building path guards on this ("safety lock engaged").
+            // The dapp-facing analyze path cannot refuse, so it reports the
+            // state instead: without it an empty or stale cache looks exactly
+            // like a verified-clean transaction.
+            assets_verified: self.ordinals_verified && self.ordinals_metadata_complete,
         };
         let mut result = match analyze_psbt_with_context(&psbt, &ctx) {
             Ok(r) => r,

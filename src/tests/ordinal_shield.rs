@@ -547,6 +547,62 @@ fn unknown_unscoped_input_suppresses_destinations_and_fee() {
     );
 }
 
+/// An empty inscription cache and a verified-clean wallet produce identical
+/// sat-flow results, so the verdict must carry which one it was.
+#[test]
+fn unverified_asset_data_downgrades_a_clean_verdict() {
+    use crate::ordinals::shield::{analyze_psbt_with_context, ShieldContext};
+
+    let psbt = create_dummy_psbt(&[(10_000, None)], &[9_000]);
+    let known_inscriptions = HashMap::new();
+    let known_runes = crate::ordinals::shield::KnownRunes::new();
+    let mint_terms = HashMap::new();
+
+    let verified = analyze_psbt_with_context(
+        &psbt,
+        &ShieldContext {
+            known_inscriptions: &known_inscriptions,
+            known_runes: &known_runes,
+            input_scope: None,
+            network: bitcoin::Network::Regtest,
+            mint_terms: &mint_terms,
+            assets_verified: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(verified.warning_level, WarningLevel::Safe);
+    assert!(verified.assets_verified);
+
+    let unverified = analyze_psbt_with_context(
+        &psbt,
+        &ShieldContext {
+            known_inscriptions: &known_inscriptions,
+            known_runes: &known_runes,
+            input_scope: None,
+            network: bitcoin::Network::Regtest,
+            mint_terms: &mint_terms,
+            assets_verified: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        !unverified.assets_verified,
+        "the UI must be able to tell 'nothing known' from 'nothing at risk'"
+    );
+    assert_eq!(
+        unverified.warning_level,
+        WarningLevel::Warn,
+        "an unverified inscription set must not read as Safe"
+    );
+    assert!(
+        unverified
+            .warnings
+            .iter()
+            .any(|w| w.contains("unverified")),
+        "an explicit warning must explain the downgrade"
+    );
+}
+
 #[test]
 fn analyze_psbt_with_scope_rejects_out_of_range_index() {
     let psbt = create_dummy_psbt(&[(10_000, None)], &[9_000]);
