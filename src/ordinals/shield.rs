@@ -125,6 +125,19 @@ pub struct AnalysisResult {
     /// will be underestimated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_rate_sat_vb: Option<f64>,
+    /// Whether the sat-flow simulation had complete prevout values for EVERY
+    /// input and therefore produced trustworthy absolute ordinal offsets.
+    ///
+    /// Ordinal offsets are absolute across the whole input list, so a single
+    /// input of unknown value invalidates every inscription destination and
+    /// the fee. When this is `false`, `inscription_destinations`,
+    /// `inscriptions_burned` and `fee_sats` are suppressed rather than
+    /// reported wrong — treat the transaction as unanalyzed, not as safe.
+    ///
+    /// Defaults to `false` on deserialize so an older payload that predates
+    /// this field is read as untrustworthy rather than trusted.
+    #[serde(default)]
+    pub sat_flow_reliable: bool,
 }
 
 /// Checks if a UTXO is safe to spend (not inscribed).
@@ -175,7 +188,12 @@ pub fn analyze_psbt_with_context(
         analyze_psbt_with_scope(psbt, ctx.known_inscriptions, ctx.input_scope, ctx.network)?;
     let tx = &psbt.unsigned_tx;
 
-    analysis.fee_rate_sat_vb = estimate_fee_rate_sat_vb(psbt, analysis.fee_sats);
+    // A suppressed fee is not a zero fee; do not derive a rate from it.
+    analysis.fee_rate_sat_vb = if analysis.sat_flow_reliable {
+        estimate_fee_rate_sat_vb(psbt, analysis.fee_sats)
+    } else {
+        None
+    };
 
     // Per-input rune holdings from the wallet cache.
     let mut input_holdings: Vec<Vec<(RuneId, u128)>> = Vec::with_capacity(tx.input.len());
@@ -403,15 +421,15 @@ pub fn analyze_psbt_with_scope(
             }
         }
 
+        // Unscoped inputs still need prevout values: ordinal offsets are
+        // absolute across the whole input list. Note which ones we cannot
+        // value instead of fabricating a zero-value txout for them — the main
+        // loop below records the same fact and the result is suppressed.
         for index in 0..analysis_psbt.inputs.len() {
             if scope_indices.binary_search(&index).is_ok() {
                 continue;
             }
             if input_value_for_audit(psbt, index, false)?.is_none() {
-                analysis_psbt.inputs[index].witness_utxo = Some(bitcoin::TxOut {
-                    value: bitcoin::Amount::from_sat(0),
-                    script_pubkey: bitcoin::ScriptBuf::new(),
-                });
                 scope_has_unknown_inputs = true;
             }
         }
@@ -474,6 +492,16 @@ pub fn analyze_psbt_with_scope(
     }
 
     // 1. Calculate Input Ranges & Total Input Value
+    //
+    // SECURITY: ordinal sat offsets are ABSOLUTE across the entire input list.
+    // Every input advances the running offset and the input total, including
+    // inputs outside the signing scope. Skipping unscoped inputs here (as this
+    // loop used to) understates each inscription's absolute offset, so the
+    // output-mapping loop below resolves it to an earlier output than reality,
+    // and undercounts total_input_value so the fee collapses toward 0. Under
+    // the ordinary dapp pattern signPsbt(psbt, { signInputs: [1] }) that let
+    // the shield report a concrete safe-looking destination for an inscription
+    // that is really burned to fee.
     let mut total_input_value = 0u64;
     let mut accumulated_input_offset = 0u64;
 
@@ -484,12 +512,9 @@ pub fn analyze_psbt_with_scope(
     zinc_log_debug!(target: LOG_TARGET_SHIELD, "analyze_psbt core: Processing {} inputs", analysis_psbt.inputs.len());
 
     for (i, input) in analysis_psbt.inputs.iter().enumerate() {
-        if scope_set
+        let in_scope = scope_set
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&i))
-        {
-            continue;
-        }
+            .is_none_or(|allowed| allowed.contains(&i));
 
         let utxo = &input.witness_utxo;
 
@@ -527,11 +552,17 @@ pub fn analyze_psbt_with_scope(
                     "Ordinal Shield Error: Input #{i} non_witness_utxo found but vout index {vout_idx} invalid."
                 )));
             }
-        } else {
+        } else if in_scope {
             zinc_log_debug!(target: LOG_TARGET_SHIELD, "analyze_psbt: BLIND SPOT at input #{} - returning error", i);
             return Err(OrdError::RequestFailed(format!(
                 "Ordinal Shield Error: Input #{i} missing witness_utxo data. Cannot safely analyze."
             )));
+        } else {
+            // An unscoped input we cannot value. It still occupies sat range in
+            // the ordinal ordering, so every offset after it is now guesswork.
+            zinc_log_debug!(target: LOG_TARGET_SHIELD, "analyze_psbt: unscoped input #{} has unknown value - sat flow unreliable", i);
+            scope_has_unknown_inputs = true;
+            0
         };
 
         let outpoint = analysis_psbt.unsigned_tx.input[i].previous_output;
@@ -855,15 +886,39 @@ pub fn analyze_psbt_with_scope(
                 .join(",")
         ));
 
-        if scope_has_unknown_inputs {
+        if warning_level == WarningLevel::Safe {
+            warning_level = WarningLevel::Warn;
+        }
+    }
+
+    // An input we could not value breaks the absolute sat ordering for every
+    // inscription after it and makes the fee meaningless. Publish nothing
+    // computed from it: a wrong destination reads as reassurance, and the
+    // burn-to-fee case is exactly where that reassurance is fatal.
+    let sat_flow_reliable = !scope_has_unknown_inputs;
+    if scope_has_unknown_inputs {
+        warnings.push(
+            "Some inputs have unknown value. Ordinal sat offsets are absolute across all inputs, so inscription destinations and the fee cannot be computed for this transaction."
+                .to_string(),
+        );
+
+        if active_inscriptions.is_empty() {
+            if warning_level == WarningLevel::Safe {
+                warning_level = WarningLevel::Warn;
+            }
+        } else {
+            warning_level = WarningLevel::Danger;
             warnings.push(
-                "Some unscoped inputs had missing UTXO metadata; sat-flow precision is reduced."
+                "This transaction moves inscriptions but their destinations could not be verified. Do not assume they are safe."
                     .to_string(),
             );
         }
 
-        if warning_level == WarningLevel::Safe {
-            warning_level = WarningLevel::Warn;
+        inscription_destinations.clear();
+        inscriptions_burned.clear();
+        fee_sats = 0;
+        for output in &mut outputs_info {
+            output.inscriptions.clear();
         }
     }
 
@@ -877,8 +932,9 @@ pub fn analyze_psbt_with_scope(
         warnings,
         inputs: inputs_info,
         outputs: outputs_info,
-        rune_actions: None,     // Filled by analyze_psbt_with_context
-        fee_rate_sat_vb: None,  // Filled by analyze_psbt_with_context
+        rune_actions: None,    // Filled by analyze_psbt_with_context
+        fee_rate_sat_vb: None, // Filled by analyze_psbt_with_context
+        sat_flow_reliable,
     })
 }
 
