@@ -547,4 +547,218 @@ mod tests {
             "unexpected error message: {err}"
         );
     }
+
+    /// Build a single-leaf taptree whose leaf is `<key> OP_CHECKSIG`, rooted at
+    /// `internal_key`. Returns (scriptPubKey, leaf script, control block).
+    fn single_leaf_taptree(
+        internal_key: bitcoin::secp256k1::XOnlyPublicKey,
+        leaf_key: bitcoin::secp256k1::XOnlyPublicKey,
+    ) -> (
+        ScriptBuf,
+        ScriptBuf,
+        bdk_wallet::bitcoin::taproot::ControlBlock,
+    ) {
+        use bdk_wallet::bitcoin::taproot::{LeafVersion, TaprootBuilder};
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let leaf = bdk_wallet::bitcoin::script::Builder::new()
+            .push_x_only_key(&leaf_key)
+            .push_opcode(bdk_wallet::bitcoin::opcodes::all::OP_CHECKSIG)
+            .into_script();
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .unwrap()
+            .finalize(&secp, internal_key)
+            .unwrap();
+        let control_block = spend_info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .unwrap();
+        let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+        (spk, leaf, control_block)
+    }
+
+    /// Assemble a one-input PSBT that presents `spk`/`leaf`/`control_block` as a
+    /// reveal-shaped script-path input carrying the empty-fingerprint origin the
+    /// custom signer keys off.
+    fn reveal_shaped_psbt(
+        wallet_key: bitcoin::secp256k1::XOnlyPublicKey,
+        spk: ScriptBuf,
+        leaf: ScriptBuf,
+        control_block: bdk_wallet::bitcoin::taproot::ControlBlock,
+        internal_key: bitcoin::secp256k1::XOnlyPublicKey,
+    ) -> Psbt {
+        use bdk_wallet::bitcoin::taproot::{LeafVersion, TapLeafHash};
+
+        let prev_txid = Txid::from_byte_array([9u8; 32]);
+        let unsigned_tx = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: bdk_wallet::bitcoin::OutPoint::new(prev_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bdk_wallet::bitcoin::Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: spk,
+        });
+        psbt.inputs[0].tap_internal_key = Some(internal_key);
+        psbt.inputs[0]
+            .tap_scripts
+            .insert(control_block, (leaf.clone(), LeafVersion::TapScript));
+
+        // Empty [0,0,0,0] fingerprint: the marker the reveal signer keys off,
+        // and entirely attacker-controlled.
+        let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
+        psbt.inputs[0].tap_key_origins.insert(
+            wallet_key,
+            (
+                vec![leaf_hash],
+                (
+                    bdk_wallet::bitcoin::bip32::Fingerprint::from([0u8; 4]),
+                    bdk_wallet::bitcoin::bip32::DerivationPath::default(),
+                ),
+            ),
+        );
+        psbt
+    }
+
+    fn wallet_taproot_x_only(builder: &crate::builder::ZincWallet) -> bitcoin::secp256k1::XOnlyPublicKey {
+        let hex = builder.get_taproot_public_key(0).unwrap();
+        bitcoin::secp256k1::XOnlyPublicKey::from_str(&hex).unwrap()
+    }
+
+    /// Signs input 0 and reports how many tap script sigs came back. `Err` when
+    /// the wallet refused outright — its existing "requested input was not
+    /// signed" guard fires when the reveal signer declines every leaf.
+    fn sign_and_count_script_sigs(
+        builder: &mut crate::builder::ZincWallet,
+        psbt: &Psbt,
+    ) -> Result<usize, String> {
+        let psbt_base64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+        let signed = builder.sign_psbt(
+            &psbt_base64,
+            Some(SignOptions {
+                sign_inputs: Some(vec![0]),
+                sighash: None,
+                finalize: false,
+            }),
+        )?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(signed)
+            .unwrap();
+        Ok(Psbt::deserialize(&bytes).unwrap().inputs[0]
+            .tap_script_sigs
+            .len())
+    }
+
+    /// The reveal signer must bind every leaf it signs to the prevout it is
+    /// spending. Before this check the empty-fingerprint origin alone was
+    /// treated as proof of ownership, so the wallet would sign an arbitrary
+    /// tapscript against an arbitrary sighash — a blind-signing oracle.
+    #[test]
+    fn script_path_signer_binds_leaf_to_prevout() {
+        let seed = [0u8; 64];
+        let mut builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+        let wallet_key = wallet_taproot_x_only(&builder);
+
+        // Positive control: a real commit-shaped taptree rooted at our own key
+        // with a leaf that requires our signature. This is the legitimate
+        // inscription-reveal shape and must still be signed.
+        let (spk, leaf, control_block) = single_leaf_taptree(wallet_key, wallet_key);
+        let psbt = reveal_shaped_psbt(
+            wallet_key,
+            spk,
+            leaf,
+            control_block,
+            wallet_key,
+        );
+        assert_eq!(
+            sign_and_count_script_sigs(&mut builder, &psbt),
+            Ok(1),
+            "a genuine commit-shaped reveal input must still be signed"
+        );
+    }
+
+    #[test]
+    fn script_path_signer_rejects_leaf_not_committed_by_prevout() {
+        let seed = [0u8; 64];
+        let mut builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+        let wallet_key = wallet_taproot_x_only(&builder);
+
+        // Attacker supplies a valid-looking leaf + control block, but the
+        // prevout's scriptPubKey belongs to a completely different taptree.
+        // The control block does not commit to it, so nothing may be signed.
+        let (_spk, leaf, control_block) = single_leaf_taptree(wallet_key, wallet_key);
+        let foreign_key = bitcoin::secp256k1::XOnlyPublicKey::from_str(
+            "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+        )
+        .unwrap();
+        let (foreign_spk, _, _) = single_leaf_taptree(foreign_key, foreign_key);
+
+        let psbt = reveal_shaped_psbt(
+            wallet_key,
+            foreign_spk,
+            leaf,
+            control_block,
+            wallet_key,
+        );
+        let outcome = sign_and_count_script_sigs(&mut builder, &psbt);
+        assert!(
+            outcome != Ok(1),
+            "a leaf whose control block does not commit to the prevout must never be signed"
+        );
+        assert!(
+            outcome.is_err(),
+            "declining every leaf must surface as a refusal, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn script_path_signer_rejects_leaf_that_does_not_need_our_key() {
+        let seed = [0u8; 64];
+        let mut builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+        let wallet_key = wallet_taproot_x_only(&builder);
+        let foreign_key = bitcoin::secp256k1::XOnlyPublicKey::from_str(
+            "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+        )
+        .unwrap();
+
+        // A well-formed taptree rooted at our key, but the leaf requires
+        // somebody else's signature. Signing it produces a signature over a
+        // script we never inspected; the old code signed every leaf present.
+        let (spk, leaf, control_block) = single_leaf_taptree(wallet_key, foreign_key);
+        let psbt = reveal_shaped_psbt(
+            wallet_key,
+            spk,
+            leaf,
+            control_block,
+            wallet_key,
+        );
+        let outcome = sign_and_count_script_sigs(&mut builder, &psbt);
+        assert!(
+            outcome != Ok(1),
+            "a leaf that never pushes our key must not be signed"
+        );
+        assert!(
+            outcome.is_err(),
+            "declining every leaf must surface as a refusal, got {outcome:?}"
+        );
+    }
 }
