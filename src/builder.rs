@@ -3477,6 +3477,159 @@ impl ZincWallet {
         base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
     }
 
+    /// Resolve the prevout a PSBT input spends, from either UTXO field.
+    fn declared_prevout(psbt: &Psbt, index: usize) -> Option<&bitcoin::TxOut> {
+        if let Some(txout) = psbt.inputs[index].witness_utxo.as_ref() {
+            return Some(txout);
+        }
+        let vout = psbt.unsigned_tx.input[index].previous_output.vout as usize;
+        psbt.inputs[index]
+            .non_witness_utxo
+            .as_ref()
+            .and_then(|prev| prev.output.get(vout))
+    }
+
+    /// Fill missing prevout metadata from the wallet's own UTXO set, and refuse
+    /// any PSBT that describes a UTXO we own differently to how we know it.
+    ///
+    /// SECURITY: the enrichment pass used to backfill only when BOTH UTXO
+    /// fields were absent, so a PSBT that declared a witness_utxo we could
+    /// have corroborated was never checked against it — the wallet held the
+    /// true `TxOut` in hand and never compared. A declared value higher than
+    /// the real one is the fee-inflation attack: the surplus is burned to
+    /// miners. Any mismatch on an outpoint we own is now a hard refusal,
+    /// regardless of how the input is later signed.
+    fn enrich_and_validate_prevouts(&self, psbt: &mut Psbt) -> Result<(), String> {
+        use std::collections::HashMap;
+        let mut known_utxos: HashMap<bitcoin::OutPoint, bitcoin::TxOut> = HashMap::new();
+
+        let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
+            for utxo in w.list_unspent() {
+                map.insert(utxo.outpoint, utxo.txout);
+            }
+        };
+
+        collect_utxos(&self.vault_wallet, &mut known_utxos);
+        if let Some(w) = &self.payment_wallet {
+            collect_utxos(w, &mut known_utxos);
+        }
+
+        for i in 0..psbt.inputs.len() {
+            let outpoint = psbt.unsigned_tx.input[i].previous_output;
+            let Some(ours) = known_utxos.get(&outpoint) else {
+                continue;
+            };
+
+            if let Some(declared) = psbt.inputs[i].witness_utxo.as_ref() {
+                if declared != ours {
+                    return Err(format!(
+                        "Security Violation: Input #{i} declares a different value or script for \
+                         an output this wallet owns (declared {} sats, wallet has {} sats)",
+                        declared.value.to_sat(),
+                        ours.value.to_sat()
+                    ));
+                }
+            } else {
+                psbt.inputs[i].witness_utxo = Some(ours.clone());
+            }
+
+            if let Some(prev_tx) = psbt.inputs[i].non_witness_utxo.as_ref() {
+                let vout = outpoint.vout as usize;
+                let matches = prev_tx.compute_txid() == outpoint.txid
+                    && prev_tx.output.get(vout).is_some_and(|txout| txout == ours);
+                if !matches {
+                    return Err(format!(
+                        "Security Violation: Input #{i} non_witness_utxo does not match the \
+                         output this wallet owns"
+                    ));
+                }
+            } else if !ours.script_pubkey.is_p2tr() {
+                // Legacy and segwit-v0 inputs need the full previous
+                // transaction so the declared amount can be proven rather
+                // than trusted. Supply it from our own chain data.
+                let from_wallet = self
+                    .vault_wallet
+                    .get_tx(outpoint.txid)
+                    .or_else(|| {
+                        self.payment_wallet
+                            .as_ref()
+                            .and_then(|w| w.get_tx(outpoint.txid))
+                    })
+                    .map(|tx| tx.tx_node.tx.as_ref().clone());
+                if let Some(prev_tx) = from_wallet {
+                    psbt.inputs[i].non_witness_utxo = Some(prev_tx);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Refuse to sign a non-taproot input whose declared amount cannot be
+    /// proven from the full previous transaction.
+    ///
+    /// The legacy P2PKH sighash does not commit to the input amount (and this
+    /// wallet supports `pkh(...)` descriptors), so a falsified `witness_utxo`
+    /// value produces a signature that is valid on chain while the difference
+    /// between the declared and real amount is burned to miners. Only
+    /// `non_witness_utxo` proves the amount. Taproot is exempt: BIP341 commits
+    /// to every prevout amount and scriptPubKey, so a lie there simply yields
+    /// an invalid signature.
+    fn require_prevout_proof_for_non_taproot(&self, psbt: &Psbt) -> Result<(), String> {
+        for i in 0..psbt.inputs.len() {
+            let input = &psbt.inputs[i];
+            if input.final_script_witness.is_some() || input.final_script_sig.is_some() {
+                continue; // Already finalized, nothing left to sign.
+            }
+            if input.non_witness_utxo.is_some() {
+                continue; // Amount is proven.
+            }
+            let Some(prevout) = Self::declared_prevout(psbt, i) else {
+                continue; // Missing metadata is handled by the shield/scope checks.
+            };
+            if prevout.script_pubkey.is_p2tr() {
+                continue;
+            }
+            // Only our own inputs can cost us money here; a foreign input we
+            // cannot sign is not our problem, and rejecting it would break
+            // legitimate multi-party PSBTs.
+            let is_ours = self.vault_wallet.is_mine(prevout.script_pubkey.clone())
+                || self
+                    .payment_wallet
+                    .as_ref()
+                    .is_some_and(|w| w.is_mine(prevout.script_pubkey.clone()));
+            if !is_ours {
+                continue;
+            }
+            return Err(format!(
+                "Security Violation: Input #{i} is a non-taproot output of this wallet but the \
+                 PSBT does not include its previous transaction, so the declared amount cannot \
+                 be verified"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether BDK's `trust_witness_utxo` must be relaxed for this PSBT.
+    ///
+    /// BDK classifies an input as taproot by the presence of `tap_internal_key`
+    /// or `tap_merkle_root`. Inscription reveal inputs spending a not-yet-
+    /// broadcast commit often carry neither, so BDK's blanket check would
+    /// reject the whole PSBT. This classifies by the actual scriptPubKey, so
+    /// trust is granted only when every input that would trip BDK is genuinely
+    /// taproot — where BIP341 makes trusting the witness_utxo safe anyway.
+    fn needs_witness_utxo_trust(psbt: &Psbt) -> bool {
+        psbt.inputs.iter().enumerate().any(|(i, input)| {
+            input.final_script_witness.is_none()
+                && input.final_script_sig.is_none()
+                && input.tap_internal_key.is_none()
+                && input.tap_merkle_root.is_none()
+                && input.non_witness_utxo.is_none()
+                && Self::declared_prevout(psbt, i)
+                    .is_some_and(|prevout| prevout.script_pubkey.is_p2tr())
+        })
+    }
+
     /// Sign a PSBT using the wallet's internal keys.
     /// Returns the signed PSBT as base64.
     #[allow(deprecated)]
@@ -3494,39 +3647,35 @@ impl ZincWallet {
 
         let mut psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| format!("Invalid PSBT: {e}"))?;
 
-        // ENRICHMENT STEP: Fill in missing witness_utxo from our own wallet if possible
-        // This solves "Plain PSBT" issues where dApps don't include UTXO info
         use std::collections::HashMap;
-        let mut known_utxos = HashMap::new();
 
-        let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-            for utxo in w.list_unspent() {
-                map.insert(utxo.outpoint, utxo.txout);
-            }
-        };
+        // ENRICHMENT STEP: fill in missing prevout metadata from our own wallet,
+        // and reject any input that describes a UTXO we own differently to how
+        // we know it. See enrich_and_validate_prevouts.
+        self.enrich_and_validate_prevouts(&mut psbt)?;
 
-        collect_utxos(&self.vault_wallet, &mut known_utxos);
-        if let Some(w) = &self.payment_wallet {
-            collect_utxos(w, &mut known_utxos);
-        }
-
-        for (i, input) in psbt.inputs.iter_mut().enumerate() {
-            if input.witness_utxo.is_none() && input.non_witness_utxo.is_none() {
-                let outpoint = psbt.unsigned_tx.input[i].previous_output;
-                if let Some(txout) = known_utxos.get(&outpoint) {
-                    input.witness_utxo = Some(txout.clone());
-                }
-            }
-        }
+        // A prevout value we cannot corroborate is a fee-inflation risk: for
+        // legacy P2PKH the sighash does not commit to the input amount, so a
+        // falsified witness_utxo value yields an on-chain-valid signature and
+        // the difference is burned to miners. Taproot is exempt because BIP341
+        // commits to every prevout amount and scriptPubKey.
+        self.require_prevout_proof_for_non_taproot(&psbt)?;
 
         // Prepare BDK SignOptions and Apply Overrides (SIGHASH, etc.)
         // We do this BEFORE audit to ensuring we check the actual state being signed.
         let should_finalize = options.as_ref().is_some_and(|o| o.finalize);
         let bdk_options = bdk_wallet::SignOptions {
-            // CRITICAL: Enable trust_witness_utxo for batch inscriptions where reveal
-            // transactions spend outputs from not-yet-broadcast commit transactions.
-            // The wallet can't verify these UTXOs from chain state, but we trust the dApp.
-            trust_witness_utxo: true,
+            // BDK defaults this to false specifically to block fee inflation,
+            // and we keep that default wherever we can. It has to be relaxed
+            // only for genuinely-taproot inputs that BDK cannot recognise:
+            // BDK decides "is taproot" from the presence of tap_internal_key /
+            // tap_merkle_root, and an inscription reveal input spending a
+            // not-yet-broadcast commit often carries neither, so BDK would
+            // reject the whole PSBT. See needs_witness_utxo_trust, which
+            // classifies by the actual scriptPubKey instead of by which PSBT
+            // fields happen to be populated, and require_prevout_proof_for_
+            // non_taproot above, which is the real gate.
+            trust_witness_utxo: Self::needs_witness_utxo_trust(&psbt),
             // Finalize if explicitly requested (internal wallet use).
             // Default is false for dApp/marketplace compatibility.
             try_finalize: should_finalize,
@@ -3712,6 +3861,11 @@ impl ZincWallet {
             .map_err(|e| format!("Invalid base64: {e}"))?;
 
         let mut psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| format!("Invalid PSBT: {e}"))?;
+
+        // Same prevout enrichment and mismatch refusal as sign_psbt: a device
+        // signs what we hand it, so a falsified amount has to be caught here.
+        self.enrich_and_validate_prevouts(&mut psbt)?;
+        self.require_prevout_proof_for_non_taproot(&psbt)?;
 
         use std::collections::HashMap;
         let mut known_utxos = HashMap::new();
