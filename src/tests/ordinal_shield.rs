@@ -456,6 +456,97 @@ fn audit_and_analyze_respect_input_scope_subset() {
     let _ = (&scoped, &full);
 }
 
+/// Ordinal offsets are absolute across ALL inputs. Under the ordinary dapp
+/// pattern signPsbt(psbt, { signInputs: [1] }) the shield used to skip input 0
+/// before accumulating its value, which understated the inscription's absolute
+/// offset by 10,000 sats. It then mapped the inscription into output 0 and
+/// reported a concrete destination with a 0 fee — affirmatively telling the
+/// user a burn was safe.
+#[test]
+fn partial_scope_keeps_absolute_offsets_across_unscoped_inputs() {
+    // Input 0 (unscoped): 10,000. Input 1 (scoped): 10,000 with an inscription
+    // at relative offset 0, so absolute offset 10,000. The single 10,000-sat
+    // output covers sats [0, 10,000) only — the inscription is in the fee.
+    let psbt = create_dummy_psbt(&[(10_000, None), (10_000, None)], &[10_000]);
+
+    let mut known: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::new();
+    known.insert(
+        (
+            Txid::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap(),
+            1,
+        ),
+        vec![("inscription_a".to_string(), 0)],
+    );
+
+    let scoped =
+        analyze_psbt_with_scope(&psbt, &known, Some(&[1]), bitcoin::Network::Regtest).unwrap();
+
+    assert!(
+        scoped.sat_flow_reliable,
+        "every input has a witness_utxo, so the sat flow is fully known"
+    );
+    assert_eq!(
+        scoped.inscriptions_burned,
+        vec!["inscription_a".to_string()],
+        "the inscription lands past the last output and is burned to fee"
+    );
+    assert_eq!(
+        scoped.warning_level,
+        WarningLevel::Danger,
+        "a burn must be Danger, not a safe-looking destination"
+    );
+    assert_eq!(
+        scoped.inscription_destinations["inscription_a"].vout, None,
+        "burned inscriptions must not report a concrete destination output"
+    );
+    assert_eq!(
+        scoped.fee_sats, 10_000,
+        "total_input_value must include unscoped inputs or the fee collapses to 0"
+    );
+}
+
+/// If any input's value is genuinely unknown the absolute ordering is
+/// guesswork, so no destination or fee may be published at all.
+#[test]
+fn unknown_unscoped_input_suppresses_destinations_and_fee() {
+    let mut psbt = create_dummy_psbt(&[(10_000, None), (10_000, None)], &[10_000]);
+    // Input 0 is outside the scope AND has no prevout metadata at all.
+    psbt.inputs[0].witness_utxo = None;
+
+    let mut known: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::new();
+    known.insert(
+        (
+            Txid::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap(),
+            1,
+        ),
+        vec![("inscription_a".to_string(), 0)],
+    );
+
+    let scoped =
+        analyze_psbt_with_scope(&psbt, &known, Some(&[1]), bitcoin::Network::Regtest).unwrap();
+
+    assert!(
+        !scoped.sat_flow_reliable,
+        "an unvalued input must mark the sat flow unreliable"
+    );
+    assert!(
+        scoped.inscription_destinations.is_empty(),
+        "a computed-but-wrong destination is worse than none"
+    );
+    assert!(
+        scoped.inscriptions_burned.is_empty(),
+        "the burn list is derived from the same broken offsets"
+    );
+    assert_eq!(scoped.fee_sats, 0, "the fee cannot be computed");
+    assert_eq!(
+        scoped.warning_level,
+        WarningLevel::Danger,
+        "unverifiable inscription movement must escalate to Danger"
+    );
+}
+
 #[test]
 fn analyze_psbt_with_scope_rejects_out_of_range_index() {
     let psbt = create_dummy_psbt(&[(10_000, None)], &[9_000]);
