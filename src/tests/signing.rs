@@ -548,6 +548,82 @@ mod tests {
         );
     }
 
+    /// The wallet holds the true TxOut for its own UTXOs, so a PSBT that
+    /// declares a different value for one of them is lying. The enrichment
+    /// pass used to backfill only when BOTH UTXO fields were absent, so a
+    /// declared witness_utxo was never compared against what we knew.
+    #[test]
+    fn rejects_witness_utxo_that_contradicts_a_wallet_owned_output() {
+        let seed = [0u8; 64];
+        let mut builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+
+        let addr = builder
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
+        let script = addr.script_pubkey();
+
+        let mut graph = bdk_wallet::chain::TxGraph::default();
+        let tx1 = create_dummy_tx(10_000, script.clone(), 1);
+        let _ = graph.insert_tx(tx1.clone());
+        let _ = graph.insert_anchor(
+            tx1.compute_txid(),
+            ConfirmationBlockTime {
+                block_id: bdk_wallet::chain::BlockId {
+                    height: 100,
+                    hash: bdk_wallet::bitcoin::BlockHash::all_zeros(),
+                },
+                confirmation_time: 1000,
+            },
+        );
+        let mut last_active = std::collections::BTreeMap::new();
+        last_active.insert(KeychainKind::External, 5);
+        builder
+            .vault_wallet
+            .apply_update(bdk_wallet::Update {
+                tx_update: graph.into(),
+                chain: Default::default(),
+                last_active_indices: last_active,
+            })
+            .unwrap();
+
+        let unsigned_tx = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: bdk_wallet::bitcoin::OutPoint::new(tx1.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bdk_wallet::bitcoin::Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: script.clone(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        // The UTXO is really 10,000 sats. Claim 500,000 — under the old code
+        // the surplus would have been burned to miners as fee.
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(500_000),
+            script_pubkey: script,
+        });
+
+        let psbt_base64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+        let err = builder
+            .sign_psbt(&psbt_base64, None)
+            .expect_err("an inflated value on a wallet-owned input must be refused");
+
+        assert!(
+            err.contains("declares a different value or script"),
+            "unexpected error message: {err}"
+        );
+    }
+
     /// Build a single-leaf taptree whose leaf is `<key> OP_CHECKSIG`, rooted at
     /// `internal_key`. Returns (scriptPubKey, leaf script, control block).
     fn single_leaf_taptree(
