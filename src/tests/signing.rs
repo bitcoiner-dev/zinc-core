@@ -838,3 +838,42 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pairing_identity {
+    use crate::builder::{AddressScheme, Seed64, WalletBuilder};
+    use bdk_wallet::bitcoin::Network;
+
+    /// The pairing identity pubkey is published in cleartext (as
+    /// NostrTransportEventV1.pubkey and as wallet_pubkey_hex inside
+    /// PairingAckV1 / SignIntentV1). It must therefore not be the key whose
+    /// BIP-86 tweak produces a funded address, or publishing it hands out the
+    /// user's address, balance and full history.
+    #[test]
+    fn pairing_identity_key_is_not_a_spending_key() {
+        let seed = [3u8; 64];
+        let wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+
+        let secret_hex = wallet.get_pairing_secret_key_hex().unwrap();
+        let pairing_pubkey =
+            crate::sign_intent::pubkey_hex_from_secret_key(&secret_hex).unwrap();
+
+        let taproot_pubkey = wallet.get_taproot_public_key(0).unwrap();
+        assert_ne!(
+            pairing_pubkey, taproot_pubkey,
+            "the published pairing identity must not be the primary spending key"
+        );
+
+        // And it must not match any nearby receive index either.
+        for index in 0..5 {
+            assert_ne!(
+                pairing_pubkey,
+                wallet.get_taproot_public_key(index).unwrap(),
+                "pairing identity collided with taproot receive index {index}"
+            );
+        }
+    }
+}
