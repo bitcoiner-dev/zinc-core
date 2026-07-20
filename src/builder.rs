@@ -4486,6 +4486,45 @@ impl ZincWallet {
         }
     }
 
+    /// True when `script` contains a data push of exactly `key`'s 32-byte
+    /// x-only serialization. A tapscript that never pushes our key cannot
+    /// require our signature, so signing it would be blind signing.
+    fn tapscript_pushes_x_only_key(
+        script: &bitcoin::Script,
+        key: bitcoin::secp256k1::XOnlyPublicKey,
+    ) -> bool {
+        let needle = key.serialize();
+        script.instructions().flatten().any(|instruction| {
+            matches!(instruction, bitcoin::script::Instruction::PushBytes(bytes)
+                if bytes.as_bytes() == needle)
+        })
+    }
+
+    /// True when `script` carries an ordinals envelope (`OP_FALSE OP_IF "ord"`).
+    /// This is the signature of a genuine inscription-reveal tapscript.
+    fn tapscript_has_ord_envelope(script: &bitcoin::Script) -> bool {
+        const ENVELOPE_MARKER: [u8; 6] = [0x00, 0x63, 0x03, 0x6f, 0x72, 0x64];
+        script
+            .as_bytes()
+            .windows(ENVELOPE_MARKER.len())
+            .any(|window| window == ENVELOPE_MARKER)
+    }
+
+    /// Extract the taproot output key committed to by a P2TR scriptPubKey.
+    fn p2tr_output_key(
+        script_pubkey: &bitcoin::Script,
+    ) -> Option<bitcoin::secp256k1::XOnlyPublicKey> {
+        if !script_pubkey.is_p2tr() {
+            return None;
+        }
+        let bytes = script_pubkey.as_bytes();
+        // P2TR spk is exactly OP_1 <32-byte push> — 34 bytes total.
+        if bytes.len() != 34 {
+            return None;
+        }
+        bitcoin::secp256k1::XOnlyPublicKey::from_slice(&bytes[2..34]).ok()
+    }
+
     fn sign_inscription_script_paths(
         &self,
         psbt: &mut Psbt,
@@ -4515,95 +4554,179 @@ impl ZincWallet {
         }
         let prevouts_all = Prevouts::All(&prevouts);
 
-        // 2. Iterate inputs and sign matches
-        for i in 0..psbt.inputs.len() {
+        // Outpoints the wallet can actually see as its own. An inscription
+        // commit that has not been broadcast yet will NOT be in here, which is
+        // exactly why the ownership gate below also accepts a taptree whose
+        // internal key is ours or a genuine ordinals reveal envelope.
+        let mut wallet_outpoints: std::collections::HashSet<bitcoin::OutPoint> =
+            std::collections::HashSet::new();
+        for utxo in self.vault_wallet.list_unspent() {
+            wallet_outpoints.insert(utxo.outpoint);
+        }
+        if let Some(wallet) = &self.payment_wallet {
+            for utxo in wallet.list_unspent() {
+                wallet_outpoints.insert(utxo.outpoint);
+            }
+        }
+
+        let account = self.active_derivation_account();
+        let effective_index = self.active_receive_index();
+        let derived_pubkey_hex =
+            self.derive_public_key_internal(86, network, account, effective_index)?;
+
+        // 2. Decide which (input, key, leaf) triples we are allowed to sign.
+        //
+        // SECURITY: an empty [0,0,0,0] origin fingerprint is chosen by whoever
+        // authored the PSBT and our reveal pubkey is public, so neither proves
+        // anything. Every leaf we sign must be cryptographically bound to the
+        // prevout being spent, or this function is a blind-signing oracle that
+        // will sign an arbitrary tapscript against an arbitrary sighash.
+        struct ApprovedLeaf {
+            input_index: usize,
+            pubkey: bitcoin::secp256k1::XOnlyPublicKey,
+            script: bitcoin::ScriptBuf,
+            leaf_version: bitcoin::taproot::LeafVersion,
+        }
+        let mut approved: Vec<ApprovedLeaf> = Vec::new();
+
+        for (i, input) in psbt.inputs.iter().enumerate() {
             if let Some(allowed) = indices {
                 if !allowed.contains(&i) {
                     continue;
                 }
             }
 
-            let input = &mut psbt.inputs[i];
             if input.tap_key_sig.is_some() || !input.tap_script_sigs.is_empty() {
                 continue; // Already signed
             }
 
-            // Check if this is an inscription reveal (tap_key_origins with empty fingerprint)
-            let mut key_found = false;
+            // The prevout must be taproot, and its output key is the anchor
+            // every control block has to prove a commitment to.
+            let Some(output_key) = Self::p2tr_output_key(&prevouts[i].script_pubkey) else {
+                continue;
+            };
+
+            let outpoint = psbt.unsigned_tx.input[i].previous_output;
+            let outpoint_is_wallet_utxo = wallet_outpoints.contains(&outpoint);
+
             for (pubkey, (_, origin)) in &input.tap_key_origins {
-                // Heuristic: Reveal inputs use the internal key directly in the script path
-                // and often have an empty fingerprint [0,0,0,0] in the PSBT origin.
-                if *origin.0.as_bytes() == [0, 0, 0, 0] {
-                    // Try to derive the ordinals key (m/86'/coin'/account'/0/0)
-                    let account = self.active_derivation_account();
-                    let effective_index = self.active_receive_index();
-                    if let Ok(derived_pubkey_hex) =
-                        self.derive_public_key_internal(86, network, account, effective_index)
-                    {
-                        if pubkey.to_string() == derived_pubkey_hex {
-                            // MATCH! Sign it.
-                            let priv_key = self.derive_private_key(86, 0, 0)?;
+                // Heuristic: reveal inputs use the reveal key directly in the
+                // script path and carry an empty fingerprint in the PSBT origin.
+                // This only selects candidates — it grants no authority.
+                if *origin.0.as_bytes() != [0, 0, 0, 0] {
+                    continue;
+                }
+                if pubkey.to_string() != derived_pubkey_hex {
+                    continue;
+                }
 
-                            let mut cache = SighashCache::new(&psbt.unsigned_tx);
-                            let sighash_type = input
-                                .sighash_type
-                                .unwrap_or(bitcoin::psbt::PsbtSighashType::from_u32(0)); // DEFAULT
-
-                            // For reveal, we sign the script path.
-                            for (_control_block, (script, _)) in &input.tap_scripts {
-                                let leaf_hash = bitcoin::taproot::TapLeafHash::from_script(
-                                    script,
-                                    bitcoin::taproot::LeafVersion::TapScript,
-                                );
-
-                                // Convert PsbtSighashType to TapSighashType
-                                let tap_sighash_type = match sighash_type.to_u32() {
-                                    0 => bitcoin::sighash::TapSighashType::Default,
-                                    1 => bitcoin::sighash::TapSighashType::All,
-                                    2 => bitcoin::sighash::TapSighashType::None,
-                                    3 => bitcoin::sighash::TapSighashType::Single,
-                                    0x81 => bitcoin::sighash::TapSighashType::AllPlusAnyoneCanPay,
-                                    0x82 => bitcoin::sighash::TapSighashType::NonePlusAnyoneCanPay,
-                                    0x83 => {
-                                        bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay
-                                    }
-                                    _ => bitcoin::sighash::TapSighashType::Default,
-                                };
-
-                                let sighash = cache
-                                    .taproot_script_spend_signature_hash(
-                                        i,
-                                        &prevouts_all,
-                                        leaf_hash,
-                                        tap_sighash_type,
-                                    )
-                                    .map_err(|e| format!("Sighash calculation failed: {e}"))?;
-
-                                let msg = Message::from_digest(sighash.to_byte_array());
-                                let sig = secp.sign_schnorr(&msg, &priv_key.keypair(&secp));
-
-                                let mut final_sig = sig.as_ref().to_vec();
-                                if tap_sighash_type != bitcoin::sighash::TapSighashType::Default {
-                                    final_sig.push(tap_sighash_type as u8);
-                                }
-
-                                // SECURITY: avoid panic if the assembled taproot signature
-                                // is malformed; surface an error instead of aborting.
-                                let tap_sig =
-                                    bitcoin::taproot::Signature::from_slice(&final_sig)
-                                        .map_err(|e| format!("Invalid taproot signature: {e}"))?;
-                                input.tap_script_sigs.insert((*pubkey, leaf_hash), tap_sig);
-                                key_found = true;
-                            }
-                        }
+                for (control_block, (script, leaf_version)) in &input.tap_scripts {
+                    // (a) The leaf must actually require our key. Signing a leaf
+                    // that never pushes our pubkey is signing something we have
+                    // not understood.
+                    if !Self::tapscript_pushes_x_only_key(script, *pubkey) {
+                        zinc_log_debug!(
+                            target: LOG_TARGET_BUILDER,
+                            "Reveal signer: input #{i} leaf does not push our key, skipping"
+                        );
+                        continue;
                     }
+
+                    // (b) The control block must prove this leaf is really in
+                    // the taptree committed to by the prevout's scriptPubKey.
+                    // This is the check that makes the discarded control block
+                    // load-bearing again.
+                    if control_block.leaf_version != *leaf_version {
+                        continue;
+                    }
+                    if !control_block.verify_taproot_commitment(&secp, output_key, script) {
+                        zinc_log_debug!(
+                            target: LOG_TARGET_BUILDER,
+                            "Reveal signer: input #{i} control block does not commit to the prevout, skipping"
+                        );
+                        continue;
+                    }
+
+                    // (c) Ownership. A confirmed wallet UTXO proves it outright;
+                    // an un-broadcast commit does not appear in list_unspent, so
+                    // accept a taptree rooted at our own internal key or a real
+                    // ordinals reveal envelope — the flow this signer exists for.
+                    let internal_key_is_ours =
+                        control_block.internal_key.to_string() == derived_pubkey_hex;
+                    let looks_like_reveal = Self::tapscript_has_ord_envelope(script);
+                    if !(outpoint_is_wallet_utxo || internal_key_is_ours || looks_like_reveal) {
+                        zinc_log_debug!(
+                            target: LOG_TARGET_BUILDER,
+                            "Reveal signer: input #{i} is not a wallet-owned or reveal-shaped input, skipping"
+                        );
+                        continue;
+                    }
+
+                    approved.push(ApprovedLeaf {
+                        input_index: i,
+                        pubkey: *pubkey,
+                        script: script.clone(),
+                        leaf_version: *leaf_version,
+                    });
                 }
             }
+        }
 
-            if key_found && finalize {
-                // Note: Full script-path finalization is complex (needs script + control block).
-                // We leave it to the dApp or BDK if possible, or implement minimal reveal finalizer here.
+        if approved.is_empty() {
+            return Ok(());
+        }
+
+        // 3. Sign the approved leaves.
+        let priv_key = self.derive_private_key(86, 0, 0)?;
+        let keypair = priv_key.keypair(&secp);
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let mut key_found = false;
+
+        for leaf in &approved {
+            let i = leaf.input_index;
+            let leaf_hash =
+                bitcoin::taproot::TapLeafHash::from_script(&leaf.script, leaf.leaf_version);
+
+            let sighash_type = psbt.inputs[i]
+                .sighash_type
+                .unwrap_or(bitcoin::psbt::PsbtSighashType::from_u32(0)); // DEFAULT
+
+            // Convert PsbtSighashType to TapSighashType
+            let tap_sighash_type = match sighash_type.to_u32() {
+                1 => bitcoin::sighash::TapSighashType::All,
+                2 => bitcoin::sighash::TapSighashType::None,
+                3 => bitcoin::sighash::TapSighashType::Single,
+                0x81 => bitcoin::sighash::TapSighashType::AllPlusAnyoneCanPay,
+                0x82 => bitcoin::sighash::TapSighashType::NonePlusAnyoneCanPay,
+                0x83 => bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay,
+                _ => bitcoin::sighash::TapSighashType::Default,
+            };
+
+            let sighash = cache
+                .taproot_script_spend_signature_hash(i, &prevouts_all, leaf_hash, tap_sighash_type)
+                .map_err(|e| format!("Sighash calculation failed: {e}"))?;
+
+            let msg = Message::from_digest(sighash.to_byte_array());
+            let sig = secp.sign_schnorr(&msg, &keypair);
+
+            let mut final_sig = sig.as_ref().to_vec();
+            if tap_sighash_type != bitcoin::sighash::TapSighashType::Default {
+                final_sig.push(tap_sighash_type as u8);
             }
+
+            // SECURITY: avoid panic if the assembled taproot signature
+            // is malformed; surface an error instead of aborting.
+            let tap_sig = bitcoin::taproot::Signature::from_slice(&final_sig)
+                .map_err(|e| format!("Invalid taproot signature: {e}"))?;
+            psbt.inputs[i]
+                .tap_script_sigs
+                .insert((leaf.pubkey, leaf_hash), tap_sig);
+            key_found = true;
+        }
+
+        if key_found && finalize {
+            // Note: Full script-path finalization is complex (needs script + control block).
+            // We leave it to the dApp or BDK if possible, or implement minimal reveal finalizer here.
         }
 
         Ok(())
