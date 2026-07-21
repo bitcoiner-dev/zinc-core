@@ -98,7 +98,9 @@ pub fn fee_rate_from_sat_per_vb_f64(rate_sat_vb: f64) -> Result<FeeRate, ZincErr
             "Invalid fee rate: {rate_sat_vb} sat/vB"
         )));
     }
-    Ok(FeeRate::from_sat_per_kwu((rate_sat_vb * 250.0).ceil() as u64))
+    Ok(FeeRate::from_sat_per_kwu(
+        (rate_sat_vb * 250.0).ceil() as u64
+    ))
 }
 
 /// Fee in sats for a transaction of `vsize` vbytes at `rate`, rounding up at
@@ -4001,11 +4003,12 @@ impl ZincWallet {
         // Backfill witness_utxo from owned UTXOs so the spk resolves (mirrors
         // prepare_external_sign_psbt's known-utxo pass).
         let mut known_utxos = std::collections::HashMap::new();
-        let collect_utxos = |w: &Wallet, map: &mut std::collections::HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-            for utxo in w.list_unspent() {
-                map.insert(utxo.outpoint, utxo.txout);
-            }
-        };
+        let collect_utxos =
+            |w: &Wallet, map: &mut std::collections::HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
+                for utxo in w.list_unspent() {
+                    map.insert(utxo.outpoint, utxo.txout);
+                }
+            };
         collect_utxos(&self.vault_wallet, &mut known_utxos);
         if let Some(w) = &self.payment_wallet {
             collect_utxos(w, &mut known_utxos);
@@ -4242,9 +4245,7 @@ impl ZincWallet {
     ) {
         use bitcoin::ScriptBuf;
 
-        let script_is_mine = |hex: &str| -> Option<ScriptBuf> {
-            ScriptBuf::from_hex(hex).ok()
-        };
+        let script_is_mine = |hex: &str| -> Option<ScriptBuf> { ScriptBuf::from_hex(hex).ok() };
         let is_mine = |spk: &ScriptBuf| -> bool {
             self.vault_wallet.is_mine(spk.clone())
                 || self

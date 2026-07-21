@@ -17,7 +17,9 @@ fn test_get_accounts_returns_public_keys() {
         phrase,
         Some("unified".to_string()),
         None,
-        Some(0), None, None,
+        Some(0),
+        None,
+        None,
     )
     .expect("Failed to create wallet");
 
@@ -60,8 +62,16 @@ fn test_get_accounts_dual_returns_public_keys() {
     let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     // 2. Initialize Wallet (Dual Scheme)
-    let wallet = ZincWasmWallet::new("regtest", phrase, Some("dual".to_string()), None, Some(0), None, None,)
-        .expect("Failed to create wallet");
+    let wallet = ZincWasmWallet::new(
+        "regtest",
+        phrase,
+        Some("dual".to_string()),
+        None,
+        Some(0),
+        None,
+        None,
+    )
+    .expect("Failed to create wallet");
 
     let accounts_js = wallet.get_accounts(1).expect("get_accounts failed");
     let accounts: Vec<serde_json::Value> = serde_wasm_bindgen::from_value(accounts_js).unwrap();
@@ -94,7 +104,9 @@ fn test_get_rune_balances_returns_stable_empty_array_shape() {
         phrase,
         Some("unified".to_string()),
         None,
-        Some(0), None, None,
+        Some(0),
+        None,
+        None,
     )
     .expect("Failed to create wallet");
 
@@ -117,7 +129,9 @@ fn test_shared_receiver_methods_do_not_alias_trap() {
         phrase,
         Some("unified".to_string()),
         None,
-        Some(0), None, None,
+        Some(0),
+        None,
+        None,
     )
     .expect("Failed to create wallet");
 
@@ -152,7 +166,9 @@ fn test_account_and_address_views_stay_coherent_after_switches() {
         phrase,
         Some("unified".to_string()),
         None,
-        Some(0), None, None,
+        Some(0),
+        None,
+        None,
     )
     .expect("Failed to create wallet");
 
@@ -200,8 +216,16 @@ fn test_account_and_address_views_stay_coherent_after_switches() {
 #[wasm_bindgen_test]
 fn test_index_mode_addresses_follow_active_account() {
     let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    let wallet = ZincWasmWallet::new("regtest", phrase, Some("dual".to_string()), None, Some(0), None, None,)
-        .expect("Failed to create wallet");
+    let wallet = ZincWasmWallet::new(
+        "regtest",
+        phrase,
+        Some("dual".to_string()),
+        None,
+        Some(0),
+        None,
+        None,
+    )
+    .expect("Failed to create wallet");
 
     wallet
         .set_derivation_mode("index")

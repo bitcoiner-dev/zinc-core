@@ -706,7 +706,9 @@ mod tests {
         psbt
     }
 
-    fn wallet_taproot_x_only(builder: &crate::builder::ZincWallet) -> bitcoin::secp256k1::XOnlyPublicKey {
+    fn wallet_taproot_x_only(
+        builder: &crate::builder::ZincWallet,
+    ) -> bitcoin::secp256k1::XOnlyPublicKey {
         let hex = builder.get_taproot_public_key(0).unwrap();
         bitcoin::secp256k1::XOnlyPublicKey::from_str(&hex).unwrap()
     }
@@ -752,13 +754,7 @@ mod tests {
         // with a leaf that requires our signature. This is the legitimate
         // inscription-reveal shape and must still be signed.
         let (spk, leaf, control_block) = single_leaf_taptree(wallet_key, wallet_key);
-        let psbt = reveal_shaped_psbt(
-            wallet_key,
-            spk,
-            leaf,
-            control_block,
-            wallet_key,
-        );
+        let psbt = reveal_shaped_psbt(wallet_key, spk, leaf, control_block, wallet_key);
         assert_eq!(
             sign_and_count_script_sigs(&mut builder, &psbt),
             Ok(1),
@@ -785,13 +781,7 @@ mod tests {
         .unwrap();
         let (foreign_spk, _, _) = single_leaf_taptree(foreign_key, foreign_key);
 
-        let psbt = reveal_shaped_psbt(
-            wallet_key,
-            foreign_spk,
-            leaf,
-            control_block,
-            wallet_key,
-        );
+        let psbt = reveal_shaped_psbt(wallet_key, foreign_spk, leaf, control_block, wallet_key);
         let outcome = sign_and_count_script_sigs(&mut builder, &psbt);
         assert!(
             outcome != Ok(1),
@@ -820,13 +810,7 @@ mod tests {
         // somebody else's signature. Signing it produces a signature over a
         // script we never inspected; the old code signed every leaf present.
         let (spk, leaf, control_block) = single_leaf_taptree(wallet_key, foreign_key);
-        let psbt = reveal_shaped_psbt(
-            wallet_key,
-            spk,
-            leaf,
-            control_block,
-            wallet_key,
-        );
+        let psbt = reveal_shaped_psbt(wallet_key, spk, leaf, control_block, wallet_key);
         let outcome = sign_and_count_script_sigs(&mut builder, &psbt);
         assert!(
             outcome != Ok(1),
@@ -858,8 +842,7 @@ mod pairing_identity {
             .unwrap();
 
         let secret_hex = wallet.get_pairing_secret_key_hex().unwrap();
-        let pairing_pubkey =
-            crate::sign_intent::pubkey_hex_from_secret_key(&secret_hex).unwrap();
+        let pairing_pubkey = crate::sign_intent::pubkey_hex_from_secret_key(&secret_hex).unwrap();
 
         let taproot_pubkey = wallet.get_taproot_public_key(0).unwrap();
         assert_ne!(

@@ -260,7 +260,10 @@ mod tests {
     async fn get_rune_info_parses_ord_shape() {
         let mut server = Server::new_async().await;
         let _m = server
-            .mock("GET", "/rune/DOG%E2%80%A2GO%E2%80%A2TO%E2%80%A2THE%E2%80%A2MOON")
+            .mock(
+                "GET",
+                "/rune/DOG%E2%80%A2GO%E2%80%A2TO%E2%80%A2THE%E2%80%A2MOON",
+            )
             .match_header("accept", "application/json")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -338,7 +341,10 @@ mod tests {
             .create_async()
             .await;
         let _rune = server
-            .mock("GET", "/rune/DOG%E2%80%A2GO%E2%80%A2TO%E2%80%A2THE%E2%80%A2MOON")
+            .mock(
+                "GET",
+                "/rune/DOG%E2%80%A2GO%E2%80%A2TO%E2%80%A2THE%E2%80%A2MOON",
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -363,10 +369,7 @@ mod tests {
             Some(&vec![("840000:3".to_string(), 1_200u128)])
         );
         assert!(resolved.rune_infos.contains_key("840000:3"));
-        assert_eq!(
-            resolved.rune_balances[0].id.as_deref(),
-            Some("840000:3")
-        );
+        assert_eq!(resolved.rune_balances[0].id.as_deref(), Some("840000:3"));
         assert!(resolved.protected_outpoints.contains(&op));
     }
 

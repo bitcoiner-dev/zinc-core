@@ -16,9 +16,16 @@ fn spec_seed() -> Seed64 {
     Seed64::from_array(*mnemonic.to_seed(""))
 }
 
-fn layout(vault_purpose: u32, payment: Option<(u32, ScriptKind)>, mode: DerivationMode) -> LayoutSpec {
+fn layout(
+    vault_purpose: u32,
+    payment: Option<(u32, ScriptKind)>,
+    mode: DerivationMode,
+) -> LayoutSpec {
     LayoutSpec {
-        vault: BranchSpec { purpose: vault_purpose, script: ScriptKind::Tr },
+        vault: BranchSpec {
+            purpose: vault_purpose,
+            script: ScriptKind::Tr,
+        },
         payment: payment.map(|(purpose, script)| BranchSpec { purpose, script }),
         derivation_mode: mode,
     }
@@ -114,9 +121,16 @@ fn index_mode_maps_logical_accounts_onto_account_zero() {
     assert_eq!(index_style.vault, account_style.vault);
 
     // Account mode: logical account 1 derives a different account subtree.
-    let account_one =
-        derive_layout_addresses(Network::Bitcoin, &seed, &LayoutSpec::zinc_default(), 1, 0, 0, 1)
-            .expect("account 1");
+    let account_one = derive_layout_addresses(
+        Network::Bitcoin,
+        &seed,
+        &LayoutSpec::zinc_default(),
+        1,
+        0,
+        0,
+        1,
+    )
+    .expect("account 1");
     assert_ne!(account_one.vault[0], account_style.vault[0]);
 }
 
@@ -144,7 +158,10 @@ fn unified_layouts_have_no_payment_branch_and_testnet_coin_type_applies() {
         1,
     )
     .expect("regtest");
-    assert!(regtest.vault[0].starts_with("bcrt1p"), "coin type 1 + regtest hrp");
+    assert!(
+        regtest.vault[0].starts_with("bcrt1p"),
+        "coin type 1 + regtest hrp"
+    );
     assert_ne!(regtest.vault[0], unified.vault[0]);
 }
 
@@ -152,7 +169,10 @@ fn unified_layouts_have_no_payment_branch_and_testnet_coin_type_applies() {
 fn validate_rejects_unrepresentable_layouts() {
     // Non-taproot ordinals branch.
     let bad_vault = LayoutSpec {
-        vault: BranchSpec { purpose: 84, script: ScriptKind::Wpkh },
+        vault: BranchSpec {
+            purpose: 84,
+            script: ScriptKind::Wpkh,
+        },
         payment: None,
         derivation_mode: DerivationMode::Account,
     };
@@ -167,16 +187,9 @@ fn validate_rejects_unrepresentable_layouts() {
     assert!(bad_purpose.validate().is_err());
 
     // derive_layout_addresses enforces validate() and the chain range.
-    assert!(derive_layout_addresses(
-        Network::Bitcoin,
-        &spec_seed(),
-        &bad_vault,
-        0,
-        0,
-        0,
-        1
-    )
-    .is_err());
+    assert!(
+        derive_layout_addresses(Network::Bitcoin, &spec_seed(), &bad_vault, 0, 0, 0, 1).is_err()
+    );
     assert!(derive_layout_addresses(
         Network::Bitcoin,
         &spec_seed(),
@@ -259,7 +272,10 @@ fn with_layout_rejects_non_seed_wallets_and_bad_layouts() {
     use crate::builder::WalletBuilder;
 
     let bad = LayoutSpec {
-        vault: BranchSpec { purpose: 84, script: ScriptKind::Wpkh },
+        vault: BranchSpec {
+            purpose: 84,
+            script: ScriptKind::Wpkh,
+        },
         payment: None,
         derivation_mode: DerivationMode::Account,
     };

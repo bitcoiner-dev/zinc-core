@@ -33,11 +33,11 @@ mod logging;
 pub mod builder;
 pub mod crypto;
 pub mod error;
-/// Derivation-layout descriptions for multi-layout discovery.
-pub mod layout;
 /// Transaction history models and wallet history helpers.
 pub mod history;
 pub mod keys;
+/// Derivation-layout descriptions for multi-layout discovery.
+pub mod layout;
 /// Fixed-price listing and sale PSBT validation helpers.
 pub mod listing;
 /// Nostr event models and signing/verification helpers for decentralized listings.
@@ -71,8 +71,8 @@ pub use builder::{
 };
 pub use error::{ZincError, ZincResult};
 pub use history::TxItem;
-pub use layout::{derive_layout_addresses, BranchSpec, LayoutAddresses, LayoutSpec, ScriptKind};
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
+pub use layout::{derive_layout_addresses, BranchSpec, LayoutAddresses, LayoutSpec, ScriptKind};
 pub use listing::{
     create_listing, create_listing_purchase, finalize_listing_purchase, finalize_listing_sale,
     passthrough_script_pubkey, passthrough_tapscript, prepare_listing_sale_signature,
@@ -1758,9 +1758,9 @@ impl ZincWasmWallet {
             let mut misses: Vec<String> = Vec::new();
 
             {
-                let inner = inner_rc
-                    .try_borrow()
-                    .map_err(|e| JsValue::from_str(&format!("Wallet busy (resolve_rune_info): {e}")))?;
+                let inner = inner_rc.try_borrow().map_err(|e| {
+                    JsValue::from_str(&format!("Wallet busy (resolve_rune_info): {e}"))
+                })?;
                 for id in &ids {
                     if let Some(info) = inner.rune_info(id) {
                         resolved.insert(info.id.clone(), info);
@@ -1794,8 +1794,7 @@ impl ZincWasmWallet {
                 "resolved": resolved,
                 "failed": failed,
             });
-            let serializer =
-                serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
             use serde::Serialize;
             payload
                 .serialize(&serializer)
@@ -2105,7 +2104,10 @@ impl ZincWasmWallet {
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "FAILED TO BORROW MUT INNER: {:?}", e);
-                        ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
+                        ZincWasmWallet::clear_syncing_if_generation_matches(
+                            &inner_rc,
+                            sync_generation,
+                        );
                         return Err(JsValue::from_str(&format!(
                             "Failed to borrow wallet inner state (mut): {}",
                             e
@@ -2604,7 +2606,10 @@ impl ZincWasmWallet {
             // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
             // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
-            let resolved = match client.resolve_assets_for_outpoints(&queryable_outpoints).await {
+            let resolved = match client
+                .resolve_assets_for_outpoints(&queryable_outpoints)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);

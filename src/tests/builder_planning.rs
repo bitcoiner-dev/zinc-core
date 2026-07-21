@@ -161,10 +161,7 @@ mod tests {
         // an unverified inscribed_utxos set can be empty while inscriptions sit
         // in the selection, so a sweep would burn their postage.
         let (w, addr, ops) = funded_wallet(&[40_000]);
-        wallet_err(
-            w.plan_consolidate_tx(&ops, fee1(), &addr),
-            "safety lock",
-        );
+        wallet_err(w.plan_consolidate_tx(&ops, fee1(), &addr), "safety lock");
     }
 
     #[test]

@@ -595,10 +595,7 @@ fn unverified_asset_data_downgrades_a_clean_verdict() {
         "an unverified inscription set must not read as Safe"
     );
     assert!(
-        unverified
-            .warnings
-            .iter()
-            .any(|w| w.contains("unverified")),
+        unverified.warnings.iter().any(|w| w.contains("unverified")),
         "an explicit warning must explain the downgrade"
     );
 }

@@ -147,7 +147,9 @@ mod tests {
         let b64 = w
             .plan_consolidate_base64(&op_strs, rate, &addr.to_string())
             .unwrap_or_else(|e| panic!("consolidate at {rate} sat/vB: {e}"));
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
         let psbt = Psbt::deserialize(&bytes).unwrap();
         let total_in: u64 = psbt
             .inputs
