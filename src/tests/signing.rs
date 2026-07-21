@@ -859,4 +859,115 @@ mod pairing_identity {
             );
         }
     }
+
+    /// REGRESSION (fdd60dc — the 2026-07 audit's taproot leaf-signing bypass, the marquee
+    /// fund-loss P0): `sign_inscription_script_paths` used to sign EVERY `tap_scripts` leaf,
+    /// discarding the control block — a blind script-path oracle reachable from a dapp's
+    /// `signPsbt`. The fix binds each leaf to the prevout: the control block must commit to
+    /// the prevout's taproot output key. Here a reveal-shaped leaf (pushes our key + carries
+    /// an `ord` envelope, internal key = ours, so the push/ownership gates pass) is paired
+    /// with a prevout whose P2TR output key is DIFFERENT from the one the control block
+    /// commits to, so the commitment check must reject it — no `tap_script_sig`.
+    #[test]
+    fn sign_inscription_refuses_a_leaf_the_prevout_does_not_commit_to() {
+        use crate::builder::SignOptions;
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        use bitcoin::bip32::{DerivationPath, Fingerprint};
+        use bitcoin::blockdata::script::Builder;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::opcodes::all::{OP_CHECKSIG, OP_ENDIF, OP_IF};
+        use bitcoin::opcodes::OP_FALSE;
+        use bitcoin::psbt::Psbt;
+        use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
+        use bitcoin::taproot::{LeafVersion, TapLeafHash, TaprootBuilder};
+        use bitcoin::{
+            Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        use std::str::FromStr as _;
+
+        let secp = Secp256k1::new();
+        let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([7u8; 64]))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+        let reveal_xonly =
+            XOnlyPublicKey::from_str(&wallet.get_taproot_public_key(0).unwrap()).unwrap();
+
+        // Reveal-shaped leaf: <our key> OP_CHECKSIG  OP_FALSE OP_IF "ord" OP_ENDIF — passes the
+        // "pushes our key" gate and the "looks like a reveal" ownership gate.
+        let leaf = Builder::new()
+            .push_x_only_key(&reveal_xonly)
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice(b"ord")
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        // The control block is built for THIS taptree (output key K1)...
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .unwrap()
+            .finalize(&secp, reveal_xonly)
+            .unwrap();
+        let control_block = spend_info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .unwrap();
+
+        // ...but the prevout is a DIFFERENT, NON-WALLET taproot output (key-path spend of an
+        // unrelated key, K2 != K1), so the control block does not commit to it. It must be a
+        // key we do NOT own, or the wallet would simply key-path sign it and the reveal signer
+        // would skip it as already-signed — masking the gate we mean to exercise.
+        let foreign_xonly = XOnlyPublicKey::from_str(
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", // BIP-340 vector
+        )
+        .unwrap();
+        let prevout = TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: ScriptBuf::new_p2tr(&secp, foreign_xonly, None),
+        };
+
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([9u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, reveal_xonly, None),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(prevout);
+        // Reveal selector: our key + the empty [0,0,0,0] origin fingerprint the signer keys off.
+        let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
+        psbt.inputs[0].tap_key_origins.insert(
+            reveal_xonly,
+            (vec![leaf_hash], (Fingerprint::from([0u8; 4]), DerivationPath::master())),
+        );
+        psbt.inputs[0]
+            .tap_scripts
+            .insert(control_block, (leaf.clone(), LeafVersion::TapScript));
+
+        let b64 = STANDARD.encode(psbt.serialize());
+        let signed_b64 = wallet
+            .sign_psbt(
+                &b64,
+                Some(SignOptions { sign_inputs: None, sighash: None, finalize: false }),
+            )
+            .expect("sign_psbt returns Ok (refusing the leaf, not erroring)");
+        let signed = Psbt::deserialize(&STANDARD.decode(signed_b64).unwrap()).unwrap();
+
+        assert!(
+            signed.inputs[0].tap_script_sigs.is_empty(),
+            "signer must refuse a script-path leaf whose control block does not commit to the \
+             prevout's taproot output key (blind-signing oracle); got {} sig(s)",
+            signed.inputs[0].tap_script_sigs.len()
+        );
+    }
 }
