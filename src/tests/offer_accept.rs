@@ -144,7 +144,8 @@ fn prepare_offer_acceptance_returns_plan_for_valid_offer() {
     let psbt = psbt_base64(seller_outpoint, false, false, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let plan = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect("valid acceptance plan");
+    let plan = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect("valid acceptance plan");
 
     assert_eq!(plan.seller_input_index, 0);
     assert_eq!(plan.input_count, 2);
@@ -161,7 +162,8 @@ fn prepare_offer_acceptance_rejects_expired_offer() {
     let psbt = psbt_base64(seller_outpoint, false, false, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix - 1);
 
-    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("expired offer");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("expired offer");
     assert!(err.to_string().contains("offer has expired"));
 }
 
@@ -179,7 +181,8 @@ fn prepare_offer_acceptance_rejects_missing_seller_input() {
     let psbt = psbt_base64(seller_outpoint_in_psbt, false, false, true);
     let offer = build_offer(now_unix, seller_outpoint_in_offer, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("missing seller input");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("missing seller input");
     assert!(err.to_string().contains("contains no seller input"));
 }
 
@@ -193,7 +196,8 @@ fn prepare_offer_acceptance_rejects_duplicate_seller_input() {
     let psbt = psbt_base64(seller_outpoint, true, false, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("duplicate seller inputs");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("duplicate seller inputs");
     assert!(err.to_string().contains("contains 2 seller inputs"));
 }
 
@@ -207,7 +211,8 @@ fn prepare_offer_acceptance_rejects_signed_seller_input() {
     let psbt = psbt_base64(seller_outpoint, false, true, true);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("signed seller input");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("signed seller input");
     assert!(err.to_string().contains("seller input"));
     assert!(err.to_string().contains("must be unsigned"));
 }
@@ -222,7 +227,8 @@ fn prepare_offer_acceptance_rejects_unsigned_buyer_input() {
     let psbt = psbt_base64(seller_outpoint, false, false, false);
     let offer = build_offer(now_unix, seller_outpoint, psbt, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("unsigned buyer input");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("unsigned buyer input");
     assert!(err.to_string().contains("buyer input"));
     assert!(err.to_string().contains("must be signed"));
 }
@@ -248,7 +254,8 @@ fn prepare_offer_acceptance_rejects_seller_input_not_first() {
     let encoded = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
     let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
 
-    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("seller input must be first");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("seller input must be first");
     assert!(err.to_string().contains("must be first input"));
 }
 
@@ -324,8 +331,8 @@ fn prepare_offer_acceptance_rejects_non_ord_output_layout() {
     let encoded = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
     let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
 
-    let err =
-        prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script()).expect_err("must reject non-canonical outputs");
+    let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("must reject non-canonical outputs");
     assert!(err
         .to_string()
         .contains("buyer postage output must be first"));

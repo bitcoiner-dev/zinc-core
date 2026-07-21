@@ -122,8 +122,14 @@ fn rune_transfer_with_edict_annotates_outputs() {
     let psbt = build_psbt(
         &[op],
         vec![
-            FixtureOutput { value: 546, script: p2tr_script(0xaa) },
-            FixtureOutput { value: 9_000, script: p2tr_script(0xbb) },
+            FixtureOutput {
+                value: 546,
+                script: p2tr_script(0xaa),
+            },
+            FixtureOutput {
+                value: 9_000,
+                script: p2tr_script(0xbb),
+            },
             runestone_output(&runestone),
         ],
     );
@@ -149,7 +155,10 @@ fn no_runestone_default_transfer_warns() {
     let op = outpoint(2);
     let psbt = build_psbt(
         &[op],
-        vec![FixtureOutput { value: 9_500, script: p2tr_script(0xaa) }],
+        vec![FixtureOutput {
+            value: 9_500,
+            script: p2tr_script(0xaa),
+        }],
     );
     let analysis = analyze(&psbt, &known_runes_for(op, 500), &HashMap::new(), None);
 
@@ -157,10 +166,7 @@ fn no_runestone_default_transfer_warns() {
     let actions = analysis.rune_actions.as_ref().expect("rune actions");
     assert!(actions.default_transfer_without_runestone);
     assert_eq!(analysis.outputs[0].runes[0].amount, "500");
-    assert!(analysis
-        .warnings
-        .iter()
-        .any(|w| w.contains("no runestone")));
+    assert!(analysis.warnings.iter().any(|w| w.contains("no runestone")));
 }
 
 #[test]
@@ -171,7 +177,10 @@ fn cenotaph_burns_and_escalates_to_danger() {
     let psbt = build_psbt(
         &[op],
         vec![
-            FixtureOutput { value: 9_000, script: p2tr_script(0xaa) },
+            FixtureOutput {
+                value: 9_000,
+                script: p2tr_script(0xaa),
+            },
             FixtureOutput { value: 0, script },
         ],
     );
@@ -199,7 +208,10 @@ fn edict_to_op_return_burns_and_escalates() {
     let psbt = build_psbt(
         &[op],
         vec![
-            FixtureOutput { value: 9_000, script: p2tr_script(0xaa) },
+            FixtureOutput {
+                value: 9_000,
+                script: p2tr_script(0xaa),
+            },
             runestone_output(&runestone),
         ],
     );
@@ -220,7 +232,10 @@ fn mint_with_cached_terms_allocates_and_stays_safe() {
     let psbt = build_psbt(
         &[outpoint(5)],
         vec![
-            FixtureOutput { value: 546, script: p2tr_script(0xaa) },
+            FixtureOutput {
+                value: 546,
+                script: p2tr_script(0xaa),
+            },
             runestone_output(&runestone),
         ],
     );
@@ -230,7 +245,10 @@ fn mint_with_cached_terms_allocates_and_stays_safe() {
 
     assert_eq!(analysis.warning_level, WarningLevel::Safe);
     let actions = analysis.rune_actions.as_ref().expect("rune actions");
-    assert_eq!(actions.mint.as_ref().unwrap().amount.as_deref(), Some("500"));
+    assert_eq!(
+        actions.mint.as_ref().unwrap().amount.as_deref(),
+        Some("500")
+    );
     assert!(!actions.mint_amount_unknown);
     assert_eq!(analysis.outputs[0].runes[0].amount, "500");
 }
@@ -244,7 +262,10 @@ fn mint_without_terms_is_flagged_and_warns() {
     let psbt = build_psbt(
         &[outpoint(6)],
         vec![
-            FixtureOutput { value: 546, script: p2tr_script(0xaa) },
+            FixtureOutput {
+                value: 546,
+                script: p2tr_script(0xaa),
+            },
             runestone_output(&runestone),
         ],
     );
@@ -281,7 +302,10 @@ fn etching_with_premine_allocates_placeholder_and_warns() {
     let psbt = build_psbt(
         &[outpoint(7)],
         vec![
-            FixtureOutput { value: 546, script: p2tr_script(0xaa) },
+            FixtureOutput {
+                value: 546,
+                script: p2tr_script(0xaa),
+            },
             runestone_output(&runestone),
         ],
     );
@@ -310,7 +334,10 @@ fn mixed_inscription_and_rune_input_reports_both() {
     let psbt = build_psbt(
         &[op],
         vec![
-            FixtureOutput { value: 10_000, script: p2tr_script(0xaa) },
+            FixtureOutput {
+                value: 10_000,
+                script: p2tr_script(0xaa),
+            },
             runestone_output(&runestone),
         ],
     );
@@ -340,7 +367,10 @@ fn partial_scope_skips_rune_simulation_and_warns() {
     let op = outpoint(9);
     let psbt = build_psbt(
         &[op, outpoint(10)],
-        vec![FixtureOutput { value: 15_000, script: p2tr_script(0xaa) }],
+        vec![FixtureOutput {
+            value: 15_000,
+            script: p2tr_script(0xaa),
+        }],
     );
     let analysis = analyze(
         &psbt,
@@ -362,8 +392,14 @@ fn dust_outputs_are_flagged() {
     let psbt = build_psbt(
         &[outpoint(11)],
         vec![
-            FixtureOutput { value: 100, script: p2tr_script(0xaa) },
-            FixtureOutput { value: 9_000, script: p2tr_script(0xbb) },
+            FixtureOutput {
+                value: 100,
+                script: p2tr_script(0xaa),
+            },
+            FixtureOutput {
+                value: 9_000,
+                script: p2tr_script(0xbb),
+            },
         ],
     );
     let analysis = analyze(&psbt, &KnownRunes::new(), &HashMap::new(), None);
@@ -386,12 +422,15 @@ fn legacy_entry_point_stays_rune_blind() {
     let psbt = build_psbt(
         &[op],
         vec![
-            FixtureOutput { value: 546, script: p2tr_script(0xaa) },
+            FixtureOutput {
+                value: 546,
+                script: p2tr_script(0xaa),
+            },
             runestone_output(&runestone),
         ],
     );
-    let analysis = analyze_psbt(&psbt, &HashMap::new(), bitcoin::Network::Bitcoin)
-        .expect("legacy analysis");
+    let analysis =
+        analyze_psbt(&psbt, &HashMap::new(), bitcoin::Network::Bitcoin).expect("legacy analysis");
 
     assert!(analysis.rune_actions.is_none());
     assert!(analysis.fee_rate_sat_vb.is_none());

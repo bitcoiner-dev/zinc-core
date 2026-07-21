@@ -585,7 +585,9 @@ impl OrdClient {
         }
 
         let parsed = response.json::<RuneInfoResponse>().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to parse rune info JSON for {id_or_name}: {e}"))
+            OrdError::RequestFailed(format!(
+                "Failed to parse rune info JSON for {id_or_name}: {e}"
+            ))
         })?;
 
         let id = parsed

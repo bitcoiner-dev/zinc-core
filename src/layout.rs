@@ -71,8 +71,14 @@ impl LayoutSpec {
     #[must_use]
     pub fn zinc_default() -> Self {
         Self {
-            vault: BranchSpec { purpose: 86, script: ScriptKind::Tr },
-            payment: Some(BranchSpec { purpose: 84, script: ScriptKind::Wpkh }),
+            vault: BranchSpec {
+                purpose: 86,
+                script: ScriptKind::Tr,
+            },
+            payment: Some(BranchSpec {
+                purpose: 84,
+                script: ScriptKind::Wpkh,
+            }),
             derivation_mode: DerivationMode::Account,
         }
     }
@@ -152,7 +158,11 @@ fn derive_branch(
         .network(network)
         .create_wallet_no_persist()
         .map_err(|e| format!("Layout descriptor rejected: {e}"))?;
-    let keychain = if chain == 0 { KeychainKind::External } else { KeychainKind::Internal };
+    let keychain = if chain == 0 {
+        KeychainKind::External
+    } else {
+        KeychainKind::Internal
+    };
     Ok((start_index..start_index.saturating_add(count))
         .map(|index| wallet.peek_address(keychain, index).address.to_string())
         .collect())
@@ -177,14 +187,28 @@ pub fn derive_layout_addresses(
     if chain > 1 {
         return Err("chain must be 0 (receive) or 1 (change)".to_string());
     }
-    let xprv = Xpriv::new_master(network, seed.as_ref())
-        .map_err(|e| format!("Invalid seed: {e}"))?;
+    let xprv =
+        Xpriv::new_master(network, seed.as_ref()).map_err(|e| format!("Invalid seed: {e}"))?;
     let (account, _address_index) = layout.account_and_index(logical_account);
 
-    let vault = derive_branch(&xprv, network, &layout.vault, account, chain, start_index, count)?;
+    let vault = derive_branch(
+        &xprv,
+        network,
+        &layout.vault,
+        account,
+        chain,
+        start_index,
+        count,
+    )?;
     let payment = match &layout.payment {
         Some(branch) => Some(derive_branch(
-            &xprv, network, branch, account, chain, start_index, count,
+            &xprv,
+            network,
+            branch,
+            account,
+            chain,
+            start_index,
+            count,
         )?),
         None => None,
     };

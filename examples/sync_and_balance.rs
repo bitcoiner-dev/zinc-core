@@ -11,7 +11,9 @@ mod native {
         let esplora_url = if let Ok(url) = std::env::var("ESPLORA_URL") {
             url
         } else {
-            eprintln!("Set ESPLORA_URL to run this example (for example: https://mempool.space/api)");
+            eprintln!(
+                "Set ESPLORA_URL to run this example (for example: https://mempool.space/api)"
+            );
             return Ok(());
         };
 

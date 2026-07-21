@@ -461,7 +461,10 @@ mod tests {
         let result = simulate_rune_flow(&tx, &holdings, None);
         assert!(result.actions.default_transfer_without_runestone);
         assert!(!result.actions.has_runestone);
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 100)]);
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 100)]
+        );
         assert!(result.output_runes[1].is_empty());
         assert!(result.actions.burned.is_empty());
         assert!(!result.danger);
@@ -514,15 +517,25 @@ mod tests {
     fn edict_moves_exact_amount_and_remainder_follows_pointer_default() {
         let id = rune_id(840_000, 3);
         let runestone = Runestone {
-            edicts: vec![Edict { id, amount: 30, output: 1 }],
+            edicts: vec![Edict {
+                id,
+                amount: 30,
+                output: 1,
+            }],
             ..Runestone::default()
         };
         let tx = tx_with_outputs(Some(&runestone), 2);
         let holdings = vec![vec![(id, 100u128)]];
         let result = simulate_rune_flow(&tx, &holdings, None);
         // 30 to output 1; remainder 70 to first non-OP_RETURN output (0).
-        assert_eq!(amounts(&result.output_runes[1]), vec![("840000:3".to_string(), 30)]);
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 70)]);
+        assert_eq!(
+            amounts(&result.output_runes[1]),
+            vec![("840000:3".to_string(), 30)]
+        );
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 70)]
+        );
         assert!(result.actions.burned.is_empty());
     }
 
@@ -530,13 +543,20 @@ mod tests {
     fn edict_amount_zero_moves_all_remaining() {
         let id = rune_id(840_000, 3);
         let runestone = Runestone {
-            edicts: vec![Edict { id, amount: 0, output: 1 }],
+            edicts: vec![Edict {
+                id,
+                amount: 0,
+                output: 1,
+            }],
             ..Runestone::default()
         };
         let tx = tx_with_outputs(Some(&runestone), 2);
         let holdings = vec![vec![(id, 100u128)]];
         let result = simulate_rune_flow(&tx, &holdings, None);
-        assert_eq!(amounts(&result.output_runes[1]), vec![("840000:3".to_string(), 100)]);
+        assert_eq!(
+            amounts(&result.output_runes[1]),
+            vec![("840000:3".to_string(), 100)]
+        );
         assert!(result.output_runes[0].is_empty());
     }
 
@@ -545,30 +565,50 @@ mod tests {
         let id = rune_id(840_000, 3);
         // output == tx.output.len() (3 = 2 pay outputs + OP_RETURN).
         let runestone = Runestone {
-            edicts: vec![Edict { id, amount: 0, output: 3 }],
+            edicts: vec![Edict {
+                id,
+                amount: 0,
+                output: 3,
+            }],
             ..Runestone::default()
         };
         let tx = tx_with_outputs(Some(&runestone), 2);
         let holdings = vec![vec![(id, 101u128)]];
         let result = simulate_rune_flow(&tx, &holdings, None);
         // 101 over 2 outputs: 51 to the first, 50 to the second.
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 51)]);
-        assert_eq!(amounts(&result.output_runes[1]), vec![("840000:3".to_string(), 50)]);
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 51)]
+        );
+        assert_eq!(
+            amounts(&result.output_runes[1]),
+            vec![("840000:3".to_string(), 50)]
+        );
     }
 
     #[test]
     fn edict_output_equals_len_with_amount_gives_each_until_exhausted() {
         let id = rune_id(840_000, 3);
         let runestone = Runestone {
-            edicts: vec![Edict { id, amount: 60, output: 3 }],
+            edicts: vec![Edict {
+                id,
+                amount: 60,
+                output: 3,
+            }],
             ..Runestone::default()
         };
         let tx = tx_with_outputs(Some(&runestone), 2);
         let holdings = vec![vec![(id, 100u128)]];
         let result = simulate_rune_flow(&tx, &holdings, None);
         // 60 to output 0, remaining 40 to output 1.
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 60)]);
-        assert_eq!(amounts(&result.output_runes[1]), vec![("840000:3".to_string(), 40)]);
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 60)]
+        );
+        assert_eq!(
+            amounts(&result.output_runes[1]),
+            vec![("840000:3".to_string(), 40)]
+        );
     }
 
     #[test]
@@ -576,7 +616,11 @@ mod tests {
         let id = rune_id(840_000, 3);
         // The runestone output is appended last: index 1 (1 pay output).
         let runestone = Runestone {
-            edicts: vec![Edict { id, amount: 40, output: 1 }],
+            edicts: vec![Edict {
+                id,
+                amount: 40,
+                output: 1,
+            }],
             ..Runestone::default()
         };
         let tx = tx_with_outputs(Some(&runestone), 1);
@@ -585,7 +629,10 @@ mod tests {
         assert_eq!(result.actions.burned.len(), 1);
         assert_eq!(result.actions.burned[0].amount, "40");
         // Remainder 60 to first non-OP_RETURN output.
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 60)]);
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 60)]
+        );
         assert!(result.danger);
     }
 
@@ -600,7 +647,10 @@ mod tests {
         let holdings = vec![vec![(id, 100u128)]];
         let result = simulate_rune_flow(&tx, &holdings, None);
         assert!(result.output_runes[0].is_empty());
-        assert_eq!(amounts(&result.output_runes[1]), vec![("840000:3".to_string(), 100)]);
+        assert_eq!(
+            amounts(&result.output_runes[1]),
+            vec![("840000:3".to_string(), 100)]
+        );
     }
 
     #[test]
@@ -650,7 +700,10 @@ mod tests {
         let holdings = vec![vec![(id, 100u128)]];
         let result = simulate_rune_flow(&tx, &holdings, None);
         // The 0:0 edict is skipped; input runes ride the remainder path.
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 100)]);
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 100)]
+        );
     }
 
     #[test]
@@ -662,9 +715,15 @@ mod tests {
         };
         let tx = tx_with_outputs(Some(&runestone), 1);
         let result = simulate_rune_flow(&tx, &[Vec::new()], Some(500));
-        assert_eq!(result.actions.mint.as_ref().unwrap().amount.as_deref(), Some("500"));
+        assert_eq!(
+            result.actions.mint.as_ref().unwrap().amount.as_deref(),
+            Some("500")
+        );
         assert!(!result.actions.mint_amount_unknown);
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 500)]);
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 500)]
+        );
     }
 
     #[test]
@@ -692,6 +751,9 @@ mod tests {
         let tx = tx_with_outputs(Some(&runestone), 1);
         let holdings = vec![vec![(id, 60u128)], vec![(id, 40u128)]];
         let result = simulate_rune_flow(&tx, &holdings, None);
-        assert_eq!(amounts(&result.output_runes[0]), vec![("840000:3".to_string(), 100)]);
+        assert_eq!(
+            amounts(&result.output_runes[0]),
+            vec![("840000:3".to_string(), 100)]
+        );
     }
 }

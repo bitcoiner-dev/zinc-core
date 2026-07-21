@@ -146,8 +146,8 @@ fn test_create_psbt_wrapper_matches_typed_path_error_surface() {
     let amount_sats = 10_000;
     let fee_rate = 1;
 
-    let request =
-        CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate as f64).expect("valid request");
+    let request = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate as f64)
+        .expect("valid request");
     let typed_err = wallet
         .create_psbt_base64(&request)
         .expect_err("empty wallet should fail");
