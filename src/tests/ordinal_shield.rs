@@ -609,3 +609,40 @@ fn analyze_psbt_with_scope_rejects_out_of_range_index() {
         "an out-of-range scope index must be rejected"
     );
 }
+
+#[test]
+fn test_scoped_analysis_still_burns_via_unscoped_input_offset() {
+    // REGRESSION (de72535 — the 2026-07 audit's shield-offset P0): ordinal sat offsets are
+    // ABSOLUTE across the whole input list, so a scoped (partial-sign) analysis must still
+    // advance the running offset by the UNSCOPED inputs' values. Two 10k inputs; the
+    // inscription sits at local offset 9,000 in input[1], i.e. absolute 10,000 + 9,000 =
+    // 19,000. With a single 15,000-sat output the tx pays 5,000 to fee and sat 19,000 lands
+    // in that fee tail — the inscription is BURNED. Under the ordinary dapp pattern
+    // signPsbt(psbt, { signInputs: [1] }), a version that skipped unscoped input[0] would
+    // place the inscription at offset 9,000, inside the output, and report a safe destination
+    // for a burn — showing "safe" for a burn.
+    let psbt = create_dummy_psbt(&[(10_000, None), (10_000, None)], &[15_000]);
+    let outpoint1 = psbt.unsigned_tx.input[1].previous_output;
+    let mut known = HashMap::new();
+    known.insert(
+        (outpoint1.txid, outpoint1.vout),
+        vec![("Inscription 0".to_string(), 9_000_u64)],
+    );
+
+    let scoped =
+        analyze_psbt_with_scope(&psbt, &known, Some(&[1]), bitcoin::Network::Regtest).unwrap();
+    assert_eq!(
+        scoped.warning_level,
+        WarningLevel::Danger,
+        "a burned inscription must stay Danger under a scoped signInputs:[1] analysis, \
+         got {:?} (burned {:?})",
+        scoped.warning_level,
+        scoped.inscriptions_burned,
+    );
+    assert!(
+        scoped
+            .inscriptions_burned
+            .contains(&"Inscription 0".to_string()),
+        "the inscription at absolute offset 19,000 is burned to the 5,000-sat fee tail"
+    );
+}
