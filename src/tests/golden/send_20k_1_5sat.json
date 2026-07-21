@@ -1,0 +1,26 @@
+{
+  "fee_sat": 231,
+  "inputs": [
+    {
+      "prevout": "615ced358b1fb074331eaf1de8097086fb33981dad15b2cc619192960e677f9b:0"
+    }
+  ],
+  "lock_time": 0,
+  "outputs": [
+    {
+      "kind": "p2tr",
+      "script_pubkey_hex": "5120fe60f8f3edcde73be7edfdeb2da0944f128dc4686887c8bcce11224e36d82821",
+      "value_sat": 20000
+    },
+    {
+      "kind": "p2tr",
+      "script_pubkey_hex": "5120891155110d7023eb0c5ed33d0a842ddf451ddb5435ab580ad026db5458bbe9d6",
+      "value_sat": 29769
+    }
+  ],
+  "unsigned_tx_hex": "02000000019b7f670e96929161ccb215ad1d9833fb867009e81daf1e3374b01f8b35ed5c610000000000fdffffff02204e000000000000225120fe60f8f3edcde73be7edfdeb2da0944f128dc4686887c8bcce11224e36d828214974000000000000225120891155110d7023eb0c5ed33d0a842ddf451ddb5435ab580ad026db5458bbe9d600000000",
+  "unsigned_txid": "d26dacd228399a79398fecd2eece449aeb0758df1bd6ca44378f7dd7c88d2892",
+  "version": 2,
+  "vsize": 137,
+  "weight": 548
+}
