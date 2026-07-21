@@ -25,5 +25,6 @@ pub mod rune_transfer;
 pub mod sign_intent;
 pub mod signing;
 pub mod utxo_list;
+pub mod vault_keystore;
 pub mod wasm_wallet_state;
 pub mod watch_and_xpub;

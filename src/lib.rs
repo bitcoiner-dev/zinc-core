@@ -220,6 +220,57 @@ pub fn decrypt_secret_internal(encrypted_json: &str, password: &str) -> Result<S
         .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {e}")))
 }
 
+/// Parse a 64-char hex string into the 32-byte data encryption key used by version-3 vaults.
+fn parse_vault_key_hex(key_hex: &str) -> Result<[u8; 32], ZincError> {
+    let bytes = hex::decode(key_hex.trim())
+        .map_err(|e| ZincError::EncryptionError(format!("vault key is not valid hex: {e}")))?;
+    let key: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        ZincError::EncryptionError(format!(
+            "vault key must be 32 bytes (64 hex chars), got {} bytes",
+            v.len()
+        ))
+    })?;
+    Ok(key)
+}
+
+#[doc(hidden)]
+/// Generate a fresh random 256-bit vault data encryption key, hex-encoded for keystore storage.
+pub fn generate_vault_key_internal() -> String {
+    hex::encode(crypto::generate_vault_key())
+}
+
+#[doc(hidden)]
+/// Encrypt a mnemonic under a hardware-keystore data encryption key (hex), producing a v3 vault.
+pub fn encrypt_wallet_with_key_internal(mnemonic: &str, key_hex: &str) -> Result<String, ZincError> {
+    let key = parse_vault_key_hex(key_hex)?;
+    let m = ZincMnemonic::parse(mnemonic)?;
+    let encrypted = crypto::encrypt_seed_with_key(m.phrase().as_bytes(), &key)?;
+    serde_json::to_string(&encrypted).map_err(|e| ZincError::SerializationError(e.to_string()))
+}
+
+#[doc(hidden)]
+/// Decrypt a v3 vault with the hardware-keystore data encryption key (hex) and recover the mnemonic.
+pub fn decrypt_wallet_with_key_internal(
+    encrypted_json: &str,
+    key_hex: &str,
+) -> Result<WalletResult, ZincError> {
+    let key = parse_vault_key_hex(key_hex)?;
+    let encrypted: crypto::EncryptedWallet = serde_json::from_str(encrypted_json)
+        .map_err(|e| ZincError::SerializationError(e.to_string()))?;
+    let plaintext = crypto::decrypt_seed_with_key(&encrypted, &key)?;
+
+    let phrase = zeroize::Zeroizing::new(
+        String::from_utf8(plaintext.to_vec())
+            .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {e}")))?,
+    );
+
+    let mnemonic = ZincMnemonic::parse(&phrase)?;
+    Ok(WalletResult {
+        phrase: mnemonic.phrase(),
+        words: mnemonic.words(),
+    })
+}
+
 // ============================================================================
 // WASM Bindings
 // ============================================================================
@@ -698,6 +749,36 @@ pub fn decrypt_wallet(encrypted_json: &str, password: &str) -> Result<JsValue, J
 #[wasm_bindgen]
 pub fn decrypt_secret(encrypted_json: &str, password: &str) -> Result<String, JsValue> {
     decrypt_secret_internal(encrypted_json, password).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Generate a fresh random 256-bit vault key (hex) for the hardware-keystore (v3) flow.
+///
+/// The caller stores the returned hex in the platform hardware keystore (iOS keychain/Secure
+/// Enclave, Android Keystore) and passes it back to `encrypt_wallet_with_key`. It is never
+/// derived from the PIN, so a leaked vault blob cannot be brute-forced offline.
+#[wasm_bindgen]
+pub fn generate_vault_key() -> String {
+    generate_vault_key_internal()
+}
+
+/// Encrypt a mnemonic under a hardware-keystore vault key (hex), producing a version-3 vault.
+#[wasm_bindgen]
+pub fn encrypt_wallet_with_key(mnemonic: &str, key_hex: &str) -> Result<String, JsValue> {
+    encrypt_wallet_with_key_internal(mnemonic, key_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Decrypt a version-3 vault with the hardware-keystore vault key (hex) and recover the mnemonic.
+#[wasm_bindgen]
+pub fn decrypt_wallet_with_key(encrypted_json: &str, key_hex: &str) -> Result<JsValue, JsValue> {
+    let result = decrypt_wallet_with_key_internal(encrypted_json, key_hex)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let response = DecryptResponse {
+        success: true,
+        phrase: result.phrase,
+        words: result.words,
+    };
+    serde_wasm_bindgen::to_value(&response).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Validate and verify a signed pairing request payload.
