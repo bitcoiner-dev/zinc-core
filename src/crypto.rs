@@ -33,8 +33,9 @@ pub struct EncryptedWallet {
     pub nonce: String,
     /// Encrypted seed (base64 encoded)
     pub ciphertext: String,
-    /// Version for future format changes
-    /// 1 = 64MB/3 iter, 2 = 32MB/1 iter
+    /// Version for future format changes.
+    /// 1 = Argon2 64MB/3iter, 2 = Argon2 32MB/1iter (both password-derived),
+    /// 3 = random 256-bit DEK held in the platform hardware keystore (NOT password-derived).
     pub version: u8,
 }
 
@@ -92,6 +93,71 @@ pub fn decrypt_seed(
     // Decrypt with AES-256-GCM
     let cipher = Aes256Gcm::new_from_slice(&*key).map_err(|_| ZincError::DecryptionError)?;
 
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_slice())
+        .map_err(|_| ZincError::DecryptionError)?;
+
+    Ok(Zeroizing::new(plaintext))
+}
+
+/// Encrypt a seed with a caller-supplied random 256-bit key (a "data encryption key")
+/// used DIRECTLY as the AES-256-GCM key — no Argon2, no password stretching.
+///
+/// This is the version-3 vault: the key is high-entropy and lives in the platform hardware
+/// keystore (iOS keychain/Secure Enclave, Android Keystore), released only after a device
+/// user-presence check. Because the key is not derived from a PIN/password, a leaked vault
+/// blob cannot be brute-forced offline — the entropy is in the key, not the user's secret.
+/// The DEK is single-purpose, so it is used as the AES key with no further KDF.
+pub fn encrypt_seed_with_key(seed: &[u8], key: &[u8; 32]) -> Result<EncryptedWallet, ZincError> {
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| ZincError::EncryptionError(e.to_string()))?;
+    let ciphertext = cipher
+        .encrypt(nonce, seed)
+        .map_err(|e| ZincError::EncryptionError(e.to_string()))?;
+
+    Ok(EncryptedWallet {
+        // Not password-derived, so there is no salt; kept empty for the shared struct shape.
+        salt: String::new(),
+        nonce: base64_encode(&nonce_bytes),
+        ciphertext: base64_encode(&ciphertext),
+        version: 3,
+    })
+}
+
+/// Generate a fresh random 256-bit data encryption key for a version-3 vault.
+///
+/// The caller stores this in the platform hardware keystore; it is the only copy, so losing
+/// the keystore entry means the vault can only be recovered by re-importing the mnemonic.
+pub fn generate_vault_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    key
+}
+
+/// Decrypt a version-3 vault with the 256-bit key retrieved from the hardware keystore.
+pub fn decrypt_seed_with_key(
+    encrypted: &EncryptedWallet,
+    key: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, ZincError> {
+    if encrypted.version != 3 {
+        return Err(ZincError::EncryptionError(format!(
+            "decrypt_seed_with_key expects a version-3 (keystore-DEK) vault, got version {}",
+            encrypted.version
+        )));
+    }
+
+    let nonce_bytes = base64_decode(&encrypted.nonce)?;
+    let ciphertext = base64_decode(&encrypted.ciphertext)?;
+    if nonce_bytes.len() != 12 {
+        return Err(ZincError::DecryptionError);
+    }
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ZincError::DecryptionError)?;
     let plaintext = cipher
         .decrypt(nonce, ciphertext.as_slice())
         .map_err(|_| ZincError::DecryptionError)?;
@@ -241,5 +307,51 @@ mod tests {
         assert_eq!(&*k1a, &*k1b);
         // Different Argon2 params (v1 = 64MB/3, v2 = 32MB/1) must yield different keys.
         assert_ne!(&*k1a, &*k2);
+    }
+
+    #[test]
+    fn test_v3_dek_roundtrip() {
+        let seed = b"this is a test seed for encryption";
+        let key = [7u8; 32];
+
+        let encrypted = encrypt_seed_with_key(seed, &key).unwrap();
+        assert_eq!(encrypted.version, 3);
+        assert!(encrypted.salt.is_empty(), "v3 is not password-derived, so carries no salt");
+
+        let decrypted = decrypt_seed_with_key(&encrypted, &key).unwrap();
+        assert_eq!(seed.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_generate_vault_key_is_fresh_each_call_and_round_trips() {
+        let k1 = generate_vault_key();
+        let k2 = generate_vault_key();
+        assert_ne!(k1, k2, "each generated DEK must be independent");
+
+        let seed = b"this is a test seed for encryption";
+        let encrypted = encrypt_seed_with_key(seed, &k1).unwrap();
+        let decrypted = decrypt_seed_with_key(&encrypted, &k1).unwrap();
+        assert_eq!(seed.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_v3_wrong_key_fails() {
+        let encrypted = encrypt_seed_with_key(b"this is a test seed", &[7u8; 32]).unwrap();
+        assert!(decrypt_seed_with_key(&encrypted, &[9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn test_v3_cannot_be_decrypted_by_the_password_path() {
+        // A leaked v3 vault must not be offline-attackable via the password/Argon2 path —
+        // there is no password to guess; the key lives in hardware. decrypt_seed refuses it.
+        let encrypted = encrypt_seed_with_key(b"seed", &[7u8; 32]).unwrap();
+        assert!(decrypt_seed(&encrypted, "any password whatsoever").is_err());
+    }
+
+    #[test]
+    fn test_decrypt_with_key_rejects_a_password_derived_vault() {
+        // Symmetrically, the keystore-DEK path must not accept a v1/v2 (password) vault.
+        let encrypted = encrypt_seed(b"seed", "pw").unwrap(); // version 2
+        assert!(decrypt_seed_with_key(&encrypted, &[7u8; 32]).is_err());
     }
 }
