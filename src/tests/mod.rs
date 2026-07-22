@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod bip_vectors;
 pub mod builder_depth;
 pub mod builder_planning;
 pub mod discovery_scan;
