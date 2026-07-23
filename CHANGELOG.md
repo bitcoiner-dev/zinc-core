@@ -2,7 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.7.0] - 2026-07-07
+## [0.8.0] - 2026-07-23
+
+### Added
+- **Breaking:** fractional fee rates — `f64` sat/vB end-to-end (transport,
+  planners, analysis, wasm surface) with kwu-precision fee math, so sub-1 sat/vB
+  regimes are representable exactly. Integer-only call sites must switch to
+  floats; serialized shapes accept both.
+- Version-3 hardware-keystore vault format: the seed is encrypted under a random
+  256-bit data-encryption key used directly as the AES-256-GCM key — no
+  password derivation — so the DEK can live in the platform hardware keystore
+  (Secure Enclave / Android Keystore) and a leaked vault blob cannot be
+  brute-forced offline. New wasm seam: `generate_vault_key`,
+  `encrypt_wallet_with_key`, `decrypt_wallet_with_key`. v1/v2 vaults remain
+  readable; v3 and v1/v2 refuse to decrypt each other's blobs.
+- Golden-file PSBT determinism tests for the deterministic planners, and
+  BIP-32/39/86 known-answer vectors with a taproot differential check pinning
+  key derivation to the published specs.
+
+### Changed
+- **Breaking:** shield analysis surfaces `ordinals_verified` as
+  `assets_verified` (it now covers runes as well as inscriptions).
+- **Breaking:** `prepare_offer_acceptance` takes the accepting wallet's expected
+  payout scriptPubKey (see Security).
+- `layout::BranchSpec` drops its redundant `purpose` field; rune edict/output
+  amount handling reworked.
+
+### Security
+- Taproot script-path signing binds every leaf to the prevout being spent: the
+  control block must commit to the prevout's taproot output key. Previously
+  `sign_inscription_script_paths` signed every `tap_scripts` leaf without
+  checking the control block — a blind script-path signing oracle reachable
+  through a dapp's `signPsbt`. Regression-tested (mutation-verified).
+- Shield analysis accumulates ordinal sat offsets across **all** inputs, not
+  just the scoped ones, so a partial-sign (`signInputs: [n]`) analysis can no
+  longer report a burned inscription as safe. Regression-tested
+  (mutation-verified).
+- Declared prevouts are verified instead of blanket-trusted: a PSBT
+  `witness_utxo`/`non_witness_utxo` that contradicts our own chain data is
+  refused, non-taproot inputs require full prevout proof (legacy sighash does
+  not commit to amounts — fee-inflation defense), and
+  `trust_witness_utxo` is computed per PSBT instead of hardcoded on.
+- Offer flow: `create_offer` routes the seller payout to the seller instead of
+  back to the buyer (the previous rule was exactly inverted), and offer
+  acceptance binds the payout output to the accepting wallet's own script so a
+  hostile offer cannot redirect it.
+- The Nostr pairing identity now derives from a non-spending branch
+  (`m/86'/coin'/account'/2/0`) instead of the primary spending key, so an
+  observer of pairing traffic can no longer derive the wallet's funded address
+  and read its balance/history. The secret is `Zeroizing` on drop.
+  **Migration:** previously-paired agents hold the old identity and must
+  re-pair.
+
+## [0.7.0] - 2026-07-23
 
 ### Added
 - Runes protocol support for the Ordinal Shield: runestone/cenotaph decoding via
@@ -23,6 +75,13 @@ All notable changes to this project will be documented in this file.
 - WASM: `resolveRuneInfo(ordUrl, ids)` returning `{ resolved, failed }`;
   `syncOrdinals` threads rune holdings through.
 - `RuneBalance` gains an optional canonical `id`.
+- Derivation-layout module (`layout::BranchSpec`,
+  `WalletBuilder::with_layout`) so wallet shells can describe account-discovery
+  layouts explicitly.
+- `enrich_psbt_key_origins` on the builder: key-origin metadata for external
+  (hardware) signers.
+- Safe, ord-compatible rune transfer planning.
+- `chain_tip_height` and `mark_ordinals_unverified` accessors.
 
 ### Changed
 - **Breaking (struct literals):** `AnalysisResult`, `InputInfo`, `OutputInfo`,
@@ -30,6 +89,15 @@ All notable changes to this project will be documented in this file.
   construction must be updated. Serialized wire shapes remain backward
   compatible (new fields are optional/defaulted).
 - MSRV raised from 1.77 to 1.80 (required by the `ordinals` dependency).
+
+### Fixed
+- Sync: primary-address script pubkeys are always revealed at wallet
+  construction/reset, so incremental syncs discover funds and inscriptions sent
+  to the primary address; per-network changeset scoping prevents cross-network
+  cache wipes; verified-empty guards stop transient ord outages from
+  unverifying held assets.
+- `plan_consolidate_tx` engages the ordinals safety lock.
+- Repaired pre-existing wasm-test breakage.
 
 ## [0.6.0] - 2026-07-06
 
