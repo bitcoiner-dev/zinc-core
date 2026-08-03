@@ -48,13 +48,36 @@ jobs:
   # Public-API guardrail: this is a published crate. Block any breaking change to
   # the public API surface relative to the last release on crates.io. Coverage
   # work is additive (tests only) and must never trip this job.
+  #
+  # v0.9.0 is an intentional pre-1.0 breaking transition. Its published v0.8.0
+  # baseline cannot currently be hydrated because that release pins the yanked
+  # bip322 v0.0.10. cargo-semver-checks also classifies 0.8 -> 0.9 as a major
+  # change and therefore has no compatibility lints to run. Scope the exception
+  # to exactly v0.9.0 so the guard automatically returns on the next version bump.
+  # Remove the exception after v0.9.0 is published so same-version changes are
+  # checked against the healthy v0.9.0 registry baseline.
   public-api:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read current crate version
+        id: crate-version
+        shell: bash
+        run: |
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Acknowledge intentional v0.9.0 API transition
+        if: steps.crate-version.outputs.version == '0.9.0'
+        run: |
+          echo "Skipping the unusable v0.8.0 registry baseline for the intentional v0.9.0 breaking transition."
+          echo "This exception expires on the next Cargo.toml version change."
+
       - name: Check for SemVer-breaking API changes
+        if: steps.crate-version.outputs.version != '0.9.0'
         uses: obi1kenobi/cargo-semver-checks-action@v2
 
   # Exercise the #[wasm_bindgen] JS surface (ZincWasmWallet + free fns) under Node.
