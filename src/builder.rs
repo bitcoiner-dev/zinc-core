@@ -4500,64 +4500,6 @@ impl ZincWallet {
         Ok(base64::engine::general_purpose::STANDARD.encode(&sig_bytes))
     }
 
-    /// Sign a message as a BIP-322 simple signature and return the witness bytes as hex.
-    pub fn sign_bip322_simple_hex(&self, address: &str, message: &str) -> Result<String, String> {
-        use bitcoin::PrivateKey;
-
-        if let Some(watched) = self.watched_address() {
-            if watched.to_string() == address {
-                let _ = message;
-                return Err(ZincError::CapabilityMissing.to_string());
-            }
-        }
-
-        let active_receive_index = self.active_receive_index();
-        let vault_addr = self
-            .vault_wallet
-            .peek_address(KeychainKind::External, active_receive_index)
-            .address
-            .to_string();
-
-        let (is_vault, is_payment) = if address == vault_addr {
-            (true, false)
-        } else if let Some(w) = &self.payment_wallet {
-            let pay_addr = w
-                .peek_address(KeychainKind::External, active_receive_index)
-                .address
-                .to_string();
-            (false, address == pay_addr)
-        } else {
-            (false, false)
-        };
-
-        if !is_vault && !is_payment {
-            return Err("Address not found in wallet".to_string());
-        }
-
-        let (purpose, chain) = if is_vault {
-            (86, 0)
-        } else {
-            (self.dual_payment_purpose(), 0)
-        };
-        let secret_key = self
-            .derive_private_key(purpose, chain, 0)
-            .map_err(|_| ZincError::CapabilityMissing.to_string())?;
-        let network = self.vault_wallet.network();
-        let private_key = PrivateKey::new(secret_key, network);
-        let witness = bip322::sign_simple(
-            &address
-                .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
-                .map_err(|e| format!("invalid address: {e}"))?
-                .require_network(network)
-                .map_err(|e| format!("address network mismatch: {e}"))?,
-            message,
-            private_key,
-        )
-        .map_err(|e| format!("failed to sign BIP-322 message: {e}"))?;
-        let bytes = bitcoin::consensus::serialize(&witness);
-        Ok(hex::encode(bytes))
-    }
-
     /// Derive the pairing signer secret key hex for this account.
     ///
     /// Uses a dedicated identity branch: `m/86'/coin'/account'/2/0`.
