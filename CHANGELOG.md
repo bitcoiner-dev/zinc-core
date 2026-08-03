@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 - **Breaking:** remove the `generate_wallet` WebAssembly export. Wallet shells must
   use their dedicated, auditable seed-generation boundary instead of asking the
   broad wallet engine to generate a mnemonic.
+- **Breaking:** remove the unused native `sign_bip322_simple_hex` helper and its
+  `bip322` dependency. BIP-322 signing should be introduced through an explicit
+  wallet-signer boundary when a supported application flow requires it.
 
 ## [0.8.0] - 2026-07-23
 

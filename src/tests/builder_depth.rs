@@ -1,6 +1,6 @@
 //! Depth coverage for `builder.rs` query/derivation/signing helpers not exercised by the
 //! planner/signing suites: ordinals-aware `get_balance` (inscribed filtering, confirmed vs
-//! pending), `sign_message` / `sign_bip322_simple_hex`, public-key + pairing-secret getters,
+//! pending), `sign_message`, public-key + pairing-secret getters,
 //! `reset_sync_state`, `export_changeset`, and scan helpers.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -292,16 +292,6 @@ mod tests {
             w.sign_message(&foreign, "gm").is_err(),
             "cannot sign a foreign address"
         );
-    }
-
-    #[test]
-    fn bip322_simple_signature_is_hex() {
-        let w = unified();
-        let own = w.peek_taproot_address(0).to_string();
-        let sig = w
-            .sign_bip322_simple_hex(&own, "hello bip322")
-            .expect("bip322 sig");
-        assert!(hex::decode(&sig).is_ok() && !sig.is_empty());
     }
 
     #[test]
