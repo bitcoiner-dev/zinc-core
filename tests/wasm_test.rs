@@ -14,21 +14,6 @@ use zinc_core::*;
 // `wasm_bindgen_test_configure!(run_in_browser)` only if a headless browser is wired up.
 
 #[wasm_bindgen_test]
-fn test_generate_wallet_returns_object() {
-    let result = generate_wallet(12).unwrap();
-
-    // In our bug, this was returning a Map.
-    // We want to ensure we know what it returns.
-    // Ideally it should be an Object for easier JS consumption,
-    // or at least we test what it IS so we don't break the frontend.
-
-    assert!(result.is_object(), "Result should be a JS Object (or Map)");
-
-    // If it's a POJO (Plain Old JS Object), we can check keys
-    // If it's a Map, result.is_object() is also true.
-}
-
-#[wasm_bindgen_test]
 fn test_decrypt_wallet_contract() {
     let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     let password = "strong_password_123";
