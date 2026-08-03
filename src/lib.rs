@@ -646,20 +646,6 @@ pub fn get_log_level() -> String {
     logging::get_log_level().as_str().to_string()
 }
 
-/// Generate a new wallet with a random mnemonic.
-#[wasm_bindgen]
-pub fn generate_wallet(word_count: u8) -> Result<JsValue, JsValue> {
-    let result =
-        generate_wallet_internal(word_count).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_result = serde_json::json!({
-        "words": result.words,
-        "phrase": result.phrase,
-    });
-
-    serde_wasm_bindgen::to_value(&js_result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
 /// Validate a mnemonic phrase.
 #[wasm_bindgen]
 pub fn validate_mnemonic(phrase: &str) -> bool {

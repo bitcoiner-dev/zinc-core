@@ -83,3 +83,11 @@ jobs:
 
       - name: Run wasm-bindgen tests in Node
         run: wasm-pack test --node . --test wasm_test --test wasm_account_test --test wasm_contract_test
+
+      # A removed export can survive in a stale generated artifact even when the
+      # source tests pass. Inspect the release-shaped module itself so the retired
+      # mnemonic generator cannot be reintroduced unnoticed.
+      - name: Audit production WASM exports
+        run: |
+          wasm-pack build --target web --release --out-dir target/wasm-audit
+          node scripts/audit-wasm-exports.mjs target/wasm-audit/zinc_core_bg.wasm

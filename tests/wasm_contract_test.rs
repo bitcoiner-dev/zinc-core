@@ -9,7 +9,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 use zinc_core::{
     decrypt_secret, decrypt_wallet, derive_address, encrypt_secret, encrypt_wallet,
-    generate_wallet, validate_mnemonic, ZincWasmWallet,
+    validate_mnemonic, ZincWasmWallet,
 };
 
 const PHRASE: &str =
@@ -33,26 +33,6 @@ fn wallet() -> ZincWasmWallet {
 }
 
 // ---------------- crypto free functions ----------------
-
-#[wasm_bindgen_test]
-fn generate_wallet_12_returns_phrase_and_12_words() {
-    let v = to_json(generate_wallet(12).expect("generate 12"));
-    assert_eq!(v["words"].as_array().expect("words array").len(), 12);
-    assert_eq!(
-        v["phrase"]
-            .as_str()
-            .expect("phrase")
-            .split_whitespace()
-            .count(),
-        12
-    );
-}
-
-#[wasm_bindgen_test]
-fn generate_wallet_24_returns_24_words() {
-    let v = to_json(generate_wallet(24).expect("generate 24"));
-    assert_eq!(v["words"].as_array().expect("words array").len(), 24);
-}
 
 #[wasm_bindgen_test]
 fn validate_mnemonic_accepts_valid_and_rejects_invalid() {

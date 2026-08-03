@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-08-02
+
+### Security
+- **Breaking:** remove the `generate_wallet` WebAssembly export. Wallet shells must
+  use their dedicated, auditable seed-generation boundary instead of asking the
+  broad wallet engine to generate a mnemonic.
+
 ## [0.8.0] - 2026-07-23
 
 ### Added
