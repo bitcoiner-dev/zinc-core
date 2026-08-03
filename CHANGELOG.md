@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.9.0] - 2026-08-02
+## [0.9.0] - 2026-08-03
 
 ### Security
 - **Breaking:** remove the `generate_wallet` WebAssembly export. Wallet shells must
