@@ -3978,6 +3978,62 @@ impl ZincWallet {
         Ok(base64::engine::general_purpose::STANDARD.encode(&prepared_bytes))
     }
 
+    /// Prepare a PSBT and enforce an adapter-supplied signer capability set.
+    ///
+    /// New hardware-wallet integrations should use this method instead of
+    /// dispatching the output of [`Self::prepare_external_sign_psbt`] directly.
+    /// Requirements are derived from the exact enriched PSBT and checked before
+    /// the caller can send it to a device.
+    pub fn prepare_external_signing_request(
+        &self,
+        psbt_base64: &str,
+        options: Option<SignOptions>,
+        capabilities: &crate::external_signing::ExternalSignerCapabilitiesV1,
+    ) -> Result<
+        crate::external_signing::PreparedExternalSigningRequestV1,
+        crate::external_signing::PrepareExternalSigningErrorV1,
+    > {
+        use crate::external_signing::{
+            check_external_signer_compatibility, derive_external_signing_requirements,
+            PrepareExternalSigningErrorV1, PreparedExternalSigningRequestV1,
+            EXTERNAL_SIGNING_SCHEMA_V1,
+        };
+        use base64::Engine;
+
+        let required_input_indices = options.as_ref().and_then(|opts| opts.sign_inputs.clone());
+        let prepared_psbt_base64 = self
+            .prepare_external_sign_psbt(psbt_base64, options)
+            .map_err(|message| PrepareExternalSigningErrorV1::PreparationFailed { message })?;
+        let prepared_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&prepared_psbt_base64)
+            .map_err(|error| PrepareExternalSigningErrorV1::RequirementsInvalid {
+                message: format!("prepared PSBT base64 is invalid: {error}"),
+            })?;
+        let prepared_psbt = Psbt::deserialize(&prepared_bytes).map_err(|error| {
+            PrepareExternalSigningErrorV1::RequirementsInvalid {
+                message: format!("prepared PSBT is invalid: {error}"),
+            }
+        })?;
+        let requirements =
+            derive_external_signing_requirements(&prepared_psbt, required_input_indices.as_deref())
+                .map_err(|error| PrepareExternalSigningErrorV1::RequirementsInvalid {
+                    message: error.to_string(),
+                })?;
+        let compatibility = check_external_signer_compatibility(&requirements, capabilities);
+        if !compatibility.compatible {
+            return Err(PrepareExternalSigningErrorV1::CapabilityRejected {
+                requirements,
+                compatibility,
+            });
+        }
+
+        Ok(PreparedExternalSigningRequestV1 {
+            schema_version: EXTERNAL_SIGNING_SCHEMA_V1,
+            prepared_psbt_base64,
+            requirements,
+        })
+    }
+
     /// Fill the derivation metadata an external signer (e.g. a Ledger) needs on
     /// every wallet-owned input:
     /// - taproot inputs gain `tap_internal_key` + `tap_key_origins`,

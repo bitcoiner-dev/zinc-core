@@ -7,7 +7,7 @@
 `zinc-core` is a Rust wallet engine for Bitcoin + Ordinals use cases.
 
 Key capabilities:
-- **Ledger Hardware Wallet Integration**: Full signing and verification flow for external hardware devices.
+- **Hardware Signer Safety**: Vendor-neutral capability negotiation plus external signing and verification.
 - **Watch-Only Identity**: Track and monitor any Taproot address without requiring private keys.
 - **Parallel Account Probing**: High-performance battery-efficient probing of multiple account paths via WASM.
 - **Deterministic Derivation**: Robust account/key derivation built on top of BDK.
@@ -18,7 +18,7 @@ Key capabilities:
 
 ```toml
 [dependencies]
-zinc-core = "0.4.0"
+zinc-core = "0.9.0"
 ```
 
 ## What You Get
@@ -89,10 +89,32 @@ WASM exports include:
 - **Stateful handles**: `ZincWasmWallet` (supports Mnemonic, Watch, and **Hardware** profiles)
 - **Discovery**: `probeHardwareAccounts` for ultra-fast parallel account scanning
 - **Hardware Signing**: `prepareExternalSignPsbt` and `verifyExternalSignedPsbt`
+- **Capability-Enforced Hardware Signing**: `prepareExternalSigningRequest`
 - **Analytics**: `analyzePsbt` for integrated Ordinal Shield protection
 - **Logging**: `set_log_level`, `set_logging_enabled`, `get_log_level`
 
 `init()` installs panic hooks only. Host applications should configure their own log subscriber/sink.
+
+## External Signer Capabilities
+
+Hardware adapters own provider/model/firmware/transport detection and produce an
+`ExternalSignerCapabilitiesV1`. `zinc-core` does not contain vendor branches. It
+derives `ExternalSigningRequirementsV1` from the exact prepared PSBT and requires
+every input type, output type, sighash, signing-scope feature, and device limit to
+match before returning a dispatchable request.
+
+Capability sets start deny-all. Adapters add only features proven for the active
+device. For example, a stock-firmware Trezor adapter can advertise Taproot
+key-path inputs and standard address outputs while omitting
+`ExternalSigningOutputTypeV1::Runestone`. An attempted Rune transfer then returns
+a typed `output.runestone` rejection before USB/WebUSB device I/O; ordinary BTC
+and inscription UTXO transfers remain eligible when their exact PSBT requirements
+are supported.
+
+Hosts should use the compatibility report for UI preflight and call
+`prepare_external_signing_request` (or `prepareExternalSigningRequest` in WASM)
+again at the trusted sign boundary. The existing `verify_external_signed_psbt`
+check remains the post-device trust gate.
 
 ## Logging Model
 
