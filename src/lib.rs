@@ -33,6 +33,8 @@ mod logging;
 pub mod builder;
 pub mod crypto;
 pub mod error;
+/// Vendor-neutral capability negotiation for hardware and other external signers.
+pub mod external_signing;
 /// Transaction history models and wallet history helpers.
 pub mod history;
 pub mod keys;
@@ -70,6 +72,14 @@ pub use builder::{
     ZincPersistence, ZincSyncRequest, ZincWallet,
 };
 pub use error::{ZincError, ZincResult};
+pub use external_signing::{
+    check_external_signer_compatibility, classify_external_signing_output,
+    derive_external_signing_requirements, require_external_signer_capabilities,
+    CapabilityRejectionCodeV1, CapabilityRejectionV1, ExternalSignerCapabilitiesV1,
+    ExternalSignerCompatibilityV1, ExternalSignerLimitsV1, ExternalSigningInputTypeV1,
+    ExternalSigningOutputTypeV1, ExternalSigningRequirementsV1, PrepareExternalSigningErrorV1,
+    PreparedExternalSigningRequestV1, RequirementsDerivationError, EXTERNAL_SIGNING_SCHEMA_V1,
+};
 pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use layout::{derive_layout_addresses, BranchSpec, LayoutAddresses, LayoutSpec, ScriptKind};
@@ -3041,6 +3051,50 @@ impl ZincWasmWallet {
                 .map_err(JsValue::from),
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (prepare_external_sign_psbt): {e}"
+            ))),
+        }
+    }
+
+    /// Prepare a PSBT and reject it unless the adapter's effective capabilities
+    /// cover every requirement derived from the exact prepared transaction.
+    #[wasm_bindgen(js_name = prepareExternalSigningRequest)]
+    pub fn prepare_external_signing_request(
+        &self,
+        psbt_base64: &str,
+        options: JsValue,
+        capabilities: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+
+        let sign_opts: Option<crate::builder::SignOptions> =
+            if options.is_null() || options.is_undefined() {
+                None
+            } else {
+                Some(
+                    serde_wasm_bindgen::from_value(options)
+                        .map_err(|error| JsValue::from_str(&format!("Invalid options: {error}")))?,
+                )
+            };
+        let capabilities: crate::external_signing::ExternalSignerCapabilitiesV1 =
+            serde_wasm_bindgen::from_value(capabilities).map_err(|error| {
+                JsValue::from_str(&format!("Invalid signer capabilities: {error}"))
+            })?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                match inner.prepare_external_signing_request(psbt_base64, sign_opts, &capabilities)
+                {
+                    Ok(request) => serde_wasm_bindgen::to_value(&request).map_err(|error| {
+                        JsValue::from_str(&format!(
+                            "Failed to serialize external signing request: {error}"
+                        ))
+                    }),
+                    Err(error) => Err(serde_wasm_bindgen::to_value(&error)
+                        .unwrap_or_else(|_| JsValue::from_str(&error.to_string()))),
+                }
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (prepareExternalSigningRequest): {error}"
             ))),
         }
     }

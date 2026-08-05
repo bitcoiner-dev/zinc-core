@@ -5,6 +5,7 @@ pub mod builder_planning;
 pub mod discovery_scan;
 pub mod dual_send_signing;
 pub mod external_signing;
+pub mod external_signing_capabilities;
 pub mod fractional_fees;
 // Golden-file PSBT tests read/write fixture files, so they are native-only.
 #[cfg(not(target_arch = "wasm32"))]

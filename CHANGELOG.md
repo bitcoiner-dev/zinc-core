@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Versioned, vendor-neutral external-signer capability negotiation. Zinc now
+  derives input, output, sighash, signing-scope, and device-limit requirements
+  from the exact prepared PSBT and compares them with adapter-supplied effective
+  capabilities.
+- Typed compatibility reports and rejection codes for native and WASM hosts,
+  including stable capability keys such as `output.runestone`.
+- `prepare_external_signing_request` / `prepareExternalSigningRequest`, which
+  combines the existing PSBT safety preparation with mandatory capability
+  enforcement before a transaction can be dispatched to a device.
+
+### Security
+- Runestone outputs are detected from their exact `OP_RETURN OP_13` script
+  prefix and kept distinct from ordinary push-data `OP_RETURN` outputs. A signer
+  must explicitly advertise Runestone representation support; otherwise the
+  request is rejected before device I/O.
+
 ## [0.9.0] - 2026-08-03
 
 ### Security
