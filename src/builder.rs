@@ -3988,58 +3988,57 @@ impl ZincWallet {
         &self,
         psbt_base64: &str,
         options: Option<SignOptions>,
-        capabilities: &crate::external_signing::ExternalSignerCapabilitiesV1,
+        capabilities: &crate::external_signing::ExternalSignerCapabilitiesV2,
     ) -> Result<
-        crate::external_signing::PreparedExternalSigningRequestV1,
-        crate::external_signing::PrepareExternalSigningErrorV1,
+        crate::external_signing::PreparedExternalSigningRequestV2,
+        crate::external_signing::PrepareExternalSigningErrorV2,
     > {
         use crate::external_signing::{
-            check_external_signer_compatibility, derive_external_signing_plan,
-            derive_external_signing_requirements, PrepareExternalSigningErrorV1,
-            PreparedExternalSigningRequestV1,
-            EXTERNAL_SIGNING_SCHEMA_V1,
+            check_external_signer_compatibility_v2, derive_external_signing_plan_v2,
+            derive_external_signing_requirements_v2, PrepareExternalSigningErrorV2,
+            PreparedExternalSigningRequestV2, EXTERNAL_SIGNING_SCHEMA_V2,
         };
         use base64::Engine;
 
         let required_input_indices = options.as_ref().and_then(|opts| opts.sign_inputs.clone());
         let prepared_psbt_base64 = self
             .prepare_external_sign_psbt(psbt_base64, options)
-            .map_err(|message| PrepareExternalSigningErrorV1::PreparationFailed { message })?;
+            .map_err(|message| PrepareExternalSigningErrorV2::PreparationFailed { message })?;
         let prepared_psbt_base64 = self
             .enrich_psbt_key_origins(&prepared_psbt_base64)
-            .map_err(|message| PrepareExternalSigningErrorV1::PreparationFailed { message })?;
+            .map_err(|message| PrepareExternalSigningErrorV2::PreparationFailed { message })?;
         let prepared_bytes = base64::engine::general_purpose::STANDARD
             .decode(&prepared_psbt_base64)
-            .map_err(|error| PrepareExternalSigningErrorV1::RequirementsInvalid {
+            .map_err(|error| PrepareExternalSigningErrorV2::RequirementsInvalid {
                 message: format!("prepared PSBT base64 is invalid: {error}"),
             })?;
         let prepared_psbt = Psbt::deserialize(&prepared_bytes).map_err(|error| {
-            PrepareExternalSigningErrorV1::RequirementsInvalid {
+            PrepareExternalSigningErrorV2::RequirementsInvalid {
                 message: format!("prepared PSBT is invalid: {error}"),
             }
         })?;
         let requirements =
-            derive_external_signing_requirements(&prepared_psbt, required_input_indices.as_deref())
-                .map_err(|error| PrepareExternalSigningErrorV1::RequirementsInvalid {
+            derive_external_signing_requirements_v2(&prepared_psbt, required_input_indices.as_deref())
+                .map_err(|error| PrepareExternalSigningErrorV2::RequirementsInvalid {
                     message: error.to_string(),
                 })?;
-        let compatibility = check_external_signer_compatibility(&requirements, capabilities);
+        let compatibility = check_external_signer_compatibility_v2(&requirements, capabilities);
         if !compatibility.compatible {
-            return Err(PrepareExternalSigningErrorV1::CapabilityRejected {
+            return Err(PrepareExternalSigningErrorV2::CapabilityRejected {
                 requirements,
                 compatibility,
             });
         }
-        let signing_plan = derive_external_signing_plan(
+        let signing_plan = derive_external_signing_plan_v2(
             &prepared_psbt,
             self.vault_wallet.network(),
         )
-        .map_err(|error| PrepareExternalSigningErrorV1::RequirementsInvalid {
+        .map_err(|error| PrepareExternalSigningErrorV2::RequirementsInvalid {
             message: error.to_string(),
         })?;
 
-        Ok(PreparedExternalSigningRequestV1 {
-            schema_version: EXTERNAL_SIGNING_SCHEMA_V1,
+        Ok(PreparedExternalSigningRequestV2 {
+            schema_version: EXTERNAL_SIGNING_SCHEMA_V2,
             prepared_psbt_base64,
             requirements,
             signing_plan,
