@@ -421,6 +421,50 @@ mod tests {
             request.requirements.sighash_types,
             [0].into_iter().collect()
         );
+        assert_eq!(request.signing_plan.inputs.len(), 1);
+        assert_eq!(request.signing_plan.outputs.len(), 1);
+        assert_eq!(
+            request.signing_plan.inputs[0].input_type,
+            ExternalSigningInputTypeV1::P2trKeyPath
+        );
+        let input_origin = request.signing_plan.inputs[0]
+            .derivation
+            .as_ref()
+            .expect("input plan must carry a derivation path");
+        assert!(
+            input_origin.path.starts_with("m/86'/1'/0'"),
+            "input plan must carry the exact BIP86 leaf path; got {}",
+            input_origin.path
+        );
+        assert!(
+            request.signing_plan.outputs[0].derivation.is_some(),
+            "wallet-owned output must be represented as path-based change"
+        );
+    }
+
+    #[test]
+    fn raw_signed_transaction_is_merged_only_when_unsigned_fields_match() {
+        use bitcoin::consensus::encode::serialize_hex;
+
+        let (mut wallet, unsigned) = setup();
+        let partially_signed = sign_all(&mut wallet, &unsigned);
+        let finalized = wallet
+            .verify_external_signed_psbt(&unsigned, &partially_signed, None, true)
+            .expect("finalize signed fixture");
+        let signed_tx = decode(&finalized).extract_tx_unchecked_fee_rate();
+        let merged = wallet
+            .apply_external_signed_transaction(&unsigned, &serialize_hex(&signed_tx))
+            .expect("merge raw signer result");
+        wallet
+            .verify_external_signed_psbt(&unsigned, &merged, None, true)
+            .expect("merged raw transaction remains verifiable");
+
+        let mut modified = signed_tx;
+        modified.output[0].value = Amount::from_sat(1);
+        let error = wallet
+            .apply_external_signed_transaction(&unsigned, &serialize_hex(&modified))
+            .unwrap_err();
+        assert!(error.contains("modified transaction"), "{error}");
     }
 
     #[test]

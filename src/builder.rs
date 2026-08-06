@@ -3994,8 +3994,9 @@ impl ZincWallet {
         crate::external_signing::PrepareExternalSigningErrorV1,
     > {
         use crate::external_signing::{
-            check_external_signer_compatibility, derive_external_signing_requirements,
-            PrepareExternalSigningErrorV1, PreparedExternalSigningRequestV1,
+            check_external_signer_compatibility, derive_external_signing_plan,
+            derive_external_signing_requirements, PrepareExternalSigningErrorV1,
+            PreparedExternalSigningRequestV1,
             EXTERNAL_SIGNING_SCHEMA_V1,
         };
         use base64::Engine;
@@ -4003,6 +4004,9 @@ impl ZincWallet {
         let required_input_indices = options.as_ref().and_then(|opts| opts.sign_inputs.clone());
         let prepared_psbt_base64 = self
             .prepare_external_sign_psbt(psbt_base64, options)
+            .map_err(|message| PrepareExternalSigningErrorV1::PreparationFailed { message })?;
+        let prepared_psbt_base64 = self
+            .enrich_psbt_key_origins(&prepared_psbt_base64)
             .map_err(|message| PrepareExternalSigningErrorV1::PreparationFailed { message })?;
         let prepared_bytes = base64::engine::general_purpose::STANDARD
             .decode(&prepared_psbt_base64)
@@ -4026,11 +4030,19 @@ impl ZincWallet {
                 compatibility,
             });
         }
+        let signing_plan = derive_external_signing_plan(
+            &prepared_psbt,
+            self.vault_wallet.network(),
+        )
+        .map_err(|error| PrepareExternalSigningErrorV1::RequirementsInvalid {
+            message: error.to_string(),
+        })?;
 
         Ok(PreparedExternalSigningRequestV1 {
             schema_version: EXTERNAL_SIGNING_SCHEMA_V1,
             prepared_psbt_base64,
             requirements,
+            signing_plan,
         })
     }
 
@@ -4121,6 +4133,89 @@ impl ZincWallet {
                     }
                 }
                 break;
+            }
+        }
+
+        // Change recognition is part of the device safety model. Enrich every
+        // wallet-owned output with the exact derivation so non-PSBT transports
+        // can send a path instead of presenting change as an external payment.
+        let output_count = psbt.unsigned_tx.output.len();
+        for i in 0..output_count {
+            let spk = psbt.unsigned_tx.output[i].script_pubkey.clone();
+            for wallet in std::iter::once(&self.vault_wallet).chain(self.payment_wallet.as_ref()) {
+                let Some((keychain, child)) = wallet.derivation_of_spk(spk.clone()) else {
+                    continue;
+                };
+                let descriptor = wallet.public_descriptor(keychain);
+                let derived = descriptor
+                    .at_derivation_index(child)
+                    .map_err(|e| format!("Derivation index error: {e}"))?;
+                psbt.update_output_with_descriptor(i, &derived)
+                    .map_err(|e| format!("Failed to enrich output {i}: {e}"))?;
+                break;
+            }
+        }
+
+        Ok(base64::engine::general_purpose::STANDARD.encode(psbt.serialize()))
+    }
+
+    /// Merge the finalized scripts/witnesses from a signer-returned raw
+    /// transaction into the exact prepared PSBT.
+    ///
+    /// Some hardware APIs (notably Trezor Connect) return a signed transaction
+    /// rather than a signed PSBT. Every unsigned field is compared before any
+    /// witness data is accepted; the normal external-PSBT verifier still runs
+    /// afterwards and enforces the requested signing scope.
+    pub fn apply_external_signed_transaction(
+        &self,
+        prepared_psbt_base64: &str,
+        signed_transaction_hex: &str,
+    ) -> Result<String, String> {
+        use base64::Engine;
+        use bitcoin::consensus::deserialize;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(prepared_psbt_base64)
+            .map_err(|e| format!("Invalid prepared PSBT base64: {e}"))?;
+        let mut psbt = Psbt::deserialize(&psbt_bytes)
+            .map_err(|e| format!("Invalid prepared PSBT: {e}"))?;
+        let signed_bytes = hex::decode(signed_transaction_hex)
+            .map_err(|e| format!("Invalid signed transaction hex: {e}"))?;
+        let signed_tx: bitcoin::Transaction = deserialize(&signed_bytes)
+            .map_err(|e| format!("Invalid signed transaction: {e}"))?;
+        let unsigned_tx = &psbt.unsigned_tx;
+
+        if signed_tx.version != unsigned_tx.version
+            || signed_tx.lock_time != unsigned_tx.lock_time
+            || signed_tx.input.len() != unsigned_tx.input.len()
+            || signed_tx.output != unsigned_tx.output
+        {
+            return Err(
+                "Security Violation: Device returned a modified transaction.".to_string(),
+            );
+        }
+
+        for (index, (signed_input, unsigned_input)) in signed_tx
+            .input
+            .iter()
+            .zip(unsigned_tx.input.iter())
+            .enumerate()
+        {
+            if signed_input.previous_output != unsigned_input.previous_output
+                || signed_input.sequence != unsigned_input.sequence
+            {
+                return Err(format!(
+                    "Security Violation: Device modified input #{index}."
+                ));
+            }
+            if signed_input.script_sig.is_empty() && signed_input.witness.is_empty() {
+                continue;
+            }
+            if !signed_input.script_sig.is_empty() {
+                psbt.inputs[index].final_script_sig = Some(signed_input.script_sig.clone());
+            }
+            if !signed_input.witness.is_empty() {
+                psbt.inputs[index].final_script_witness = Some(signed_input.witness.clone());
             }
         }
 
