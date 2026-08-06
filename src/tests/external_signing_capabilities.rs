@@ -2,10 +2,11 @@
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::external_signing::{
-        check_external_signer_compatibility, classify_external_signing_output,
-        derive_external_signing_requirements, CapabilityRejectionCodeV1,
-        ExternalSignerCapabilitiesV1, ExternalSignerLimitsV1, ExternalSigningInputTypeV1,
-        ExternalSigningOutputTypeV1, EXTERNAL_SIGNING_SCHEMA_V1,
+        check_external_signer_compatibility_v2, classify_external_signing_output,
+        derive_external_signing_requirements_v2, CapabilityRejectionCodeV2,
+        ExternalSignerCapabilitiesV2, ExternalSignerInputPolicyV2, ExternalSignerLimitsV1,
+        ExternalSigningInputRequirementV2, ExternalSigningInputTypeV1,
+        ExternalSigningOutputTypeV1, EXTERNAL_SIGNING_SCHEMA_V2,
     };
     use bitcoin::hashes::Hash;
     use bitcoin::psbt::Psbt;
@@ -94,15 +95,17 @@ mod tests {
         let runestone = ScriptBuf::from_bytes(vec![0x6a, 0x5d, 0x01, 0x00]);
         let psbt = psbt(&[p2tr(1), p2wpkh(2)], &[p2tr(3), runestone]);
 
-        let requirements = derive_external_signing_requirements(&psbt, Some(&[0])).unwrap();
+        let requirements = derive_external_signing_requirements_v2(&psbt, Some(&[0])).unwrap();
 
-        assert_eq!(requirements.schema_version, EXTERNAL_SIGNING_SCHEMA_V1);
-        assert_eq!(requirements.required_input_indices, vec![0]);
+        assert_eq!(requirements.schema_version, EXTERNAL_SIGNING_SCHEMA_V2);
         assert_eq!(
-            requirements.input_types,
-            set([ExternalSigningInputTypeV1::P2trKeyPath])
+            requirements.required_inputs,
+            vec![ExternalSigningInputRequirementV2 {
+                index: 0,
+                input_type: ExternalSigningInputTypeV1::P2trKeyPath,
+                sighash_type: 0,
+            }]
         );
-        assert_eq!(requirements.sighash_types, set([0]));
         assert_eq!(
             requirements.output_types,
             set([
@@ -118,22 +121,25 @@ mod tests {
     fn unsupported_runestone_is_a_typed_deny_before_device_dispatch() {
         let runestone = ScriptBuf::from_bytes(vec![0x6a, 0x5d, 0x01, 0x00]);
         let psbt = psbt(&[p2tr(1)], &[p2tr(2), runestone]);
-        let requirements = derive_external_signing_requirements(&psbt, None).unwrap();
-        let mut capabilities = ExternalSignerCapabilitiesV1::deny_all("test:stock-firmware");
-        capabilities.supported_input_types = set([ExternalSigningInputTypeV1::P2trKeyPath]);
+        let requirements = derive_external_signing_requirements_v2(&psbt, None).unwrap();
+        let mut capabilities = ExternalSignerCapabilitiesV2::deny_all("test:stock-firmware");
+        capabilities.input_signing_policies = vec![ExternalSignerInputPolicyV2 {
+            input_type: ExternalSigningInputTypeV1::P2trKeyPath,
+            supported_sighash_types: set([0]),
+            default_sighash_type: 0,
+        }];
         capabilities.supported_output_types = set([
             ExternalSigningOutputTypeV1::P2tr,
             ExternalSigningOutputTypeV1::OpReturnPushData,
         ]);
-        capabilities.supported_sighash_types = set([0]);
 
-        let report = check_external_signer_compatibility(&requirements, &capabilities);
+        let report = check_external_signer_compatibility_v2(&requirements, &capabilities);
 
         assert!(!report.compatible);
         assert_eq!(report.rejections.len(), 1);
         assert_eq!(
             report.rejections[0].code,
-            CapabilityRejectionCodeV1::CapabilityUnsupported
+            CapabilityRejectionCodeV2::TransactionNotRepresentable
         );
         assert_eq!(report.rejections[0].capability, "output.runestone");
         assert!(report.rejections[0].message.contains("cannot represent"));
@@ -142,17 +148,20 @@ mod tests {
     #[test]
     fn matcher_collects_scope_and_device_limit_rejections() {
         let psbt = psbt(&[p2tr(1), p2tr(2)], &[p2tr(3)]);
-        let requirements = derive_external_signing_requirements(&psbt, Some(&[0])).unwrap();
-        let mut capabilities = ExternalSignerCapabilitiesV1::deny_all("test:limited");
-        capabilities.supported_input_types = set([ExternalSigningInputTypeV1::P2trKeyPath]);
+        let requirements = derive_external_signing_requirements_v2(&psbt, Some(&[0])).unwrap();
+        let mut capabilities = ExternalSignerCapabilitiesV2::deny_all("test:limited");
+        capabilities.input_signing_policies = vec![ExternalSignerInputPolicyV2 {
+            input_type: ExternalSigningInputTypeV1::P2trKeyPath,
+            supported_sighash_types: set([0]),
+            default_sighash_type: 0,
+        }];
         capabilities.supported_output_types = set([ExternalSigningOutputTypeV1::P2tr]);
-        capabilities.supported_sighash_types = set([0]);
         capabilities.limits = ExternalSignerLimitsV1 {
             max_inputs: Some(1),
             max_outputs: None,
         };
 
-        let report = check_external_signer_compatibility(&requirements, &capabilities);
+        let report = check_external_signer_compatibility_v2(&requirements, &capabilities);
         let keys = report
             .rejections
             .iter()
@@ -170,18 +179,53 @@ mod tests {
         assert!(report
             .rejections
             .iter()
-            .any(|rejection| rejection.code == CapabilityRejectionCodeV1::DeviceLimitExceeded));
+            .any(|rejection| rejection.code == CapabilityRejectionCodeV2::DeviceLimitExceeded));
     }
 
     #[test]
     fn capability_json_is_versioned_and_uses_stable_names() {
-        let mut capabilities = ExternalSignerCapabilitiesV1::deny_all("vendor:model:firmware");
-        capabilities.supported_input_types = set([ExternalSigningInputTypeV1::P2trKeyPath]);
+        let mut capabilities = ExternalSignerCapabilitiesV2::deny_all("vendor:model:firmware");
+        capabilities.input_signing_policies = vec![ExternalSignerInputPolicyV2 {
+            input_type: ExternalSigningInputTypeV1::P2trKeyPath,
+            supported_sighash_types: set([0]),
+            default_sighash_type: 0,
+        }];
         capabilities.supported_output_types = set([ExternalSigningOutputTypeV1::Runestone]);
         let value = serde_json::to_value(capabilities).unwrap();
 
-        assert_eq!(value["schemaVersion"], EXTERNAL_SIGNING_SCHEMA_V1);
-        assert_eq!(value["supportedInputTypes"][0], "p2tr_key_path");
+        assert_eq!(value["schemaVersion"], EXTERNAL_SIGNING_SCHEMA_V2);
+        assert_eq!(value["inputSigningPolicies"][0]["inputType"], "p2tr_key_path");
         assert_eq!(value["supportedOutputTypes"][0], "runestone");
+    }
+
+    #[test]
+    fn rejects_a_sighash_that_is_supported_only_by_another_input_family() {
+        let mut psbt = psbt(&[p2tr(1)], &[p2tr(2)]);
+        psbt.inputs[0].sighash_type = Some(bitcoin::psbt::PsbtSighashType::from_u32(1));
+        let requirements = derive_external_signing_requirements_v2(&psbt, None).unwrap();
+        let mut capabilities = ExternalSignerCapabilitiesV2::deny_all("trezor:stock");
+        capabilities.input_signing_policies = vec![
+            ExternalSignerInputPolicyV2 {
+                input_type: ExternalSigningInputTypeV1::P2wpkh,
+                supported_sighash_types: set([1]),
+                default_sighash_type: 1,
+            },
+            ExternalSignerInputPolicyV2 {
+                input_type: ExternalSigningInputTypeV1::P2trKeyPath,
+                supported_sighash_types: set([0]),
+                default_sighash_type: 0,
+            },
+        ];
+        capabilities.supported_output_types = set([ExternalSigningOutputTypeV1::P2tr]);
+
+        let report = check_external_signer_compatibility_v2(&requirements, &capabilities);
+        assert_eq!(report.rejections.len(), 1);
+        assert_eq!(
+            report.rejections[0].code,
+            CapabilityRejectionCodeV2::SighashUnsupportedForInput
+        );
+        assert_eq!(report.rejections[0].input_index, Some(0));
+        assert_eq!(report.rejections[0].required_sighash_type, Some(1));
+        assert_eq!(report.rejections[0].supported_sighash_types, Some(set([0])));
     }
 }

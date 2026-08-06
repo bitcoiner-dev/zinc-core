@@ -1,9 +1,9 @@
 //! Vendor-neutral capability negotiation for external signers.
 //!
-//! Zinc derives [`ExternalSigningRequirementsV1`] from the exact PSBT that will
+//! Zinc derives [`ExternalSigningRequirementsV2`] from the exact PSBT that will
 //! be handed to a signer. A hardware-wallet adapter independently describes the
 //! effective capabilities of its provider/model/firmware/transport combination
-//! with [`ExternalSignerCapabilitiesV1`]. The matcher in this module is pure and
+//! with [`ExternalSignerCapabilitiesV2`]. The matcher in this module is pure and
 //! deny-by-default: every derived requirement must be explicitly supported.
 
 use bitcoin::psbt::Psbt;
@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// Schema version used by all `V1` external-signing values.
-pub const EXTERNAL_SIGNING_SCHEMA_V1: u16 = 1;
+/// Schema version for per-input external-signing capability negotiation.
+pub const EXTERNAL_SIGNING_SCHEMA_V2: u16 = 2;
 
 /// Script/signing mechanism required for an input Zinc asks the device to sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -75,24 +75,6 @@ impl ExternalSigningOutputTypeV1 {
     }
 }
 
-/// Requirements derived from the exact prepared PSBT.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalSigningRequirementsV1 {
-    pub schema_version: u16,
-    pub required_input_indices: Vec<usize>,
-    pub input_types: BTreeSet<ExternalSigningInputTypeV1>,
-    pub output_types: BTreeSet<ExternalSigningOutputTypeV1>,
-    /// Raw consensus sighash values required by inputs Zinc asks the signer to sign.
-    pub sighash_types: BTreeSet<u32>,
-    pub input_count: usize,
-    pub output_count: usize,
-    /// True when the PSBT contains inputs outside `required_input_indices`.
-    pub has_external_inputs: bool,
-    /// True when Zinc asks the signer to sign fewer than all transaction inputs.
-    pub requires_selective_signing: bool,
-}
-
 /// Optional signer limits which can vary by model, firmware, or transport.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,34 +83,62 @@ pub struct ExternalSignerLimitsV1 {
     pub max_outputs: Option<usize>,
 }
 
-/// Effective capabilities supplied by a hardware-wallet adapter.
-///
-/// `signer` is an opaque diagnostic label such as
-/// `"trezor:safe-5:2.8.1:webusb"`. `zinc-core` never branches on its value.
+/// Exact signing requirement for one input. Keeping the input type and
+/// sighash together prevents a signer from appearing compatible merely because
+/// it supports each value independently on different script families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSigningInputRequirementV2 {
+    pub index: usize,
+    pub input_type: ExternalSigningInputTypeV1,
+    pub sighash_type: u32,
+}
+
+/// Requirements derived from the exact prepared PSBT.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalSignerCapabilitiesV1 {
+pub struct ExternalSigningRequirementsV2 {
+    pub schema_version: u16,
+    pub required_inputs: Vec<ExternalSigningInputRequirementV2>,
+    pub output_types: BTreeSet<ExternalSigningOutputTypeV1>,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub has_external_inputs: bool,
+    pub requires_selective_signing: bool,
+}
+
+/// Sighash policy for one signer-supported input family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSignerInputPolicyV2 {
+    pub input_type: ExternalSigningInputTypeV1,
+    pub supported_sighash_types: BTreeSet<u32>,
+    pub default_sighash_type: u32,
+}
+
+/// Effective capabilities supplied by a hardware-wallet adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSignerCapabilitiesV2 {
     pub schema_version: u16,
     pub signer: String,
-    pub supported_input_types: BTreeSet<ExternalSigningInputTypeV1>,
+    pub input_signing_policies: Vec<ExternalSignerInputPolicyV2>,
     pub supported_output_types: BTreeSet<ExternalSigningOutputTypeV1>,
-    pub supported_sighash_types: BTreeSet<u32>,
     pub supports_external_inputs: bool,
     pub supports_selective_signing: bool,
     #[serde(default)]
     pub limits: ExternalSignerLimitsV1,
 }
 
-impl ExternalSignerCapabilitiesV1 {
+impl ExternalSignerCapabilitiesV2 {
     /// Start with an empty, deny-by-default capability set.
     #[must_use]
     pub fn deny_all(signer: impl Into<String>) -> Self {
         Self {
-            schema_version: EXTERNAL_SIGNING_SCHEMA_V1,
+            schema_version: EXTERNAL_SIGNING_SCHEMA_V2,
             signer: signer.into(),
-            supported_input_types: BTreeSet::new(),
+            input_signing_policies: Vec::new(),
             supported_output_types: BTreeSet::new(),
-            supported_sighash_types: BTreeSet::new(),
             supports_external_inputs: false,
             supports_selective_signing: false,
             limits: ExternalSignerLimitsV1::default(),
@@ -136,42 +146,43 @@ impl ExternalSignerCapabilitiesV1 {
     }
 }
 
-/// Stable rejection categories suitable for RPC/UI handling.
+/// Stable V2 rejection categories suitable for RPC/UI handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CapabilityRejectionCodeV1 {
+pub enum CapabilityRejectionCodeV2 {
     SchemaVersionUnsupported,
     CapabilityUnsupported,
-    FirmwareTooOld,
-    AdapterUnsupported,
+    SighashUnsupportedForInput,
     TransactionNotRepresentable,
     DeviceLimitExceeded,
 }
 
-/// A typed, user-presentable reason an external signer must not receive a PSBT.
+/// A typed V2 reason an external signer must not receive a PSBT.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CapabilityRejectionV1 {
-    pub code: CapabilityRejectionCodeV1,
-    /// Stable capability key, for example `output.runestone`.
+pub struct CapabilityRejectionV2 {
+    pub code: CapabilityRejectionCodeV2,
     pub capability: String,
     pub message: String,
+    pub input_index: Option<usize>,
+    pub input_type: Option<ExternalSigningInputTypeV1>,
+    pub required_sighash_type: Option<u32>,
+    pub supported_sighash_types: Option<BTreeSet<u32>>,
 }
 
-impl fmt::Display for CapabilityRejectionV1 {
+impl fmt::Display for CapabilityRejectionV2 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.capability, self.message)
     }
 }
 
-impl std::error::Error for CapabilityRejectionV1 {}
+impl std::error::Error for CapabilityRejectionV2 {}
 
-/// Complete compatibility result. An empty `rejections` list means compatible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalSignerCompatibilityV1 {
+pub struct ExternalSignerCompatibilityV2 {
     pub compatible: bool,
-    pub rejections: Vec<CapabilityRejectionV1>,
+    pub rejections: Vec<CapabilityRejectionV2>,
 }
 
 /// Typed failures encountered while deriving requirements from a PSBT.
@@ -190,29 +201,6 @@ pub enum RequirementsDerivationError {
     MissingPreviousOutput { input_index: usize, vout: u32 },
 }
 
-/// Prepared PSBT plus its capability requirements.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreparedExternalSigningRequestV1 {
-    pub schema_version: u16,
-    pub prepared_psbt_base64: String,
-    pub requirements: ExternalSigningRequirementsV1,
-    pub signing_plan: ExternalSigningPlanV1,
-}
-
-/// Vendor-neutral transaction facts an adapter needs to invoke a signer which
-/// does not consume PSBTs directly. Values are copied from the exact prepared
-/// PSBT which already passed Zinc's audit and capability checks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalSigningPlanV1 {
-    pub schema_version: u16,
-    pub version: i32,
-    pub lock_time: u32,
-    pub inputs: Vec<ExternalSigningPlanInputV1>,
-    pub outputs: Vec<ExternalSigningPlanOutputV1>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalSigningDerivationV1 {
@@ -222,7 +210,7 @@ pub struct ExternalSigningDerivationV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalSigningPlanInputV1 {
+pub struct ExternalSigningPlanInputV2 {
     pub index: usize,
     pub prev_hash: String,
     pub prev_index: u32,
@@ -230,38 +218,41 @@ pub struct ExternalSigningPlanInputV1 {
     pub sequence: u32,
     pub script_pubkey_hex: String,
     pub input_type: ExternalSigningInputTypeV1,
+    pub sighash_type: u32,
     pub derivation: Option<ExternalSigningDerivationV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalSigningPlanOutputV1 {
-    pub index: usize,
-    pub amount_sats: String,
-    pub script_pubkey_hex: String,
-    pub output_type: ExternalSigningOutputTypeV1,
-    pub address: Option<String>,
-    pub op_return_data_hex: Option<String>,
-    pub derivation: Option<ExternalSigningDerivationV1>,
+pub struct ExternalSigningPlanV2 {
+    pub schema_version: u16,
+    pub version: i32,
+    pub lock_time: u32,
+    pub inputs: Vec<ExternalSigningPlanInputV2>,
+    pub outputs: Vec<ExternalSigningPlanOutputV1>,
 }
 
-/// Typed failure from the capability-enforced preparation path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedExternalSigningRequestV2 {
+    pub schema_version: u16,
+    pub prepared_psbt_base64: String,
+    pub requirements: ExternalSigningRequirementsV2,
+    pub signing_plan: ExternalSigningPlanV2,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PrepareExternalSigningErrorV1 {
-    PreparationFailed {
-        message: String,
-    },
-    RequirementsInvalid {
-        message: String,
-    },
+pub enum PrepareExternalSigningErrorV2 {
+    PreparationFailed { message: String },
+    RequirementsInvalid { message: String },
     CapabilityRejected {
-        requirements: ExternalSigningRequirementsV1,
-        compatibility: ExternalSignerCompatibilityV1,
+        requirements: ExternalSigningRequirementsV2,
+        compatibility: ExternalSignerCompatibilityV2,
     },
 }
 
-impl fmt::Display for PrepareExternalSigningErrorV1 {
+impl fmt::Display for PrepareExternalSigningErrorV2 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PreparationFailed { message } => write!(f, "PSBT preparation failed: {message}"),
@@ -279,7 +270,19 @@ impl fmt::Display for PrepareExternalSigningErrorV1 {
     }
 }
 
-impl std::error::Error for PrepareExternalSigningErrorV1 {}
+impl std::error::Error for PrepareExternalSigningErrorV2 {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSigningPlanOutputV1 {
+    pub index: usize,
+    pub amount_sats: String,
+    pub script_pubkey_hex: String,
+    pub output_type: ExternalSigningOutputTypeV1,
+    pub address: Option<String>,
+    pub op_return_data_hex: Option<String>,
+    pub derivation: Option<ExternalSigningDerivationV1>,
+}
 
 fn input_script_pubkey(
     psbt: &Psbt,
@@ -355,47 +358,43 @@ pub fn classify_external_signing_output(script: &Script) -> ExternalSigningOutpu
     }
 }
 
-/// Derive signer requirements from the exact PSBT and requested signing scope.
-///
-/// `required_input_indices = None` means all inputs. Supplying a strict subset
-/// records both selective signing and the presence of external inputs.
-pub fn derive_external_signing_requirements(
+/// Derive V2 requirements while preserving the script-family/sighash
+/// correlation for every input Zinc asks the signer to sign.
+pub fn derive_external_signing_requirements_v2(
     psbt: &Psbt,
     required_input_indices: Option<&[usize]>,
-) -> Result<ExternalSigningRequirementsV1, RequirementsDerivationError> {
+) -> Result<ExternalSigningRequirementsV2, RequirementsDerivationError> {
     let input_count = psbt.inputs.len();
     let required_input_indices =
         required_input_indices.map_or_else(|| (0..input_count).collect(), <[usize]>::to_vec);
 
     let mut seen = BTreeSet::new();
-    for &input_index in &required_input_indices {
-        if input_index >= input_count {
+    let mut required_inputs = Vec::with_capacity(required_input_indices.len());
+    for &index in &required_input_indices {
+        if index >= input_count {
             return Err(RequirementsDerivationError::RequiredInputOutOfBounds {
-                input_index,
+                input_index: index,
                 input_count,
             });
         }
-        if !seen.insert(input_index) {
-            return Err(RequirementsDerivationError::DuplicateRequiredInput { input_index });
+        if !seen.insert(index) {
+            return Err(RequirementsDerivationError::DuplicateRequiredInput { input_index: index });
         }
-    }
-
-    let mut input_types = BTreeSet::new();
-    let mut sighash_types = BTreeSet::new();
-    for &input_index in &required_input_indices {
-        let script = input_script_pubkey(psbt, input_index)?;
-        let input_type = classify_input(psbt, input_index, script);
-        let default_sighash = match input_type {
+        let script = input_script_pubkey(psbt, index)?;
+        let input_type = classify_input(psbt, index, script);
+        let default_sighash_type = match input_type {
             ExternalSigningInputTypeV1::P2trKeyPath
             | ExternalSigningInputTypeV1::P2trScriptPath => 0,
             _ => 1,
         };
-        input_types.insert(input_type);
-        sighash_types.insert(
-            psbt.inputs[input_index]
-                .sighash_type
-                .map_or(default_sighash, bitcoin::psbt::PsbtSighashType::to_u32),
-        );
+        let sighash_type = psbt.inputs[index]
+            .sighash_type
+            .map_or(default_sighash_type, bitcoin::psbt::PsbtSighashType::to_u32);
+        required_inputs.push(ExternalSigningInputRequirementV2 {
+            index,
+            input_type,
+            sighash_type,
+        });
     }
 
     let output_types = psbt
@@ -406,12 +405,10 @@ pub fn derive_external_signing_requirements(
         .collect();
     let requires_selective_signing = required_input_indices.len() != input_count;
 
-    Ok(ExternalSigningRequirementsV1 {
-        schema_version: EXTERNAL_SIGNING_SCHEMA_V1,
-        required_input_indices,
-        input_types,
+    Ok(ExternalSigningRequirementsV2 {
+        schema_version: EXTERNAL_SIGNING_SCHEMA_V2,
+        required_inputs,
         output_types,
-        sighash_types,
         input_count,
         output_count: psbt.unsigned_tx.output.len(),
         has_external_inputs: requires_selective_signing,
@@ -482,15 +479,12 @@ fn single_push_op_return_data(script: &Script) -> Option<String> {
     }
 }
 
-/// Build a transport-neutral signing plan from the exact prepared PSBT.
-///
-/// Adapters whose SDK accepts PSBT can ignore this value. Adapters such as
-/// Trezor Connect can translate it into their vendor request without parsing or
-/// reinterpreting the transaction in the UI process.
-pub fn derive_external_signing_plan(
+/// Build a V2 transport-neutral plan whose inputs carry the exact effective
+/// sighash Zinc validated for their script family.
+pub fn derive_external_signing_plan_v2(
     psbt: &Psbt,
     network: Network,
-) -> Result<ExternalSigningPlanV1, RequirementsDerivationError> {
+) -> Result<ExternalSigningPlanV2, RequirementsDerivationError> {
     let mut inputs = Vec::with_capacity(psbt.inputs.len());
     for (index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
         let script = input_script_pubkey(psbt, index)?;
@@ -511,8 +505,15 @@ pub fn derive_external_signing_plan(
                 })?
                 .value
         };
-
-        inputs.push(ExternalSigningPlanInputV1 {
+        let default_sighash_type = match input_type {
+                ExternalSigningInputTypeV1::P2trKeyPath
+                | ExternalSigningInputTypeV1::P2trScriptPath => 0,
+                _ => 1,
+        };
+        let sighash_type = psbt.inputs[index]
+            .sighash_type
+            .map_or(default_sighash_type, bitcoin::psbt::PsbtSighashType::to_u32);
+        inputs.push(ExternalSigningPlanInputV2 {
             index,
             prev_hash: txin.previous_output.txid.to_string(),
             prev_index: txin.previous_output.vout,
@@ -520,35 +521,30 @@ pub fn derive_external_signing_plan(
             sequence: txin.sequence.to_consensus_u32(),
             script_pubkey_hex: hex::encode(script.as_bytes()),
             input_type,
+            sighash_type,
             derivation: input_derivation(psbt, index, input_type),
         });
     }
-
     let outputs = psbt
         .unsigned_tx
         .output
         .iter()
         .enumerate()
-        .map(|(index, txout)| {
-            let output_type = classify_external_signing_output(txout.script_pubkey.as_script());
-            ExternalSigningPlanOutputV1 {
-                index,
-                amount_sats: txout.value.to_sat().to_string(),
-                script_pubkey_hex: hex::encode(txout.script_pubkey.as_bytes()),
-                output_type,
-                address: Address::from_script(txout.script_pubkey.as_script(), network)
-                    .ok()
-                    .map(|address| address.to_string()),
-                op_return_data_hex: single_push_op_return_data(
-                    txout.script_pubkey.as_script(),
-                ),
-                derivation: output_derivation(&psbt.outputs[index]),
-            }
+        .map(|(index, txout)| ExternalSigningPlanOutputV1 {
+            index,
+            amount_sats: txout.value.to_sat().to_string(),
+            script_pubkey_hex: hex::encode(txout.script_pubkey.as_bytes()),
+            output_type: classify_external_signing_output(txout.script_pubkey.as_script()),
+            address: Address::from_script(txout.script_pubkey.as_script(), network)
+                .ok()
+                .map(|address| address.to_string()),
+            op_return_data_hex: single_push_op_return_data(txout.script_pubkey.as_script()),
+            derivation: output_derivation(&psbt.outputs[index]),
         })
         .collect();
 
-    Ok(ExternalSigningPlanV1 {
-        schema_version: EXTERNAL_SIGNING_SCHEMA_V1,
+    Ok(ExternalSigningPlanV2 {
+        schema_version: EXTERNAL_SIGNING_SCHEMA_V2,
         version: psbt.unsigned_tx.version.0,
         lock_time: psbt.unsigned_tx.lock_time.to_consensus_u32(),
         inputs,
@@ -556,30 +552,120 @@ pub fn derive_external_signing_plan(
     })
 }
 
-fn rejection(
-    code: CapabilityRejectionCodeV1,
+fn rejection_v2(
+    code: CapabilityRejectionCodeV2,
     capability: impl Into<String>,
     message: impl Into<String>,
-) -> CapabilityRejectionV1 {
-    CapabilityRejectionV1 {
+) -> CapabilityRejectionV2 {
+    CapabilityRejectionV2 {
         code,
         capability: capability.into(),
         message: message.into(),
+        input_index: None,
+        input_type: None,
+        required_sighash_type: None,
+        supported_sighash_types: None,
     }
 }
 
-fn append_limit_rejections(
-    requirements: &ExternalSigningRequirementsV1,
-    capabilities: &ExternalSignerCapabilitiesV1,
-    rejections: &mut Vec<CapabilityRejectionV1>,
-) {
+/// Compare exact per-input requirements with V2 signer policies.
+#[must_use]
+pub fn check_external_signer_compatibility_v2(
+    requirements: &ExternalSigningRequirementsV2,
+    capabilities: &ExternalSignerCapabilitiesV2,
+) -> ExternalSignerCompatibilityV2 {
+    let mut rejections = Vec::new();
+    if requirements.schema_version != EXTERNAL_SIGNING_SCHEMA_V2
+        || capabilities.schema_version != EXTERNAL_SIGNING_SCHEMA_V2
+    {
+        rejections.push(rejection_v2(
+            CapabilityRejectionCodeV2::SchemaVersionUnsupported,
+            "schema.external_signing_v2",
+            format!(
+                "{} cannot negotiate external-signing schema versions requirements={} capabilities={}",
+                capabilities.signer, requirements.schema_version, capabilities.schema_version
+            ),
+        ));
+        return ExternalSignerCompatibilityV2 { compatible: false, rejections };
+    }
+
+    for required in &requirements.required_inputs {
+        let Some(policy) = capabilities
+            .input_signing_policies
+            .iter()
+            .find(|policy| policy.input_type == required.input_type)
+        else {
+            let mut rejection = rejection_v2(
+                CapabilityRejectionCodeV2::CapabilityUnsupported,
+                required.input_type.capability_key(),
+                format!(
+                    "{} cannot sign {:?} input #{}",
+                    capabilities.signer, required.input_type, required.index
+                ),
+            );
+            rejection.input_index = Some(required.index);
+            rejection.input_type = Some(required.input_type);
+            rejections.push(rejection);
+            continue;
+        };
+
+        if !policy.supported_sighash_types.contains(&required.sighash_type) {
+            let mut rejection = rejection_v2(
+                CapabilityRejectionCodeV2::SighashUnsupportedForInput,
+                format!("input.{}.sighash", required.index),
+                format!(
+                    "{} cannot sign {:?} input #{} with sighash value {}",
+                    capabilities.signer,
+                    required.input_type,
+                    required.index,
+                    required.sighash_type
+                ),
+            );
+            rejection.input_index = Some(required.index);
+            rejection.input_type = Some(required.input_type);
+            rejection.required_sighash_type = Some(required.sighash_type);
+            rejection.supported_sighash_types = Some(policy.supported_sighash_types.clone());
+            rejections.push(rejection);
+        }
+    }
+
+    for output_type in requirements
+        .output_types
+        .difference(&capabilities.supported_output_types)
+    {
+        rejections.push(rejection_v2(
+            CapabilityRejectionCodeV2::TransactionNotRepresentable,
+            output_type.capability_key(),
+            format!(
+                "{} cannot represent {output_type:?} outputs without changing the transaction",
+                capabilities.signer
+            ),
+        ));
+    }
+    if requirements.has_external_inputs && !capabilities.supports_external_inputs {
+        rejections.push(rejection_v2(
+            CapabilityRejectionCodeV2::CapabilityUnsupported,
+            "transaction.external_inputs",
+            format!("{} cannot safely process external inputs", capabilities.signer),
+        ));
+    }
+    if requirements.requires_selective_signing && !capabilities.supports_selective_signing {
+        rejections.push(rejection_v2(
+            CapabilityRejectionCodeV2::CapabilityUnsupported,
+            "signing.selective_inputs",
+            format!(
+                "{} cannot restrict signing to the requested inputs",
+                capabilities.signer
+            ),
+        ));
+    }
     if capabilities
         .limits
         .max_inputs
         .is_some_and(|max| requirements.input_count > max)
     {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::DeviceLimitExceeded,
+        rejections.push(rejection_v2(
+            CapabilityRejectionCodeV2::DeviceLimitExceeded,
             "limits.inputs",
             format!(
                 "{} supports at most {} inputs; transaction has {}",
@@ -594,8 +680,8 @@ fn append_limit_rejections(
         .max_outputs
         .is_some_and(|max| requirements.output_count > max)
     {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::DeviceLimitExceeded,
+        rejections.push(rejection_v2(
+            CapabilityRejectionCodeV2::DeviceLimitExceeded,
             "limits.outputs",
             format!(
                 "{} supports at most {} outputs; transaction has {}",
@@ -605,107 +691,9 @@ fn append_limit_rejections(
             ),
         ));
     }
-}
 
-/// Compare requirements and effective signer capabilities without device I/O.
-///
-/// The result is deterministic and collects every incompatibility so a UI can
-/// explain all blockers during preflight. The same function should be called
-/// again immediately before dispatching the PSBT to the signer.
-#[must_use]
-pub fn check_external_signer_compatibility(
-    requirements: &ExternalSigningRequirementsV1,
-    capabilities: &ExternalSignerCapabilitiesV1,
-) -> ExternalSignerCompatibilityV1 {
-    let mut rejections = Vec::new();
-
-    if requirements.schema_version != EXTERNAL_SIGNING_SCHEMA_V1
-        || capabilities.schema_version != EXTERNAL_SIGNING_SCHEMA_V1
-    {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::SchemaVersionUnsupported,
-            "schema.external_signing_v1",
-            format!(
-                "{} cannot negotiate external-signing schema versions requirements={} capabilities={}",
-                capabilities.signer, requirements.schema_version, capabilities.schema_version
-            ),
-        ));
-        return ExternalSignerCompatibilityV1 {
-            compatible: false,
-            rejections,
-        };
-    }
-
-    for input_type in requirements
-        .input_types
-        .difference(&capabilities.supported_input_types)
-    {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::CapabilityUnsupported,
-            input_type.capability_key(),
-            format!("{} cannot sign {input_type:?} inputs", capabilities.signer),
-        ));
-    }
-    for output_type in requirements
-        .output_types
-        .difference(&capabilities.supported_output_types)
-    {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::CapabilityUnsupported,
-            output_type.capability_key(),
-            format!(
-                "{} cannot represent {output_type:?} outputs without changing the transaction",
-                capabilities.signer
-            ),
-        ));
-    }
-    for sighash in requirements
-        .sighash_types
-        .difference(&capabilities.supported_sighash_types)
-    {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::CapabilityUnsupported,
-            format!("sighash.{sighash}"),
-            format!(
-                "{} does not support sighash value {sighash}",
-                capabilities.signer
-            ),
-        ));
-    }
-
-    if requirements.has_external_inputs && !capabilities.supports_external_inputs {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::CapabilityUnsupported,
-            "transaction.external_inputs",
-            format!(
-                "{} cannot safely process external inputs",
-                capabilities.signer
-            ),
-        ));
-    }
-    if requirements.requires_selective_signing && !capabilities.supports_selective_signing {
-        rejections.push(rejection(
-            CapabilityRejectionCodeV1::CapabilityUnsupported,
-            "signing.selective_inputs",
-            format!(
-                "{} cannot restrict signing to the requested inputs",
-                capabilities.signer
-            ),
-        ));
-    }
-    append_limit_rejections(requirements, capabilities, &mut rejections);
-
-    ExternalSignerCompatibilityV1 {
+    ExternalSignerCompatibilityV2 {
         compatible: rejections.is_empty(),
         rejections,
     }
-}
-
-/// Return the first deterministic incompatibility, if any.
-pub fn require_external_signer_capabilities(
-    requirements: &ExternalSigningRequirementsV1,
-    capabilities: &ExternalSignerCapabilitiesV1,
-) -> Result<(), CapabilityRejectionV1> {
-    let report = check_external_signer_compatibility(requirements, capabilities);
-    report.rejections.into_iter().next().map_or(Ok(()), Err)
 }

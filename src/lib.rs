@@ -73,15 +73,14 @@ pub use builder::{
 };
 pub use error::{ZincError, ZincResult};
 pub use external_signing::{
-    check_external_signer_compatibility, classify_external_signing_output,
-    derive_external_signing_plan, derive_external_signing_requirements,
-    require_external_signer_capabilities,
-    CapabilityRejectionCodeV1, CapabilityRejectionV1, ExternalSignerCapabilitiesV1,
-    ExternalSignerCompatibilityV1, ExternalSignerLimitsV1, ExternalSigningInputTypeV1,
-    ExternalSigningOutputTypeV1, ExternalSigningRequirementsV1, ExternalSigningDerivationV1,
-    ExternalSigningPlanInputV1, ExternalSigningPlanOutputV1, ExternalSigningPlanV1,
-    PrepareExternalSigningErrorV1, PreparedExternalSigningRequestV1,
-    RequirementsDerivationError, EXTERNAL_SIGNING_SCHEMA_V1,
+    check_external_signer_compatibility_v2, classify_external_signing_output,
+    derive_external_signing_plan_v2, derive_external_signing_requirements_v2,
+    CapabilityRejectionCodeV2, CapabilityRejectionV2, ExternalSignerCapabilitiesV2,
+    ExternalSignerCompatibilityV2, ExternalSignerInputPolicyV2, ExternalSignerLimitsV1,
+    ExternalSigningDerivationV1, ExternalSigningInputRequirementV2, ExternalSigningInputTypeV1,
+    ExternalSigningOutputTypeV1, ExternalSigningPlanInputV2, ExternalSigningPlanOutputV1,
+    ExternalSigningPlanV2, ExternalSigningRequirementsV2, PrepareExternalSigningErrorV2,
+    PreparedExternalSigningRequestV2, RequirementsDerivationError, EXTERNAL_SIGNING_SCHEMA_V2,
 };
 pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
@@ -3128,7 +3127,7 @@ impl ZincWasmWallet {
                         .map_err(|error| JsValue::from_str(&format!("Invalid options: {error}")))?,
                 )
             };
-        let capabilities: crate::external_signing::ExternalSignerCapabilitiesV1 =
+        let capabilities: crate::external_signing::ExternalSignerCapabilitiesV2 =
             serde_wasm_bindgen::from_value(capabilities).map_err(|error| {
                 JsValue::from_str(&format!("Invalid signer capabilities: {error}"))
             })?;

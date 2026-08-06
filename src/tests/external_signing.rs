@@ -392,34 +392,34 @@ mod tests {
     #[test]
     fn capability_enforced_preparation_returns_psbt_and_exact_requirements() {
         use crate::external_signing::{
-            ExternalSignerCapabilitiesV1, ExternalSigningInputTypeV1, ExternalSigningOutputTypeV1,
+            ExternalSignerCapabilitiesV2, ExternalSignerInputPolicyV2,
+            ExternalSigningInputRequirementV2, ExternalSigningInputTypeV1,
+            ExternalSigningOutputTypeV1,
         };
 
         let (wallet, unsigned) = setup();
-        let mut capabilities = ExternalSignerCapabilitiesV1::deny_all("test:taproot-signer");
-        capabilities
-            .supported_input_types
-            .insert(ExternalSigningInputTypeV1::P2trKeyPath);
+        let mut capabilities = ExternalSignerCapabilitiesV2::deny_all("test:taproot-signer");
+        capabilities.input_signing_policies = vec![ExternalSignerInputPolicyV2 {
+            input_type: ExternalSigningInputTypeV1::P2trKeyPath,
+            supported_sighash_types: [0].into_iter().collect(),
+            default_sighash_type: 0,
+        }];
         capabilities
             .supported_output_types
             .insert(ExternalSigningOutputTypeV1::P2tr);
-        capabilities.supported_sighash_types.insert(0);
 
         let request = wallet
             .prepare_external_signing_request(&unsigned, None, &capabilities)
             .expect("compatible signer");
 
         assert!(!request.prepared_psbt_base64.is_empty());
-        assert_eq!(request.requirements.required_input_indices, vec![0]);
         assert_eq!(
-            request.requirements.input_types,
-            [ExternalSigningInputTypeV1::P2trKeyPath]
-                .into_iter()
-                .collect()
-        );
-        assert_eq!(
-            request.requirements.sighash_types,
-            [0].into_iter().collect()
+            request.requirements.required_inputs,
+            vec![ExternalSigningInputRequirementV2 {
+                index: 0,
+                input_type: ExternalSigningInputTypeV1::P2trKeyPath,
+                sighash_type: 0,
+            }]
         );
         assert_eq!(request.signing_plan.inputs.len(), 1);
         assert_eq!(request.signing_plan.outputs.len(), 1);
@@ -427,6 +427,7 @@ mod tests {
             request.signing_plan.inputs[0].input_type,
             ExternalSigningInputTypeV1::P2trKeyPath
         );
+        assert_eq!(request.signing_plan.inputs[0].sighash_type, 0);
         let input_origin = request.signing_plan.inputs[0]
             .derivation
             .as_ref()
@@ -470,23 +471,23 @@ mod tests {
     #[test]
     fn capability_enforced_preparation_returns_typed_rejection() {
         use crate::external_signing::{
-            ExternalSignerCapabilitiesV1, PrepareExternalSigningErrorV1,
+            ExternalSignerCapabilitiesV2, PrepareExternalSigningErrorV2,
         };
 
         let (wallet, unsigned) = setup();
-        let capabilities = ExternalSignerCapabilitiesV1::deny_all("test:deny-all");
+        let capabilities = ExternalSignerCapabilitiesV2::deny_all("test:deny-all");
         let error = wallet
             .prepare_external_signing_request(&unsigned, None, &capabilities)
             .unwrap_err();
 
-        let PrepareExternalSigningErrorV1::CapabilityRejected {
+        let PrepareExternalSigningErrorV2::CapabilityRejected {
             requirements,
             compatibility,
         } = error
         else {
             panic!("expected typed capability rejection");
         };
-        assert_eq!(requirements.required_input_indices, vec![0]);
+        assert_eq!(requirements.required_inputs[0].index, 0);
         assert_eq!(
             compatibility.rejections[0].capability,
             "input.p2tr_key_path"
