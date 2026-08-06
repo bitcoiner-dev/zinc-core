@@ -8,6 +8,7 @@
 
 use bitcoin::psbt::Psbt;
 use bitcoin::script::{Instruction, Script};
+use bitcoin::{Address, Network};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -196,6 +197,52 @@ pub struct PreparedExternalSigningRequestV1 {
     pub schema_version: u16,
     pub prepared_psbt_base64: String,
     pub requirements: ExternalSigningRequirementsV1,
+    pub signing_plan: ExternalSigningPlanV1,
+}
+
+/// Vendor-neutral transaction facts an adapter needs to invoke a signer which
+/// does not consume PSBTs directly. Values are copied from the exact prepared
+/// PSBT which already passed Zinc's audit and capability checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSigningPlanV1 {
+    pub schema_version: u16,
+    pub version: i32,
+    pub lock_time: u32,
+    pub inputs: Vec<ExternalSigningPlanInputV1>,
+    pub outputs: Vec<ExternalSigningPlanOutputV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSigningDerivationV1 {
+    pub master_fingerprint_hex: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSigningPlanInputV1 {
+    pub index: usize,
+    pub prev_hash: String,
+    pub prev_index: u32,
+    pub amount_sats: String,
+    pub sequence: u32,
+    pub script_pubkey_hex: String,
+    pub input_type: ExternalSigningInputTypeV1,
+    pub derivation: Option<ExternalSigningDerivationV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSigningPlanOutputV1 {
+    pub index: usize,
+    pub amount_sats: String,
+    pub script_pubkey_hex: String,
+    pub output_type: ExternalSigningOutputTypeV1,
+    pub address: Option<String>,
+    pub op_return_data_hex: Option<String>,
+    pub derivation: Option<ExternalSigningDerivationV1>,
 }
 
 /// Typed failure from the capability-enforced preparation path.
@@ -369,6 +416,143 @@ pub fn derive_external_signing_requirements(
         output_count: psbt.unsigned_tx.output.len(),
         has_external_inputs: requires_selective_signing,
         requires_selective_signing,
+    })
+}
+
+fn key_source_to_derivation(
+    key_source: &bitcoin::bip32::KeySource,
+) -> ExternalSigningDerivationV1 {
+    let rendered_path = key_source.1.to_string();
+    ExternalSigningDerivationV1 {
+        master_fingerprint_hex: key_source.0.to_string().to_lowercase(),
+        path: if rendered_path == "m" || rendered_path.starts_with("m/") {
+            rendered_path
+        } else {
+            format!("m/{rendered_path}")
+        },
+    }
+}
+
+fn input_derivation(
+    psbt: &Psbt,
+    input_index: usize,
+    input_type: ExternalSigningInputTypeV1,
+) -> Option<ExternalSigningDerivationV1> {
+    let input = &psbt.inputs[input_index];
+    match input_type {
+        ExternalSigningInputTypeV1::P2trKeyPath => input
+            .tap_key_origins
+            .values()
+            .find(|(leaf_hashes, _)| leaf_hashes.is_empty())
+            .map(|(_, key_source)| key_source_to_derivation(key_source)),
+        _ => input
+            .bip32_derivation
+            .values()
+            .next()
+            .map(key_source_to_derivation),
+    }
+}
+
+fn output_derivation(
+    output: &bitcoin::psbt::Output,
+) -> Option<ExternalSigningDerivationV1> {
+    output
+        .tap_key_origins
+        .values()
+        .find(|(leaf_hashes, _)| leaf_hashes.is_empty())
+        .map(|(_, key_source)| key_source_to_derivation(key_source))
+        .or_else(|| {
+            output
+                .bip32_derivation
+                .values()
+                .next()
+                .map(key_source_to_derivation)
+        })
+}
+
+fn single_push_op_return_data(script: &Script) -> Option<String> {
+    if !is_single_push_op_return(script) {
+        return None;
+    }
+    let mut instructions = script.instructions();
+    let _op_return = instructions.next()?;
+    match instructions.next()? {
+        Ok(Instruction::PushBytes(bytes)) => Some(hex::encode(bytes.as_bytes())),
+        _ => None,
+    }
+}
+
+/// Build a transport-neutral signing plan from the exact prepared PSBT.
+///
+/// Adapters whose SDK accepts PSBT can ignore this value. Adapters such as
+/// Trezor Connect can translate it into their vendor request without parsing or
+/// reinterpreting the transaction in the UI process.
+pub fn derive_external_signing_plan(
+    psbt: &Psbt,
+    network: Network,
+) -> Result<ExternalSigningPlanV1, RequirementsDerivationError> {
+    let mut inputs = Vec::with_capacity(psbt.inputs.len());
+    for (index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+        let script = input_script_pubkey(psbt, index)?;
+        let input_type = classify_input(psbt, index, script);
+        let amount = if let Some(txout) = &psbt.inputs[index].witness_utxo {
+            txout.value
+        } else {
+            let previous_tx = psbt.inputs[index]
+                .non_witness_utxo
+                .as_ref()
+                .ok_or(RequirementsDerivationError::MissingPrevout { input_index: index })?;
+            previous_tx
+                .output
+                .get(txin.previous_output.vout as usize)
+                .ok_or(RequirementsDerivationError::MissingPreviousOutput {
+                    input_index: index,
+                    vout: txin.previous_output.vout,
+                })?
+                .value
+        };
+
+        inputs.push(ExternalSigningPlanInputV1 {
+            index,
+            prev_hash: txin.previous_output.txid.to_string(),
+            prev_index: txin.previous_output.vout,
+            amount_sats: amount.to_sat().to_string(),
+            sequence: txin.sequence.to_consensus_u32(),
+            script_pubkey_hex: hex::encode(script.as_bytes()),
+            input_type,
+            derivation: input_derivation(psbt, index, input_type),
+        });
+    }
+
+    let outputs = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .map(|(index, txout)| {
+            let output_type = classify_external_signing_output(txout.script_pubkey.as_script());
+            ExternalSigningPlanOutputV1 {
+                index,
+                amount_sats: txout.value.to_sat().to_string(),
+                script_pubkey_hex: hex::encode(txout.script_pubkey.as_bytes()),
+                output_type,
+                address: Address::from_script(txout.script_pubkey.as_script(), network)
+                    .ok()
+                    .map(|address| address.to_string()),
+                op_return_data_hex: single_push_op_return_data(
+                    txout.script_pubkey.as_script(),
+                ),
+                derivation: output_derivation(&psbt.outputs[index]),
+            }
+        })
+        .collect();
+
+    Ok(ExternalSigningPlanV1 {
+        schema_version: EXTERNAL_SIGNING_SCHEMA_V1,
+        version: psbt.unsigned_tx.version.0,
+        lock_time: psbt.unsigned_tx.lock_time.to_consensus_u32(),
+        inputs,
+        outputs,
     })
 }
 

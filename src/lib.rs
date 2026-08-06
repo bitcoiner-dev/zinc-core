@@ -74,11 +74,14 @@ pub use builder::{
 pub use error::{ZincError, ZincResult};
 pub use external_signing::{
     check_external_signer_compatibility, classify_external_signing_output,
-    derive_external_signing_requirements, require_external_signer_capabilities,
+    derive_external_signing_plan, derive_external_signing_requirements,
+    require_external_signer_capabilities,
     CapabilityRejectionCodeV1, CapabilityRejectionV1, ExternalSignerCapabilitiesV1,
     ExternalSignerCompatibilityV1, ExternalSignerLimitsV1, ExternalSigningInputTypeV1,
-    ExternalSigningOutputTypeV1, ExternalSigningRequirementsV1, PrepareExternalSigningErrorV1,
-    PreparedExternalSigningRequestV1, RequirementsDerivationError, EXTERNAL_SIGNING_SCHEMA_V1,
+    ExternalSigningOutputTypeV1, ExternalSigningRequirementsV1, ExternalSigningDerivationV1,
+    ExternalSigningPlanInputV1, ExternalSigningPlanOutputV1, ExternalSigningPlanV1,
+    PrepareExternalSigningErrorV1, PreparedExternalSigningRequestV1,
+    RequirementsDerivationError, EXTERNAL_SIGNING_SCHEMA_V1,
 };
 pub use history::TxItem;
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
@@ -3145,6 +3148,28 @@ impl ZincWasmWallet {
             }
             Err(error) => Err(JsValue::from_str(&format!(
                 "Wallet busy (prepareExternalSigningRequest): {error}"
+            ))),
+        }
+    }
+
+    /// Merge the final script data from a raw transaction signed externally.
+    #[wasm_bindgen(js_name = applyExternalSignedTransaction)]
+    pub fn apply_external_signed_transaction(
+        &self,
+        prepared_psbt_base64: &str,
+        signed_transaction_hex: &str,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .apply_external_signed_transaction(
+                    prepared_psbt_base64,
+                    signed_transaction_hex,
+                )
+                .map_err(JsValue::from),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (applyExternalSignedTransaction): {error}"
             ))),
         }
     }
