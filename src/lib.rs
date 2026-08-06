@@ -323,6 +323,7 @@ async fn probe_single_account(
     taproot_xpub: &str,
     payment_xpub: Option<&String>,
     path_type: &str,
+    include_empty: bool,
 ) -> Option<AccountDiscoveryReport> {
     // 1. Build descriptors for this specific index
     let (t_ext, t_int) = if path_type == "legacy" {
@@ -370,10 +371,6 @@ async fn probe_single_account(
     };
 
     // 2. Initialize a temporary wallet to derive addresses
-    if path_type == "standard" && index > 0 {
-        return None;
-    }
-
     let builder = WalletBuilder::new(network);
     let wallet = match builder.build_hardware(
         fingerprint_hex,
@@ -422,8 +419,9 @@ async fn probe_single_account(
         }
     }
 
-    // Index 0 is always returned to ensure at least one account exists
-    if has_activity || index == 0 {
+    // Bulk legacy discovery always includes index 0; exact account probing
+    // includes the requested account even when it is still empty.
+    if has_activity || index == 0 || include_empty {
         Some(AccountDiscoveryReport {
             index,
             path_type: path_type.to_string(),
@@ -1695,18 +1693,27 @@ impl ZincWasmWallet {
 
                     batch_futures.push(async move {
                         // 1. Probe Standard Path (m/86'/0'/idx' and m/84'/0'/idx')
-                        let standard_report = probe_single_account(
-                            &client,
-                            &esplora,
-                            &ord,
-                            network_enum,
-                            &fp,
-                            idx,
-                            &s_t_xpub,
-                            Some(&s_p_xpub),
-                            "standard",
-                        )
-                        .await;
+                        // The bulk compatibility API receives only the
+                        // account-0 standard xpub, so it cannot derive other
+                        // hardened accounts. Exact account-N probes use the
+                        // dedicated API below with an xpub exported at N.
+                        let standard_report = if idx == 0 {
+                            probe_single_account(
+                                &client,
+                                &esplora,
+                                &ord,
+                                network_enum,
+                                &fp,
+                                idx,
+                                &s_t_xpub,
+                                Some(&s_p_xpub),
+                                "standard",
+                                false,
+                            )
+                            .await
+                        } else {
+                            None
+                        };
 
                         // 2. Probe Legacy Path (m/86'/0'/0'/0/idx and m/84'/0'/0'/0/idx)
                         let legacy_report = probe_single_account(
@@ -1719,6 +1726,7 @@ impl ZincWasmWallet {
                             &l_t_xpub,
                             Some(&l_p_xpub),
                             "legacy",
+                            false,
                         )
                         .await;
 
@@ -1738,6 +1746,48 @@ impl ZincWasmWallet {
             }
 
             Ok(serde_wasm_bindgen::to_value(&reports)?)
+        }))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = probeHardwareAccount)]
+    /// Probe one standard BIP84/BIP86 hardened account. The supplied xpubs
+    /// must have been exported at the exact requested account index.
+    pub fn probe_hardware_account(
+        network: String,
+        fingerprint_hex: String,
+        esplora_url: String,
+        ord_url: String,
+        account_index: u32,
+        taproot_xpub: String,
+        payment_xpub: String,
+    ) -> Result<js_sys::Promise, JsValue> {
+        let network_enum = match network.as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "signet" => Network::Signet,
+            "testnet" => Network::Testnet,
+            "regtest" => Network::Regtest,
+            _ => return Err(JsValue::from_str("Invalid network")),
+        };
+
+        Ok(wasm_bindgen_futures::future_to_promise(async move {
+            let client = reqwest::Client::new();
+            let report = probe_single_account(
+                &client,
+                &esplora_url,
+                &ord_url,
+                network_enum,
+                &fingerprint_hex,
+                account_index,
+                &taproot_xpub,
+                Some(&payment_xpub),
+                "standard",
+                true,
+            )
+            .await
+            .ok_or_else(|| JsValue::from_str("Unable to build hardware account descriptors"))?;
+
+            Ok(serde_wasm_bindgen::to_value(&report)?)
         }))
     }
 
