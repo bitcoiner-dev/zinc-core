@@ -58,8 +58,14 @@ pub struct SignOptions {
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Strongly-typed 64-byte seed material used by canonical constructors.
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Seed64([u8; 64]);
+
+impl std::fmt::Debug for Seed64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Seed64([REDACTED])")
+    }
+}
 
 impl Seed64 {
     /// Create a seed wrapper from a 64-byte array.
@@ -364,7 +370,7 @@ pub fn now_unix() -> u64 {
 }
 
 /// Represents the cryptographic identity of the wallet.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum WalletKind {
     /// Full signing capability with master private key.
     Seed {
@@ -382,6 +388,28 @@ pub enum WalletKind {
     },
     /// Read-only capability bound to a single tracked address.
     WatchAddress(Address),
+}
+
+impl std::fmt::Debug for WalletKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Seed { .. } => f
+                .debug_struct("Seed")
+                .field("master_xprv", &"[REDACTED]")
+                .finish(),
+            Self::Hardware {
+                fingerprint,
+                taproot_external,
+                payment_external,
+            } => f
+                .debug_struct("Hardware")
+                .field("fingerprint", fingerprint)
+                .field("taproot_external", taproot_external)
+                .field("payment_external", payment_external)
+                .finish(),
+            Self::WatchAddress(addr) => f.debug_tuple("WatchAddress").field(addr).finish(),
+        }
+    }
 }
 
 impl WalletKind {
@@ -5577,6 +5605,22 @@ pub struct ZincPersistence {
 mod tests {
     use super::*;
     use bitcoin::Network;
+
+    #[test]
+    fn test_seed64_debug_redacts_bytes() {
+        let seed = Seed64::from_array([0x42; 64]);
+        assert_eq!(format!("{seed:?}"), "Seed64([REDACTED])");
+    }
+
+    #[test]
+    fn test_wallet_kind_debug_redacts_master_xprv() {
+        use bdk_wallet::bitcoin::bip32::Xpriv;
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
+        let kind = WalletKind::Seed { master_xprv };
+        assert!(format!("{kind:?}").contains("master_xprv: \"[REDACTED]\""));
+    }
 
     #[test]
     fn test_builder_basic() {

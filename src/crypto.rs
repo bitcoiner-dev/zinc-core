@@ -132,9 +132,9 @@ pub fn encrypt_seed_with_key(seed: &[u8], key: &[u8; 32]) -> Result<EncryptedWal
 ///
 /// The caller stores this in the platform hardware keystore; it is the only copy, so losing
 /// the keystore entry means the vault can only be recovered by re-importing the mnemonic.
-pub fn generate_vault_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
+pub fn generate_vault_key() -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *key);
     key
 }
 
