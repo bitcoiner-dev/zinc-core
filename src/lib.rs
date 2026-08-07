@@ -142,12 +142,34 @@ use bdk_wallet::KeychainKind;
 
 #[doc(hidden)]
 /// Mnemonic material returned by wallet generation/decryption helpers.
-#[derive(zeroize::Zeroize)]
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct WalletResult {
     /// Full normalized BIP-39 mnemonic phrase.
     pub phrase: String,
     /// Phrase split into individual words.
     pub words: Vec<String>,
+}
+
+fn wallet_result_from_mnemonic(mnemonic: &ZincMnemonic) -> WalletResult {
+    let mut phrase = zeroize::Zeroizing::new(mnemonic.phrase());
+    let mut words = zeroize::Zeroizing::new(mnemonic.words());
+    WalletResult {
+        phrase: std::mem::take(&mut *phrase),
+        words: std::mem::take(&mut *words),
+    }
+}
+
+fn decrypted_utf8(
+    mut plaintext: zeroize::Zeroizing<Vec<u8>>,
+) -> Result<zeroize::Zeroizing<String>, ZincError> {
+    match String::from_utf8(std::mem::take(&mut *plaintext)) {
+        Ok(value) => Ok(zeroize::Zeroizing::new(value)),
+        Err(error) => {
+            let message = format!("Invalid UTF-8: {}", error.utf8_error());
+            let _invalid_bytes = zeroize::Zeroizing::new(error.into_bytes());
+            Err(ZincError::SerializationError(message))
+        }
+    }
 }
 
 impl std::fmt::Debug for WalletResult {
@@ -163,10 +185,7 @@ impl std::fmt::Debug for WalletResult {
 /// Generate a new mnemonic-backed wallet result for native Rust callers.
 pub fn generate_wallet_internal(word_count: u8) -> Result<WalletResult, ZincError> {
     let mnemonic = ZincMnemonic::generate(word_count)?;
-    Ok(WalletResult {
-        phrase: mnemonic.phrase(),
-        words: mnemonic.words(),
-    })
+    Ok(wallet_result_from_mnemonic(&mnemonic))
 }
 
 #[doc(hidden)]
@@ -197,7 +216,8 @@ pub fn derive_address_internal(phrase: &str, network: Network) -> Result<String,
 /// Encrypt a mnemonic phrase with a password and return serialized JSON payload.
 pub fn encrypt_wallet_internal(mnemonic: &str, password: &str) -> Result<String, ZincError> {
     let m = ZincMnemonic::parse(mnemonic)?;
-    let encrypted = crypto::encrypt_seed(m.phrase().as_bytes(), password)?;
+    let phrase = zeroize::Zeroizing::new(m.phrase());
+    let encrypted = crypto::encrypt_seed(phrase.as_bytes(), password)?;
     serde_json::to_string(&encrypted).map_err(|e| ZincError::SerializationError(e.to_string()))
 }
 
@@ -210,19 +230,10 @@ pub fn decrypt_wallet_internal(
     let encrypted: crypto::EncryptedWallet = serde_json::from_str(encrypted_json)
         .map_err(|e| ZincError::SerializationError(e.to_string()))?;
 
-    let plaintext = crypto::decrypt_seed(&encrypted, password)?;
-
-    let phrase = zeroize::Zeroizing::new(
-        String::from_utf8(plaintext.to_vec())
-            .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {e}")))?,
-    );
+    let phrase = decrypted_utf8(crypto::decrypt_seed(&encrypted, password)?)?;
 
     let mnemonic = ZincMnemonic::parse(&phrase)?;
-
-    Ok(WalletResult {
-        phrase: mnemonic.phrase(),
-        words: mnemonic.words(),
-    })
+    Ok(wallet_result_from_mnemonic(&mnemonic))
 }
 
 #[doc(hidden)]
@@ -234,39 +245,48 @@ pub fn encrypt_secret_internal(secret: &str, password: &str) -> Result<String, Z
 
 #[doc(hidden)]
 /// Decrypt an encrypted secret JSON payload and recover UTF-8 plaintext.
-pub fn decrypt_secret_internal(encrypted_json: &str, password: &str) -> Result<String, ZincError> {
+pub fn decrypt_secret_internal(
+    encrypted_json: &str,
+    password: &str,
+) -> Result<zeroize::Zeroizing<String>, ZincError> {
     let encrypted: crypto::EncryptedWallet = serde_json::from_str(encrypted_json)
         .map_err(|e| ZincError::SerializationError(e.to_string()))?;
-    let plaintext = crypto::decrypt_seed(&encrypted, password)?;
-    String::from_utf8(plaintext.to_vec())
-        .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {e}")))
+    decrypted_utf8(crypto::decrypt_seed(&encrypted, password)?)
 }
 
 /// Parse a 64-char hex string into the 32-byte data encryption key used by version-3 vaults.
-fn parse_vault_key_hex(key_hex: &str) -> Result<[u8; 32], ZincError> {
-    let bytes = hex::decode(key_hex.trim())
+fn parse_vault_key_hex(key_hex: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, ZincError> {
+    let key_hex = key_hex.trim();
+    if key_hex.len() != 64 {
+        return Err(ZincError::EncryptionError(format!(
+            "vault key must be 32 bytes (64 hex chars), got {} hex chars",
+            key_hex.len()
+        )));
+    }
+
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(key_hex, &mut *key)
         .map_err(|e| ZincError::EncryptionError(format!("vault key is not valid hex: {e}")))?;
-    let key: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-        ZincError::EncryptionError(format!(
-            "vault key must be 32 bytes (64 hex chars), got {} bytes",
-            v.len()
-        ))
-    })?;
     Ok(key)
 }
 
 #[doc(hidden)]
 /// Generate a fresh random 256-bit vault data encryption key, hex-encoded for keystore storage.
-pub fn generate_vault_key_internal() -> String {
-    hex::encode(crypto::generate_vault_key())
+pub fn generate_vault_key_internal() -> zeroize::Zeroizing<String> {
+    let key = crypto::generate_vault_key();
+    zeroize::Zeroizing::new(hex::encode(&key[..]))
 }
 
 #[doc(hidden)]
 /// Encrypt a mnemonic under a hardware-keystore data encryption key (hex), producing a v3 vault.
-pub fn encrypt_wallet_with_key_internal(mnemonic: &str, key_hex: &str) -> Result<String, ZincError> {
+pub fn encrypt_wallet_with_key_internal(
+    mnemonic: &str,
+    key_hex: &str,
+) -> Result<String, ZincError> {
     let key = parse_vault_key_hex(key_hex)?;
     let m = ZincMnemonic::parse(mnemonic)?;
-    let encrypted = crypto::encrypt_seed_with_key(m.phrase().as_bytes(), &key)?;
+    let phrase = zeroize::Zeroizing::new(m.phrase());
+    let encrypted = crypto::encrypt_seed_with_key(phrase.as_bytes(), &key)?;
     serde_json::to_string(&encrypted).map_err(|e| ZincError::SerializationError(e.to_string()))
 }
 
@@ -279,18 +299,10 @@ pub fn decrypt_wallet_with_key_internal(
     let key = parse_vault_key_hex(key_hex)?;
     let encrypted: crypto::EncryptedWallet = serde_json::from_str(encrypted_json)
         .map_err(|e| ZincError::SerializationError(e.to_string()))?;
-    let plaintext = crypto::decrypt_seed_with_key(&encrypted, &key)?;
-
-    let phrase = zeroize::Zeroizing::new(
-        String::from_utf8(plaintext.to_vec())
-            .map_err(|e| ZincError::SerializationError(format!("Invalid UTF-8: {e}")))?,
-    );
+    let phrase = decrypted_utf8(crypto::decrypt_seed_with_key(&encrypted, &key)?)?;
 
     let mnemonic = ZincMnemonic::parse(&phrase)?;
-    Ok(WalletResult {
-        phrase: mnemonic.phrase(),
-        words: mnemonic.words(),
-    })
+    Ok(wallet_result_from_mnemonic(&mnemonic))
 }
 
 // ============================================================================
@@ -698,7 +710,7 @@ pub fn encrypt_secret(secret: &str, password: &str) -> Result<String, JsValue> {
     encrypt_secret_internal(secret, password).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 /// WASM response payload for mnemonic decryption.
 pub struct DecryptResponse {
     /// Whether decryption succeeded.
@@ -707,6 +719,14 @@ pub struct DecryptResponse {
     pub phrase: String,
     /// Decrypted phrase split into words.
     pub words: Vec<String>,
+}
+
+#[derive(Serialize)]
+/// Borrow the zeroizing result while copying the required response into JavaScript-owned memory.
+struct BorrowedDecryptResponse<'a> {
+    success: bool,
+    phrase: &'a str,
+    words: &'a [String],
 }
 
 /// Decrypt an encrypted wallet blob.
@@ -732,10 +752,10 @@ pub fn decrypt_wallet(encrypted_json: &str, password: &str) -> Result<JsValue, J
         }
     };
 
-    let response = DecryptResponse {
+    let response = BorrowedDecryptResponse {
         success: true,
-        phrase: result.phrase,
-        words: result.words,
+        phrase: &result.phrase,
+        words: &result.words,
     };
 
     zinc_log_debug!(target: LOG_TARGET_WASM, "Serializing response...");
@@ -752,8 +772,19 @@ pub fn decrypt_wallet(encrypted_json: &str, password: &str) -> Result<JsValue, J
 }
 
 /// Decrypt encrypted secret material and return plaintext UTF-8.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-pub fn decrypt_secret(encrypted_json: &str, password: &str) -> Result<String, JsValue> {
+pub fn decrypt_secret(encrypted_json: &str, password: &str) -> Result<js_sys::JsString, JsValue> {
+    let secret = decrypt_secret_internal(encrypted_json, password)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(js_sys::JsString::from(secret.as_str()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn decrypt_secret(
+    encrypted_json: &str,
+    password: &str,
+) -> Result<zeroize::Zeroizing<String>, JsValue> {
     decrypt_secret_internal(encrypted_json, password).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
@@ -762,8 +793,17 @@ pub fn decrypt_secret(encrypted_json: &str, password: &str) -> Result<String, Js
 /// The caller stores the returned hex in the platform hardware keystore (iOS keychain/Secure
 /// Enclave, Android Keystore) and passes it back to `encrypt_wallet_with_key`. It is never
 /// derived from the PIN, so a leaked vault blob cannot be brute-forced offline.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-pub fn generate_vault_key() -> String {
+pub fn generate_vault_key() -> js_sys::JsString {
+    let key = generate_vault_key_internal();
+    // Copy directly into a JavaScript-owned string while `key` remains zeroizing. Returning a
+    // Rust `String` would transfer its allocation to wasm-bindgen, which frees it without wiping.
+    js_sys::JsString::from(key.as_str())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn generate_vault_key() -> zeroize::Zeroizing<String> {
     generate_vault_key_internal()
 }
 
@@ -779,10 +819,10 @@ pub fn encrypt_wallet_with_key(mnemonic: &str, key_hex: &str) -> Result<String, 
 pub fn decrypt_wallet_with_key(encrypted_json: &str, key_hex: &str) -> Result<JsValue, JsValue> {
     let result = decrypt_wallet_with_key_internal(encrypted_json, key_hex)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let response = DecryptResponse {
+    let response = BorrowedDecryptResponse {
         success: true,
-        phrase: result.phrase,
-        words: result.words,
+        phrase: &result.phrase,
+        words: &result.words,
     };
     serde_wasm_bindgen::to_value(&response).map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -1069,7 +1109,7 @@ struct WalletState {
     account_index: u32,
 }
 
-#[derive(Clone)]
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 enum WalletMaterial {
     MnemonicPhrase(String),
     WatchAddress(String),
@@ -1358,7 +1398,7 @@ impl ZincWasmWallet {
             Self::parse_payment_address_type_label(payment_address_type_str.as_deref())?;
         let active_index = account_index.unwrap_or(0);
 
-        let result = decrypt_wallet_internal(encrypted_json, password)
+        let mut result = decrypt_wallet_internal(encrypted_json, password)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let wallet = Self::build_seed_wallet(
             network_enum,
@@ -1370,9 +1410,12 @@ impl ZincWasmWallet {
             persistence_json.as_deref(),
         )?;
 
+        // Transfer the existing allocation into the long-lived zeroizing owner without cloning it.
+        let phrase = std::mem::take(&mut result.phrase);
+
         Ok(ZincWasmWallet {
             inner: Rc::new(RefCell::new(wallet)),
-            material: WalletMaterial::MnemonicPhrase(result.phrase),
+            material: WalletMaterial::MnemonicPhrase(phrase),
             state: Cell::new(WalletState {
                 network: network_enum,
                 scheme,
