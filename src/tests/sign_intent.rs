@@ -420,7 +420,7 @@ fn encrypt_secret_internal_roundtrip() {
     let secret = generate_secret_key_hex().expect("generate secret");
     let encrypted = encrypt_secret_internal(&secret, "test-password").expect("encrypt secret");
     let decrypted = decrypt_secret_internal(&encrypted, "test-password").expect("decrypt secret");
-    assert_eq!(decrypted, secret);
+    assert_eq!(decrypted.as_str(), secret);
 }
 
 #[test]

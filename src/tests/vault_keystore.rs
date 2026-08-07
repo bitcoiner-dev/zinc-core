@@ -6,8 +6,10 @@
 
 use crate::{
     crypto, decrypt_wallet_with_key_internal, encrypt_wallet_internal,
-    encrypt_wallet_with_key_internal, generate_vault_key_internal,
+    encrypt_wallet_with_key_internal, generate_vault_key, generate_vault_key_internal,
+    parse_vault_key_hex,
 };
+use zeroize::Zeroizing;
 
 /// A valid 12-word BIP-39 mnemonic (the canonical all-`abandon` test vector).
 const TEST_MNEMONIC: &str =
@@ -15,11 +17,23 @@ const TEST_MNEMONIC: &str =
 
 #[test]
 fn generate_vault_key_internal_is_64_hex_chars_and_fresh() {
-    let k1 = generate_vault_key_internal();
-    let k2 = generate_vault_key_internal();
+    let k1: Zeroizing<String> = generate_vault_key_internal();
+    let k2: Zeroizing<String> = generate_vault_key_internal();
     assert_eq!(k1.len(), 64, "32 bytes hex-encoded is 64 chars");
     assert!(k1.chars().all(|c| c.is_ascii_hexdigit()));
     assert_ne!(k1, k2, "each generated key must be independent");
+}
+
+#[test]
+fn native_vault_key_export_preserves_zeroizing_ownership() {
+    let key: Zeroizing<String> = generate_vault_key();
+    assert_eq!(key.len(), 64);
+}
+
+#[test]
+fn parsed_vault_key_is_zeroized_on_drop_without_an_intermediate_vec() {
+    let parsed: Zeroizing<[u8; 32]> = parse_vault_key_hex(&"42".repeat(32)).unwrap();
+    assert_eq!(&*parsed, &[0x42; 32]);
 }
 
 #[test]

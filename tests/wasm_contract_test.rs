@@ -8,8 +8,8 @@
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 use zinc_core::{
-    decrypt_secret, decrypt_wallet, derive_address, encrypt_secret, encrypt_wallet,
-    validate_mnemonic, ZincWasmWallet,
+    decrypt_secret, decrypt_wallet, decrypt_wallet_with_key, derive_address, encrypt_secret,
+    encrypt_wallet, encrypt_wallet_with_key, generate_vault_key, validate_mnemonic, ZincWasmWallet,
 };
 
 const PHRASE: &str =
@@ -66,11 +66,35 @@ fn decrypt_wallet_with_wrong_password_errors() {
 }
 
 #[wasm_bindgen_test]
+fn generated_vault_key_crosses_the_wasm_boundary_as_a_javascript_string() {
+    let key = generate_vault_key();
+    assert_eq!(key.length(), 64);
+    assert!(JsValue::from(key).is_string());
+}
+
+#[wasm_bindgen_test]
+fn keystore_wallet_decryption_preserves_the_wasm_response_shape() {
+    let key = JsValue::from(generate_vault_key())
+        .as_string()
+        .expect("vault key string");
+    let encrypted = encrypt_wallet_with_key(PHRASE, &key).expect("encrypt keystore wallet");
+    let decrypted =
+        to_json(decrypt_wallet_with_key(&encrypted, &key).expect("decrypt keystore wallet"));
+    assert_eq!(decrypted["success"].as_bool(), Some(true));
+    assert_eq!(decrypted["phrase"].as_str(), Some(PHRASE));
+    assert_eq!(
+        decrypted["words"].as_array().map(std::vec::Vec::len),
+        Some(12)
+    );
+}
+
+#[wasm_bindgen_test]
 fn encrypt_then_decrypt_secret_round_trips() {
     let enc = encrypt_secret("super-secret-value", "pw").expect("encrypt secret");
+    let decrypted = decrypt_secret(&enc, "pw").expect("decrypt secret");
     assert_eq!(
-        decrypt_secret(&enc, "pw").expect("decrypt secret"),
-        "super-secret-value"
+        JsValue::from(decrypted).as_string().as_deref(),
+        Some("super-secret-value")
     );
 }
 
@@ -92,9 +116,20 @@ fn new_encrypted_builds_a_usable_wallet() {
     .expect("new_encrypted");
     let accts = to_json(w.get_accounts(1).expect("accounts"));
     assert_eq!(accts.as_array().expect("accounts array").len(), 1);
-    assert_eq!(
-        accts[0]["taprootPublicKey"].as_str().expect("pubkey").len(),
-        64
+    let first_pubkey = accts[0]["taprootPublicKey"]
+        .as_str()
+        .expect("pubkey")
+        .to_string();
+    assert_eq!(first_pubkey.len(), 64);
+
+    // The decrypted result owner has already been dropped. Account rebuilding must continue to
+    // work from the mnemonic allocation transferred into the zeroizing wallet material.
+    w.set_active_account(1).expect("switch account");
+    let second = to_json(w.get_addresses().expect("second account"));
+    assert_eq!(second["account_index"].as_u64(), Some(1));
+    assert_ne!(
+        second["taprootPublicKey"].as_str().expect("pubkey"),
+        first_pubkey
     );
 }
 

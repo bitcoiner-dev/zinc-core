@@ -24,6 +24,7 @@ pub mod ordinal_shield;
 pub mod persistence_scope;
 pub mod profiles;
 pub mod rune_transfer;
+pub mod secret_lifetimes;
 pub mod sign_intent;
 pub mod signing;
 pub mod utxo_list;

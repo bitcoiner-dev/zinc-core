@@ -7,6 +7,7 @@ use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_chain::Merge;
 use bdk_esplora::EsploraAsyncExt;
 
+use bdk_wallet::descriptor::{Descriptor, DescriptorPublicKey};
 use bdk_wallet::{KeychainKind, Wallet};
 use bitcoin::address::{AddressType, NetworkUnchecked};
 use bitcoin::hashes::Hash;
@@ -399,13 +400,16 @@ impl std::fmt::Debug for WalletKind {
                 .finish(),
             Self::Hardware {
                 fingerprint,
-                taproot_external,
                 payment_external,
+                ..
             } => f
                 .debug_struct("Hardware")
                 .field("fingerprint", fingerprint)
-                .field("taproot_external", taproot_external)
-                .field("payment_external", payment_external)
+                .field("taproot_external", &"[REDACTED]")
+                .field(
+                    "payment_external",
+                    &payment_external.as_ref().map(|_| "[REDACTED]"),
+                )
                 .finish(),
             Self::WatchAddress(addr) => f.debug_tuple("WatchAddress").field(addr).finish(),
         }
@@ -467,6 +471,32 @@ impl WalletKind {
             }
         }
     }
+}
+
+fn validate_public_hardware_descriptor(label: &str, descriptor: &str) -> Result<(), String> {
+    descriptor
+        .parse::<Descriptor<DescriptorPublicKey>>()
+        .map_err(|_| {
+            format!("{label} hardware descriptor must be valid and contain public keys only")
+        })?;
+    Ok(())
+}
+
+fn validate_public_hardware_descriptors(
+    taproot_external: &str,
+    taproot_internal: &str,
+    payment_external: Option<&str>,
+    payment_internal: Option<&str>,
+) -> Result<(), String> {
+    validate_public_hardware_descriptor("taproot external", taproot_external)?;
+    validate_public_hardware_descriptor("taproot internal", taproot_internal)?;
+    if let Some(descriptor) = payment_external {
+        validate_public_hardware_descriptor("payment external", descriptor)?;
+    }
+    if let Some(descriptor) = payment_internal {
+        validate_public_hardware_descriptor("payment internal", descriptor)?;
+    }
+    Ok(())
 }
 
 /// Stateful wallet runtime that owns account wallets and safety state.
@@ -5325,6 +5355,15 @@ impl WalletBuilder {
             ),
         };
 
+        if matches!(&kind, WalletKind::Hardware { .. }) {
+            validate_public_hardware_descriptors(
+                &vault_ext,
+                &vault_int,
+                payment_ext.as_deref(),
+                payment_int.as_deref(),
+            )?;
+        }
+
         // 1. Vault (Taproot) wallet
         let (vault_wallet, loaded_vault_changeset) = if let Some(p) = &self.persistence {
             if let Some(changeset) = &p.taproot {
@@ -5465,6 +5504,13 @@ impl WalletBuilder {
         let network = self.network;
         let account_index = self.account_index;
         let persistence = self.persistence;
+
+        validate_public_hardware_descriptors(
+            &taproot_external_desc,
+            &taproot_internal_desc,
+            payment_external_desc.as_deref(),
+            payment_internal_desc.as_deref(),
+        )?;
 
         let scheme = if payment_external_desc.is_some() {
             AddressScheme::Dual
@@ -5620,6 +5666,80 @@ mod tests {
         let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
         let kind = WalletKind::Seed { master_xprv };
         assert!(format!("{kind:?}").contains("master_xprv: \"[REDACTED]\""));
+    }
+
+    #[test]
+    fn hardware_debug_redacts_descriptor_material() {
+        use bdk_wallet::bitcoin::bip32::Xpriv;
+        let xprv = Xpriv::new_master(Network::Signet, &[0x42; 32]).unwrap();
+        let descriptor = format!("tr({xprv}/86'/1'/0'/0/*)");
+        let kind = WalletKind::Hardware {
+            fingerprint: [0; 4],
+            taproot_external: descriptor.clone(),
+            payment_external: None,
+        };
+
+        let debug = format!("{kind:?}");
+        assert!(!debug.contains(&xprv.to_string()));
+        assert!(!debug.contains(&descriptor));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn hardware_builders_reject_private_descriptors_and_accept_public_descriptors() {
+        use bdk_wallet::bitcoin::bip32::{Xpriv, Xpub};
+        use bdk_wallet::bitcoin::secp256k1::Secp256k1;
+
+        let secp = Secp256k1::new();
+        let xprv = Xpriv::new_master(Network::Signet, &[0x24; 32]).unwrap();
+        let xpub = Xpub::from_priv(&secp, &xprv);
+        let private_external = format!("tr({xprv}/86'/1'/0'/0/*)");
+        let private_internal = format!("tr({xprv}/86'/1'/0'/1/*)");
+
+        let error = WalletBuilder::new(Network::Signet)
+            .build_hardware(
+                "00000000",
+                private_external.clone(),
+                private_internal.clone(),
+                None,
+                None,
+            )
+            .err()
+            .expect("hardware builder must reject private descriptors");
+        assert!(error.contains("public keys only"));
+        assert!(!error.contains(&xprv.to_string()));
+
+        let direct_error = WalletBuilder::new(Network::Signet)
+            .kind(WalletKind::Hardware {
+                fingerprint: [0; 4],
+                taproot_external: private_external,
+                payment_external: None,
+            })
+            .build()
+            .err()
+            .expect("generic builder must not bypass public-only validation");
+        assert!(direct_error.contains("public keys only"));
+        assert!(!direct_error.contains(&xprv.to_string()));
+
+        let public_external = format!("tr({xpub}/0/*)");
+        let public_internal = format!("tr({xpub}/1/*)");
+        let wif = bitcoin::PrivateKey::new(xprv.private_key, Network::Signet).to_wif();
+        let payment_error = WalletBuilder::new(Network::Signet)
+            .build_hardware(
+                "00000000",
+                public_external.clone(),
+                public_internal.clone(),
+                Some(format!("wpkh({wif})")),
+                Some(format!("wpkh({wif})")),
+            )
+            .err()
+            .expect("private payment descriptors must also be rejected");
+        assert!(payment_error.contains("public keys only"));
+        assert!(!payment_error.contains(&wif));
+
+        WalletBuilder::new(Network::Signet)
+            .build_hardware("00000000", public_external, public_internal, None, None)
+            .expect("public hardware descriptors remain supported");
     }
 
     #[test]
