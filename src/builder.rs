@@ -865,6 +865,34 @@ pub struct WalletBuilder {
 }
 
 impl ZincWallet {
+    /// Remove every live software-signing capability from this wallet in place.
+    ///
+    /// This is used by lock boundaries that may have outstanding read-only sync futures holding
+    /// the wallet allocation alive. Clearing BDK's keymaps prevents those futures from retaining
+    /// usable signers after lock, while replacing the identity makes all direct private-key
+    /// derivation paths fail closed.
+    pub fn lock_private_material(&mut self) {
+        let watched_address = self.peek_taproot_address(0);
+
+        if let WalletKind::Seed { master_xprv } = &mut self.kind {
+            master_xprv.private_key.non_secure_erase();
+        }
+
+        self.vault_wallet
+            .set_keymap(KeychainKind::External, Default::default());
+        self.vault_wallet
+            .set_keymap(KeychainKind::Internal, Default::default());
+        if let Some(payment_wallet) = &mut self.payment_wallet {
+            payment_wallet.set_keymap(KeychainKind::External, Default::default());
+            payment_wallet.set_keymap(KeychainKind::Internal, Default::default());
+        }
+
+        self.kind = WalletKind::WatchAddress(watched_address);
+        self.account_generation = self.account_generation.wrapping_add(1);
+        self.is_syncing = false;
+        self.sync_latch_started_at_ms = 0.0;
+    }
+
     fn watched_address(&self) -> Option<&Address> {
         match &self.kind {
             WalletKind::WatchAddress(address) => Some(address),

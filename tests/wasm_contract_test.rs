@@ -150,6 +150,17 @@ fn new_encrypted_with_wrong_password_errors() {
 }
 
 #[wasm_bindgen_test]
+fn locking_a_wallet_invalidates_the_handle() {
+    let mut wallet = wallet();
+    assert!(wallet.get_pairing_pubkey_hex().is_ok());
+    wallet
+        .lock_private_material()
+        .expect("lock private material");
+    assert!(wallet.get_pairing_pubkey_hex().is_err());
+    assert!(wallet.get_addresses().is_err());
+}
+
+#[wasm_bindgen_test]
 fn new_watch_address_builds_wallet_for_its_address() {
     let addr = derive_address(PHRASE, "regtest").expect("derive");
     let w = ZincWasmWallet::new_watch_address("regtest", &addr, None, None).expect("watch wallet");

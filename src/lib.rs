@@ -1127,6 +1127,24 @@ pub struct ZincWasmWallet {
 
 #[wasm_bindgen]
 impl ZincWasmWallet {
+    /// Irreversibly remove live private material from this handle.
+    ///
+    /// Unlike dropping the JavaScript wrapper, this also scrubs the shared core wallet retained by
+    /// outstanding async futures. The handle becomes unusable immediately after this succeeds.
+    #[wasm_bindgen(js_name = lockPrivateMaterial)]
+    pub fn lock_private_material(&mut self) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        {
+            let mut inner = self.inner.try_borrow_mut().map_err(|e| {
+                JsValue::from_str(&format!("Wallet busy (lockPrivateMaterial): {e}"))
+            })?;
+            inner.lock_private_material();
+        }
+        zeroize::Zeroize::zeroize(&mut self.material);
+        self.vitality = 0;
+        Ok(())
+    }
+
     fn parse_network_label(network: &str) -> Result<Network, JsValue> {
         match network {
             "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
