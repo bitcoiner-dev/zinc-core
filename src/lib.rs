@@ -142,11 +142,21 @@ use bdk_wallet::KeychainKind;
 
 #[doc(hidden)]
 /// Mnemonic material returned by wallet generation/decryption helpers.
+#[derive(zeroize::Zeroize)]
 pub struct WalletResult {
     /// Full normalized BIP-39 mnemonic phrase.
     pub phrase: String,
     /// Phrase split into individual words.
     pub words: Vec<String>,
+}
+
+impl std::fmt::Debug for WalletResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletResult")
+            .field("phrase", &"[REDACTED]")
+            .field("words", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[doc(hidden)]

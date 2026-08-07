@@ -9,7 +9,6 @@ use crate::error::ZincError;
 /// A wrapper around BIP-39 mnemonic with zeroization.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ZincMnemonic {
-    #[zeroize(skip)]
     inner: Mnemonic,
 }
 
@@ -29,7 +28,7 @@ impl ZincMnemonic {
         rand::RngCore::fill_bytes(&mut OsRng, &mut entropy);
 
         let mnemonic = Mnemonic::from_entropy(&entropy)
-            .map_err(|e| ZincError::MnemonicError(e.to_string()))?;
+            .map_err(|_| ZincError::MnemonicError("Invalid mnemonic entropy".to_string()))?;
 
         Ok(Self { inner: mnemonic })
     }
@@ -37,7 +36,7 @@ impl ZincMnemonic {
     /// Parse a mnemonic from a phrase.
     pub fn parse(phrase: &str) -> Result<Self, ZincError> {
         let mnemonic = Mnemonic::parse_in(bip39::Language::English, phrase)
-            .map_err(|e| ZincError::MnemonicError(e.to_string()))?;
+            .map_err(|_| ZincError::MnemonicError("Invalid mnemonic phrase".to_string()))?;
 
         Ok(Self { inner: mnemonic })
     }
@@ -138,5 +137,15 @@ mod tests {
         let eleven =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         assert!(ZincMnemonic::parse(eleven).is_err());
+    }
+
+    #[test]
+    fn mnemonic_zeroize_clears_memory() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut m = ZincMnemonic::parse(phrase).unwrap();
+        let orig_seed = m.to_seed("");
+        m.zeroize();
+        let zeroed_seed = m.to_seed("");
+        assert_ne!(&*orig_seed, &*zeroed_seed);
     }
 }
