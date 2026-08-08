@@ -355,3 +355,15 @@ mod tests {
         assert!(decrypt_seed_with_key(&encrypted, &[7u8; 32]).is_err());
     }
 }
+
+
+// PERFORMANCE OPTIMIZATION (Bolt): Replace formatting allocation with static lookup table
+pub fn bytes_to_hex_lower(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        out.push(HEX_CHARS[(byte >> 4) as usize]);
+        out.push(HEX_CHARS[(byte & 0x0f) as usize]);
+    }
+    String::from_utf8(out).unwrap()
+}
