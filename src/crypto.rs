@@ -59,12 +59,12 @@ where
 pub fn encrypt_with_key(plaintext: &[u8], key: &[u8; 32]) -> Result<EncryptedVault, ZincError> {
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| ZincError::EncryptionError(e.to_string()))?;
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| ZincError::EncryptionError(e.to_string()))?;
 
     Ok(EncryptedVault {
@@ -102,11 +102,11 @@ pub fn decrypt_with_key(
     if nonce_bytes.len() != 12 {
         return Err(ZincError::DecryptionError);
     }
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| ZincError::DecryptionError)?;
 
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ZincError::DecryptionError)?;
     let plaintext = cipher
-        .decrypt(nonce, ciphertext.as_slice())
+        .decrypt(&nonce, ciphertext.as_slice())
         .map_err(|_| ZincError::DecryptionError)?;
 
     Ok(Zeroizing::new(plaintext))

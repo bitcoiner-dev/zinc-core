@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file.
 - Refresh the compatible dependency graph to remove all currently reported
   RustSec vulnerabilities, including fixes in `quinn-proto`, `rustls-webpki`,
   `rand`, and `time`.
+- Upgrade AES-GCM from 0.10 to 0.11 with its zeroization support enabled, while
+  keeping nonce generation on zinc-core's existing browser-compatible entropy
+  boundary.
 - Upgrade Nostr from 0.44 to 0.45, replacing its unmaintained `instant` timing
   dependency. NIP-44 encryption continues to source browser-compatible nonce
   entropy through zinc-core's audited `getrandom` boundary.
@@ -23,6 +26,8 @@ All notable changes to this project will be documented in this file.
 - Update compatible releases across the BDK, Bitcoin, Tokio, Reqwest,
   wasm-bindgen, and supporting dependency families; BDK Wallet moves from 2.3
   to 2.4 and Bitcoin from 0.32.8 to 0.32.102.
+- Upgrade Tokio-Tungstenite from 0.24 to 0.30 for current WebSocket protocol,
+  validation, memory-layout, and I/O behavior.
 
 ## [0.10.0] - 2026-08-08
 
