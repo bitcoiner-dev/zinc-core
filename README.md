@@ -18,12 +18,13 @@ Key capabilities:
 
 ```toml
 [dependencies]
-zinc-core = "0.9.0"
+zinc-core = "0.10.0"
 ```
 
 ## What You Get
 
-- BIP-39 mnemonic generation, validation, and encryption/decryption
+- BIP-39 mnemonic generation and validation, with version-3 DEK-based
+  wallet/secret encryption
 - **Hardware Integration**: Support for Ledger and other hardware signatures via PSBT preparation and verification
 - **Watch-Only Support**: Initialize wallets from public addresses for tracking-only functionality
 - **Discovery Engine**: High-performance parallel probing for accounts across standard and legacy paths
@@ -128,6 +129,13 @@ check remains the post-device trust gate.
 
 - This is security-sensitive software. Review release notes before upgrading.
 - Avoid logging secret material and mnemonic data.
+- Mnemonics, vault keys, decrypted responses, and stateful wallet material use
+  zeroizing owners where the Rust/WASM boundary permits it.
+- Hosts must call `lock_private_material` (`lockPrivateMaterial` in WASM) before
+  releasing an unlocked wallet; it scrubs the master key and consumes the live
+  BDK signer handles so later signing fails closed.
+- Hardware-wallet constructors reject descriptors containing private keys, and
+  sensitive wallet kinds use redacted `Debug` output.
 - Reporting process: see [SECURITY.md](./SECURITY.md).
 - Discovery APIs are hardened to avoid exposing raw master private keys.
 
