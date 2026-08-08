@@ -38,6 +38,31 @@ fn test_fresh_wallet_persistence_has_descriptors() {
 }
 
 #[test]
+fn test_seed_persistence_contains_public_descriptors_only() {
+    let wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(TEST_SEED))
+        .build()
+        .expect("Should build wallet");
+    let persistence = wallet.export_changeset().expect("Should export changeset");
+    let vault = persistence.taproot.expect("Should have vault changeset");
+
+    for descriptor in [vault.descriptor, vault.change_descriptor]
+        .into_iter()
+        .flatten()
+    {
+        let rendered = descriptor.to_string();
+        assert!(
+            !rendered.contains("prv"),
+            "private descriptor was persisted"
+        );
+        rendered
+            .parse::<bdk_wallet::descriptor::Descriptor<
+                bdk_wallet::descriptor::DescriptorPublicKey,
+            >>()
+            .expect("persisted descriptor must contain public keys only");
+    }
+}
+
+#[test]
 fn test_round_trip_persistence() {
     // 1. Create Wallet A
     let builder_a = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(TEST_SEED));

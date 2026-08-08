@@ -32,11 +32,11 @@ pub fn taproot_descriptors(
     let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
 
     let (external, _) = Bip86(xprv, KeychainKind::External)
-        .into_wallet_descriptor(&secp, network)
+        .into_wallet_descriptor(&secp, network.into())
         .map_err(|e| ZincError::KeyDerivation(e.to_string()))?;
 
     let (internal, _) = Bip86(xprv, KeychainKind::Internal)
-        .into_wallet_descriptor(&secp, network)
+        .into_wallet_descriptor(&secp, network.into())
         .map_err(|e| ZincError::KeyDerivation(e.to_string()))?;
 
     Ok(DescriptorPair { external, internal })
