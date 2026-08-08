@@ -7,7 +7,8 @@ use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_chain::Merge;
 use bdk_esplora::EsploraAsyncExt;
 
-use bdk_wallet::descriptor::{Descriptor, DescriptorPublicKey};
+use bdk_wallet::descriptor::{Descriptor, DescriptorPublicKey, IntoWalletDescriptor};
+use bdk_wallet::signer::SignersContainer;
 use bdk_wallet::{KeychainKind, Wallet};
 use bitcoin::address::{AddressType, NetworkUnchecked};
 use bitcoin::hashes::Hash;
@@ -56,7 +57,7 @@ pub struct SignOptions {
     pub finalize: bool,
 }
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Strongly-typed 64-byte seed material used by canonical constructors.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
@@ -373,7 +374,6 @@ pub fn now_unix() -> u64 {
 }
 
 /// Represents the cryptographic identity of the wallet.
-#[derive(Clone)]
 pub enum WalletKind {
     /// Full signing capability with master private key.
     Seed {
@@ -418,6 +418,26 @@ impl std::fmt::Debug for WalletKind {
     }
 }
 
+impl Drop for WalletKind {
+    fn drop(&mut self) {
+        if let Self::Seed { master_xprv } = self {
+            master_xprv.private_key.non_secure_erase();
+        }
+    }
+}
+
+fn public_descriptor_from_secret(
+    secret_descriptor: Zeroizing<String>,
+    network: Network,
+) -> Result<String, String> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (descriptor, _) = secret_descriptor
+        .as_str()
+        .into_wallet_descriptor(&secp, network.into())
+        .map_err(|_| "Failed to derive public wallet descriptor".to_string())?;
+    Ok(descriptor.to_string())
+}
+
 impl WalletKind {
     /// Returns true if this identity is read-only.
     #[must_use]
@@ -427,30 +447,52 @@ impl WalletKind {
 
     /// Derive external and internal descriptor strings for the vault and optional payment keychains.
     /// Returns (`vault_external`, `vault_internal`, `payment_external`, `payment_internal`).
-    pub fn derive_descriptors(
+    fn derive_descriptors(
         &self,
         scheme: AddressScheme,
         payment_type: PaymentAddressType,
         network: Network,
         account: u32,
-    ) -> (String, String, Option<String>, Option<String>) {
+    ) -> Result<(String, String, Option<String>, Option<String>), String> {
         let coin_type = u32::from(network != Network::Bitcoin);
 
         match self {
             Self::Seed {
                 master_xprv: master,
             } => {
-                let vault_ext = format!("tr({master}/86'/{coin_type}'/{account}'/0/*)");
-                let vault_int = format!("tr({master}/86'/{coin_type}'/{account}'/1/*)");
+                let vault_ext = public_descriptor_from_secret(
+                    Zeroizing::new(format!("tr({master}/86'/{coin_type}'/{account}'/0/*)")),
+                    network,
+                )?;
+                let vault_int = public_descriptor_from_secret(
+                    Zeroizing::new(format!("tr({master}/86'/{coin_type}'/{account}'/1/*)")),
+                    network,
+                )?;
 
                 if scheme == AddressScheme::Dual {
-                    let pay_ext =
-                        payment_descriptor_for_xprv(master, payment_type, coin_type, account, 0);
-                    let pay_int =
-                        payment_descriptor_for_xprv(master, payment_type, coin_type, account, 1);
-                    (vault_ext, vault_int, Some(pay_ext), Some(pay_int))
+                    let pay_ext = public_descriptor_from_secret(
+                        Zeroizing::new(payment_descriptor_for_xprv(
+                            master,
+                            payment_type,
+                            coin_type,
+                            account,
+                            0,
+                        )),
+                        network,
+                    )?;
+                    let pay_int = public_descriptor_from_secret(
+                        Zeroizing::new(payment_descriptor_for_xprv(
+                            master,
+                            payment_type,
+                            coin_type,
+                            account,
+                            1,
+                        )),
+                        network,
+                    )?;
+                    Ok((vault_ext, vault_int, Some(pay_ext), Some(pay_int)))
                 } else {
-                    (vault_ext, vault_int, None, None)
+                    Ok((vault_ext, vault_int, None, None))
                 }
             }
             Self::Hardware {
@@ -459,17 +501,17 @@ impl WalletKind {
                 ..
             } => {
                 // For hardware wallets, we assume the provided descriptors are already at the account level.
-                (
+                Ok((
                     taproot_external.clone(),
                     taproot_external.replace("/0/*", "/1/*"),
                     payment_external.clone(),
                     payment_external.as_ref().map(|e| e.replace("/0/*", "/1/*")),
-                )
+                ))
             }
             Self::WatchAddress(address) => {
                 let descriptor = taproot_watch_descriptor(address)
                     .expect("watch-address identity must hold a validated taproot address");
-                (descriptor.clone(), descriptor, None, None)
+                Ok((descriptor.clone(), descriptor, None, None))
             }
         }
     }
@@ -544,6 +586,9 @@ pub struct ZincWallet {
     pub(crate) ordinals_metadata_complete: bool,
     /// Cryptographic identity of this wallet (Seed or Hardware).
     pub(crate) kind: WalletKind,
+    /// Public derivation metadata used to create short-lived BDK signers for seed wallets.
+    /// No private descriptor or signer container is retained here.
+    pub(crate) signing_layout: Option<crate::layout::LayoutSpec>,
     /// Guard flag used to prevent overlapping sync operations.
     #[allow(dead_code)]
     pub(crate) is_syncing: bool,
@@ -721,7 +766,7 @@ pub struct DiscoveryAccountPlan {
 }
 
 /// Precomputed account discovery context that avoids exposing raw keys externally.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DiscoveryContext {
     /// Network for the descriptors in this context.
     pub network: Network,
@@ -772,6 +817,32 @@ fn payment_descriptor_for_xpub(
         PaymentAddressType::NativeSegwit => format!("wpkh({xpub}/{chain}/*)"),
         PaymentAddressType::NestedSegwit => format!("sh(wpkh({xpub}/{chain}/*))"),
         PaymentAddressType::Legacy => format!("pkh({xpub}/{chain}/*)"),
+    }
+}
+
+fn standard_signing_layout(
+    scheme: AddressScheme,
+    derivation_mode: DerivationMode,
+    payment_type: PaymentAddressType,
+) -> crate::layout::LayoutSpec {
+    use crate::layout::{BranchSpec, LayoutSpec, ScriptKind};
+
+    let payment = (scheme == AddressScheme::Dual).then(|| BranchSpec {
+        purpose: payment_type.purpose(),
+        script: match payment_type {
+            PaymentAddressType::NativeSegwit => ScriptKind::Wpkh,
+            PaymentAddressType::NestedSegwit => ScriptKind::ShWpkh,
+            PaymentAddressType::Legacy => ScriptKind::Pkh,
+        },
+    });
+
+    LayoutSpec {
+        vault: BranchSpec {
+            purpose: 86,
+            script: ScriptKind::Tr,
+        },
+        payment,
+        derivation_mode,
     }
 }
 
@@ -848,7 +919,6 @@ fn taproot_watch_descriptor(address: &Address) -> Result<String, String> {
 }
 
 /// Builder for constructing a `ZincWallet` from identity, network, and options.
-#[derive(Clone)]
 pub struct WalletBuilder {
     network: Network,
     kind: Option<WalletKind>,
@@ -865,12 +935,91 @@ pub struct WalletBuilder {
 }
 
 impl ZincWallet {
+    fn temporary_signers(
+        &self,
+        wallet: &Wallet,
+        branch: crate::layout::BranchSpec,
+    ) -> Result<(SignersContainer, SignersContainer), String> {
+        let WalletKind::Seed { master_xprv } = &self.kind else {
+            return Err(ZincError::CapabilityMissing.to_string());
+        };
+        let layout = self
+            .signing_layout
+            .ok_or_else(|| "Seed signing layout is unavailable".to_string())?;
+        let (derivation_account, _) = layout.account_and_index(self.account_index);
+        let coin_type = u32::from(wallet.network() != Network::Bitcoin);
+        let account_path = Zeroizing::new(format!(
+            "{master_xprv}/{}'/{coin_type}'/{derivation_account}'",
+            branch.purpose
+        ));
+        let secp = wallet.secp_ctx();
+
+        let build = |keychain: KeychainKind, chain: u32| -> Result<SignersContainer, String> {
+            let secret_descriptor =
+                Zeroizing::new(branch.script.descriptor(account_path.as_str(), chain));
+            let (public_descriptor, keymap) = secret_descriptor
+                .as_str()
+                .into_wallet_descriptor(secp, wallet.network().into())
+                .map_err(|_| "Failed to prepare temporary wallet signer".to_string())?;
+            if &public_descriptor != wallet.public_descriptor(keychain) {
+                return Err("Temporary signer does not match the watch-only wallet".to_string());
+            }
+            Ok(SignersContainer::build(
+                keymap,
+                wallet.public_descriptor(keychain),
+                secp,
+            ))
+        };
+
+        Ok((
+            build(KeychainKind::External, 0)?,
+            build(KeychainKind::Internal, 1)?,
+        ))
+    }
+
+    fn sign_with_temporary_signers(
+        &self,
+        wallet: &Wallet,
+        branch: crate::layout::BranchSpec,
+        psbt: &mut Psbt,
+        options: bdk_wallet::SignOptions,
+    ) -> Result<(), String> {
+        let (external, internal) = self.temporary_signers(wallet, branch)?;
+        wallet
+            .sign_with_signers(psbt, &[&external, &internal], options)
+            .map_err(|e| format!("Wallet signing failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn sign_role_with_temporary_signers(
+        &self,
+        payment_role: bool,
+        psbt: &mut Psbt,
+        options: bdk_wallet::SignOptions,
+    ) -> Result<(), String> {
+        let (WalletKind::Seed { .. }, Some(layout)) = (&self.kind, self.signing_layout) else {
+            return Err(ZincError::CapabilityMissing.to_string());
+        };
+        if payment_role {
+            let wallet = self
+                .payment_wallet
+                .as_ref()
+                .ok_or_else(|| "Payment wallet not initialized".to_string())?;
+            let branch = layout.payment.ok_or_else(|| {
+                "Payment wallet exists without matching signer metadata".to_string()
+            })?;
+            self.sign_with_temporary_signers(wallet, branch, psbt, options)
+        } else {
+            self.sign_with_temporary_signers(&self.vault_wallet, layout.vault, psbt, options)
+        }
+    }
+
     /// Remove every live software-signing capability from this wallet in place.
     ///
     /// This is used by lock boundaries that may have outstanding read-only sync futures holding
-    /// the wallet allocation alive. Clearing BDK's keymaps prevents those futures from retaining
-    /// usable signers after lock, while replacing the identity makes all direct private-key
-    /// derivation paths fail closed.
+    /// the wallet allocation alive. Persistent BDK wallets are watch-only, and clearing their
+    /// keymaps is defense in depth; erasing and replacing the identity makes every direct
+    /// private-key derivation and temporary-signer path fail closed.
     pub fn lock_private_material(&mut self) {
         let watched_address = self.peek_taproot_address(0);
 
@@ -3705,6 +3854,11 @@ impl ZincWallet {
     ) -> Result<String, String> {
         use base64::Engine;
 
+        let (WalletKind::Seed { .. }, Some(signing_layout)) = (&self.kind, self.signing_layout)
+        else {
+            return Err(ZincError::CapabilityMissing.to_string());
+        };
+
         // Decode PSBT from base64
         let psbt_bytes = base64::engine::general_purpose::STANDARD
             .decode(psbt_base64)
@@ -3830,16 +3984,28 @@ impl ZincWallet {
             None
         };
 
-        // Try signing with both, just in case inputs are mixed
-        // This is safe because BDK only signs inputs it controls
-        self.vault_wallet
-            .sign(&mut psbt, bdk_options.clone())
-            .map_err(|e| format!("Vault signing failed: {e}"))?;
+        // The live BDK wallets are watch-only. Build signer containers from the
+        // master key for this authorized operation only, use them explicitly,
+        // and drop them before returning.
+        self.sign_with_temporary_signers(
+            &self.vault_wallet,
+            signing_layout.vault,
+            &mut psbt,
+            bdk_options.clone(),
+        )
+        .map_err(|e| format!("Vault signing failed: {e}"))?;
 
         if let Some(payment_wallet) = &self.payment_wallet {
-            payment_wallet
-                .sign(&mut psbt, bdk_options)
-                .map_err(|e| format!("Payment signing failed: {e}"))?;
+            let payment_branch = signing_layout.payment.ok_or_else(|| {
+                "Payment wallet exists without matching signer metadata".to_string()
+            })?;
+            self.sign_with_temporary_signers(
+                payment_wallet,
+                payment_branch,
+                &mut psbt,
+                bdk_options,
+            )
+            .map_err(|e| format!("Payment signing failed: {e}"))?;
         }
 
         // CUSTOM SCRIPT-PATH SIGNING for Inscription Reveal Inputs
@@ -3955,13 +4121,12 @@ impl ZincWallet {
             }
         }
 
-        #[allow(deprecated)]
-        let _ = self
-            .vault_wallet
-            .sign(&mut psbt, bdk_wallet::SignOptions::default());
+        // Populate descriptor metadata without attaching any software signer.
+        let _ =
+            self.vault_wallet
+                .sign_with_signers(&mut psbt, &[], bdk_wallet::SignOptions::default());
         if let Some(w) = &self.payment_wallet {
-            #[allow(deprecated)]
-            let _ = w.sign(&mut psbt, bdk_wallet::SignOptions::default());
+            let _ = w.sign_with_signers(&mut psbt, &[], bdk_wallet::SignOptions::default());
         }
 
         if let Some(opts) = &options {
@@ -5316,27 +5481,45 @@ impl WalletBuilder {
             DerivationMode::Index => 0,
         };
 
+        let signing_layout = matches!(&kind, WalletKind::Seed { .. }).then(|| {
+            self.custom_layout.unwrap_or_else(|| {
+                standard_signing_layout(scheme, self.derivation_mode, self.payment_address_type)
+            })
+        });
+
         let (vault_ext, vault_int, payment_ext, payment_int) = match &self.custom_layout {
             Some(layout) => {
                 let WalletKind::Seed { master_xprv } = &kind else {
                     return Err("Custom layouts are only supported for seed wallets".to_string());
                 };
                 let coin_type = u32::from(self.network != Network::Bitcoin);
-                let vault_path = format!(
+                let vault_path = Zeroizing::new(format!(
                     "{master_xprv}/{}'/{coin_type}'/{derivation_account}'",
                     layout.vault.purpose
-                );
-                let vault_ext = layout.vault.script.descriptor(&vault_path, 0);
-                let vault_int = layout.vault.script.descriptor(&vault_path, 1);
+                ));
+                let vault_ext = public_descriptor_from_secret(
+                    Zeroizing::new(layout.vault.script.descriptor(vault_path.as_str(), 0)),
+                    self.network,
+                )?;
+                let vault_int = public_descriptor_from_secret(
+                    Zeroizing::new(layout.vault.script.descriptor(vault_path.as_str(), 1)),
+                    self.network,
+                )?;
                 let (payment_ext, payment_int) = match &layout.payment {
                     Some(branch) => {
-                        let path = format!(
+                        let path = Zeroizing::new(format!(
                             "{master_xprv}/{}'/{coin_type}'/{derivation_account}'",
                             branch.purpose
-                        );
+                        ));
                         (
-                            Some(branch.script.descriptor(&path, 0)),
-                            Some(branch.script.descriptor(&path, 1)),
+                            Some(public_descriptor_from_secret(
+                                Zeroizing::new(branch.script.descriptor(path.as_str(), 0)),
+                                self.network,
+                            )?),
+                            Some(public_descriptor_from_secret(
+                                Zeroizing::new(branch.script.descriptor(path.as_str(), 1)),
+                                self.network,
+                            )?),
                         )
                     }
                     None => (None, None),
@@ -5348,7 +5531,7 @@ impl WalletBuilder {
                 self.payment_address_type,
                 self.network,
                 derivation_account,
-            ),
+            )?,
         };
 
         if matches!(&kind, WalletKind::Hardware { .. }) {
@@ -5370,9 +5553,7 @@ impl WalletBuilder {
                     loader = loader.descriptor(KeychainKind::Internal, Some(vault_int.clone()));
                 }
 
-                let res = loader
-                    .extract_keys()
-                    .load_wallet_no_persist(changeset.clone());
+                let res = loader.load_wallet_no_persist(changeset.clone());
 
                 if let Ok(Some(w)) = res {
                     (w, changeset.clone())
@@ -5421,7 +5602,6 @@ impl WalletBuilder {
                         let res = Wallet::load()
                             .descriptor(KeychainKind::External, Some(pay_ext.clone()))
                             .descriptor(KeychainKind::Internal, Some(pay_int.clone()))
-                            .extract_keys()
                             .load_wallet_no_persist(changeset.clone());
 
                         if let Ok(Some(w)) = res {
@@ -5471,6 +5651,7 @@ impl WalletBuilder {
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             kind,
+            signing_layout,
             is_syncing: false,
             sync_latch_started_at_ms: 0.0,
             account_generation: 0,
@@ -5518,7 +5699,6 @@ impl WalletBuilder {
                 let res = Wallet::load()
                     .descriptor(KeychainKind::External, Some(taproot_external_desc.clone()))
                     .descriptor(KeychainKind::Internal, Some(taproot_internal_desc.clone()))
-                    .extract_keys()
                     .load_wallet_no_persist(changeset.clone());
 
                 if let Ok(Some(w)) = res {
@@ -5560,7 +5740,6 @@ impl WalletBuilder {
                     let res = Wallet::load()
                         .descriptor(KeychainKind::External, Some(pay_ext.clone()))
                         .descriptor(KeychainKind::Internal, Some(pay_int.clone()))
-                        .extract_keys()
                         .load_wallet_no_persist(changeset.clone());
 
                     if let Ok(Some(w)) = res {
@@ -5618,6 +5797,7 @@ impl WalletBuilder {
                 taproot_external: taproot_external_desc,
                 payment_external: payment_external_desc,
             },
+            signing_layout: None,
             is_syncing: false,
             sync_latch_started_at_ms: 0.0,
             account_generation: 0,

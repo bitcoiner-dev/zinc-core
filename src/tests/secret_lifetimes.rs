@@ -41,14 +41,26 @@ fn locking_a_wallet_removes_live_signing_material() {
         .unwrap();
 
     assert!(wallet.get_pairing_secret_key_hex().is_ok());
-    assert!(!wallet
+    let old_signer_handle = wallet
         .vault_wallet
         .get_signers(KeychainKind::External)
-        .ids()
-        .is_empty());
+        .clone();
+    assert!(
+        old_signer_handle.ids().is_empty(),
+        "the persistent BDK wallet must be watch-only even while Zinc is unlocked"
+    );
+    assert!(wallet.sign_psbt("not-a-valid-psbt", None).is_err());
     wallet.lock_private_material();
     assert!(wallet.get_pairing_secret_key_hex().is_err());
     assert!(matches!(wallet.kind, WalletKind::WatchAddress(_)));
+    let after_lock = wallet
+        .sign_psbt("not-a-valid-psbt", None)
+        .expect_err("a locked wallet must reject signing before parsing the PSBT");
+    assert!(after_lock.contains("Capability missing"));
+    assert!(
+        old_signer_handle.ids().is_empty(),
+        "an old BDK signer handle must not retain signing capability after lock"
+    );
     assert!(wallet
         .vault_wallet
         .get_signers(KeychainKind::External)

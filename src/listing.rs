@@ -761,7 +761,8 @@ pub fn create_listing_purchase(
         .peek_address(KeychainKind::External, 0)
         .script_pubkey();
     let protected_outpoints = wallet.inscribed_utxos.iter().copied().collect();
-    let signing_wallet = if wallet.scheme == AddressScheme::Dual {
+    let payment_role = wallet.scheme == AddressScheme::Dual;
+    let signing_wallet = if payment_role {
         wallet
             .payment_wallet
             .as_mut()
@@ -833,8 +834,9 @@ pub fn create_listing_purchase(
         ));
     }
 
-    signing_wallet
-        .sign(
+    wallet
+        .sign_role_with_temporary_signers(
+            payment_role,
             &mut psbt,
             bdk_wallet::SignOptions {
                 trust_witness_utxo: true,

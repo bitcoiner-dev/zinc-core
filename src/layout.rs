@@ -12,8 +12,10 @@
 
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::Network;
+use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::{KeychainKind, Wallet};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::builder::{DerivationMode, PaymentAddressType, Seed64};
 
@@ -151,9 +153,18 @@ fn derive_branch(
     count: u32,
 ) -> Result<Vec<String>, String> {
     let coin = coin_type(network);
-    let account_path = format!("{xprv}/{}'/{coin}'/{account}'", branch.purpose);
-    let receive = branch.script.descriptor(&account_path, 0);
-    let change = branch.script.descriptor(&account_path, 1);
+    let account_path = Zeroizing::new(format!("{xprv}/{}'/{coin}'/{account}'", branch.purpose));
+    let receive_secret = Zeroizing::new(branch.script.descriptor(account_path.as_str(), 0));
+    let change_secret = Zeroizing::new(branch.script.descriptor(account_path.as_str(), 1));
+    let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
+    let (receive, _) = receive_secret
+        .as_str()
+        .into_wallet_descriptor(&secp, network.into())
+        .map_err(|_| "Layout receive descriptor rejected".to_string())?;
+    let (change, _) = change_secret
+        .as_str()
+        .into_wallet_descriptor(&secp, network.into())
+        .map_err(|_| "Layout change descriptor rejected".to_string())?;
     let wallet = Wallet::create(receive, change)
         .network(network)
         .create_wallet_no_persist()
