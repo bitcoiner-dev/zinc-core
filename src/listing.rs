@@ -540,7 +540,7 @@ pub fn finalize_listing_purchase(
         && request
             .change_script_pubkey
             .as_ref()
-            .map_or(true, |script| script.as_script().is_empty())
+            .is_none_or(|script| script.as_script().is_empty())
     {
         return Err(ZincError::OfferError(
             "change scriptPubKey is required when change_sats > 0".to_string(),

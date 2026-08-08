@@ -561,7 +561,7 @@ pub fn analyze_psbt_with_scope(
     for (i, input) in analysis_psbt.inputs.iter().enumerate() {
         let in_scope = scope_set
             .as_ref()
-            .map_or(true, |allowed| allowed.contains(&i));
+            .is_none_or(|allowed| allowed.contains(&i));
 
         let utxo = &input.witness_utxo;
 
