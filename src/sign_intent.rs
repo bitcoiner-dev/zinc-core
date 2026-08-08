@@ -2069,8 +2069,9 @@ fn domain_separated_digest(domain: &str, canonical_payload: &[u8]) -> Result<[u8
     Ok(digest.to_byte_array())
 }
 
+// PERFORMANCE OPTIMIZATION (Bolt): Replaced expensive format! macro in loop with efficient zero-dependency nibble mapping.
 fn digest_hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    bytes_to_hex_lower(digest)
 }
 
 fn pubkey_hex_from_secret(secret_key: &SecretKey) -> String {
