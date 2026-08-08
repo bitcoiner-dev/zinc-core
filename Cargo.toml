@@ -42,7 +42,7 @@ thiserror = "2.0"
 log = "0.4"
 
 # BDK & Bitcoin
-bdk_wallet = "2.3.0"
+bdk_wallet = "3.1.0"
 bdk_chain = "0.23"
 bitcoin = { version = "0.32", default-features = false, features = ["secp-lowmemory", "secp-recovery", "std"] }
 ordinals = "0.0.15"
