@@ -49,8 +49,10 @@ In particular:
   intermediate strings/vectors, error formatting, serialization, and `Debug`
   implementations—not only the originating buffer.
 - Hardware/watch-only constructors must reject private descriptors and keys.
-- Lock paths must scrub the master key, consume live signer handles, and prove
-  that later signing fails closed.
+- Persistent BDK wallets must remain watch-only. Software signer containers may
+  exist only within an authorized signing call, and lock paths must scrub the
+  master key and prove that later signing fails closed even through an older
+  reachable BDK handle.
 - New or removed WASM exports must pass this repository's production export audit.
   The downstream Zinc repository additionally maintains an exact normalized
   import/export manifest, so intentional capability changes require a reviewed
