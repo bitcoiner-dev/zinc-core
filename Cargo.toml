@@ -84,7 +84,7 @@ js-sys = "0.3"
 futures-util = "0.3.32"
 
 [target.wasm32-unknown-unknown.dependencies]
-gloo-timers = { version = "0.3.0", features = ["futures"] }
+gloo-timers = { version = "0.4.0", features = ["futures"] }
 
 [dev-dependencies]
 
