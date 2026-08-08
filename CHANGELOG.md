@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-08
+
 ### Added
 - Weekly and change-triggered dependency policy checks with `cargo-deny`, plus
   grouped weekly Dependabot updates and CI enforcement for formatting, Clippy,
