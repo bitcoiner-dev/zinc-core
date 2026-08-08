@@ -361,19 +361,13 @@ async fn probe_single_account(
 ) -> Option<AccountDiscoveryReport> {
     // 1. Build descriptors for this specific index
     let (t_ext, t_int) = if path_type == "legacy" {
-        let path = format!(
-            "86'/{}'/0'",
-            if network == Network::Bitcoin { 0 } else { 1 }
-        );
+        let path = format!("86'/{}'/0'", i32::from(network != Network::Bitcoin));
         (
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/0/{index})"),
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/1/{index})"),
         )
     } else {
-        let path = format!(
-            "86'/{}'/{index}'",
-            if network == Network::Bitcoin { 0 } else { 1 }
-        );
+        let path = format!("86'/{}'/{index}'", i32::from(network != Network::Bitcoin));
         (
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/0/*)"),
             format!("tr([{fingerprint_hex}/{path}]{taproot_xpub}/1/*)"),
@@ -382,19 +376,13 @@ async fn probe_single_account(
 
     let (p_ext, p_int) = if let Some(xpub) = payment_xpub {
         if path_type == "legacy" {
-            let path = format!(
-                "84'/{}'/0'",
-                if network == Network::Bitcoin { 0 } else { 1 }
-            );
+            let path = format!("84'/{}'/0'", i32::from(network != Network::Bitcoin));
             (
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/0/{index})")),
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/1/{index})")),
             )
         } else {
-            let path = format!(
-                "84'/{}'/{index}'",
-                if network == Network::Bitcoin { 0 } else { 1 }
-            );
+            let path = format!("84'/{}'/{index}'", i32::from(network != Network::Bitcoin));
             (
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/0/*)")),
                 Some(format!("wpkh([{fingerprint_hex}/{path}]{xpub}/1/*)")),
@@ -406,15 +394,14 @@ async fn probe_single_account(
 
     // 2. Initialize a temporary wallet to derive addresses
     let builder = WalletBuilder::new(network);
-    let wallet = match builder.build_hardware(
+    let Ok(wallet) = builder.build_hardware(
         fingerprint_hex,
         t_ext.clone(),
         t_int.clone(),
         p_ext.clone(),
         p_int.clone(),
-    ) {
-        Ok(w) => w,
-        Err(_) => return None,
+    ) else {
+        return None;
     };
 
     let vault_addr = wallet.peek_taproot_address(0).to_string();
@@ -483,7 +470,7 @@ async fn fetch_addr_stats(
     address: &str,
 ) -> Option<(u64, Vec<InscriptionPreview>, bool)> {
     // 1. Get Balance from Esplora
-    let url = format!("{}/address/{}", esplora_url, address);
+    let url = format!("{esplora_url}/address/{address}");
     let mut balance = 0u64;
     let mut has_history = false;
 
@@ -494,13 +481,13 @@ async fn fetch_addr_stats(
 
             let chain_funded = chain_stats["funded_txo_sum"].as_u64().unwrap_or(0);
             let chain_spent = chain_stats["spent_txo_sum"].as_u64().unwrap_or(0);
-            let chain_sats = chain_funded.saturating_sub(chain_spent);
+            let confirmed_balance = chain_funded.saturating_sub(chain_spent);
 
             let mempool_funded = mempool_stats["funded_txo_sum"].as_u64().unwrap_or(0);
             let mempool_spent = mempool_stats["spent_txo_sum"].as_u64().unwrap_or(0);
-            let mempool_sats = mempool_funded.saturating_sub(mempool_spent);
+            let unconfirmed_balance = mempool_funded.saturating_sub(mempool_spent);
 
-            balance = chain_sats.saturating_add(mempool_sats);
+            balance = confirmed_balance.saturating_add(unconfirmed_balance);
 
             let tx_count = chain_stats["tx_count"].as_u64().unwrap_or(0)
                 + mempool_stats["tx_count"].as_u64().unwrap_or(0);
@@ -512,7 +499,7 @@ async fn fetch_addr_stats(
 
     // 2. Get Inscriptions from Ord
     let mut inscriptions = Vec::new();
-    let ord_addr_url = format!("{}/address/{}", ord_url, address);
+    let ord_addr_url = format!("{ord_url}/address/{address}");
     if let Ok(resp) = client
         .get(&ord_addr_url)
         .header("Accept", "application/json")
@@ -523,10 +510,8 @@ async fn fetch_addr_stats(
             // Handle different JSON structures: { "inscriptions": [...] } or direct array [...]
             let list_opt = if let Some(list) = json["inscriptions"].as_array() {
                 Some(list)
-            } else if let Some(list) = json.as_array() {
-                Some(list)
             } else {
-                None
+                json.as_array()
             };
 
             if let Some(list) = list_opt {
@@ -547,7 +532,7 @@ async fn fetch_addr_stats(
                                 .get("content_type")
                                 .or(obj.get("contentType"))
                                 .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
+                                .map(std::string::ToString::to_string);
                             inscriptions.push(InscriptionPreview {
                                 id: id.to_string(),
                                 content_type: ct,
@@ -1079,7 +1064,7 @@ struct WalletState {
 enum WalletMaterial {
     MnemonicPhrase(String),
     WatchAddress(String),
-    Hardware { _fingerprint: [u8; 4] },
+    Hardware { fingerprint: [u8; 4] },
 }
 
 #[wasm_bindgen]
@@ -1237,9 +1222,7 @@ impl ZincWasmWallet {
 
         Ok(ZincWasmWallet {
             inner: std::rc::Rc::new(std::cell::RefCell::new(wallet)),
-            material: WalletMaterial::Hardware {
-                _fingerprint: fingerprint,
-            },
+            material: WalletMaterial::Hardware { fingerprint },
             state: std::cell::Cell::new(WalletState {
                 network: network_enum,
                 scheme: AddressScheme::Dual,
@@ -1680,7 +1663,7 @@ impl ZincWasmWallet {
         let inner = self
             .inner
             .try_borrow()
-            .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {}", e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Wallet busy (get_accounts): {e}")))?;
 
         let accounts = inner.get_accounts(count);
         Ok(serde_wasm_bindgen::to_value(&accounts)?)
@@ -3174,10 +3157,7 @@ impl ZincWasmWallet {
 
         match self.inner.try_borrow() {
             Ok(inner) => inner
-                .apply_external_signed_transaction(
-                    prepared_psbt_base64,
-                    signed_transaction_hex,
-                )
+                .apply_external_signed_transaction(prepared_psbt_base64, signed_transaction_hex)
                 .map_err(JsValue::from),
             Err(error) => Err(JsValue::from_str(&format!(
                 "Wallet busy (applyExternalSignedTransaction): {error}"

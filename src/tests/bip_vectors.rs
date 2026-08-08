@@ -26,7 +26,8 @@ use bdk_wallet::bitcoin::{Network, ScriptBuf};
 use crate::keys::{taproot_descriptors, ZincMnemonic};
 
 /// Canonical BIP-39 / BIP-86 mnemonic (all-zero entropy).
-const ABANDON_ABOUT: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const ABANDON_ABOUT: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -49,7 +50,11 @@ fn bip39_seed_matches_trezor_passphrase_vectors() {
     for (phrase, expected_seed) in cases {
         let m = ZincMnemonic::parse(phrase).unwrap();
         let seed = m.to_seed("TREZOR");
-        assert_eq!(to_hex(&seed[..]), expected_seed, "BIP-39 seed mismatch for: {phrase}");
+        assert_eq!(
+            to_hex(&seed[..]),
+            expected_seed,
+            "BIP-39 seed mismatch for: {phrase}"
+        );
     }
 }
 
@@ -90,8 +95,16 @@ fn bip32_test_vector_1_master_and_children() {
             master.derive_priv(&secp, &dp).unwrap()
         };
         let xpub = Xpub::from_priv(&secp, &xprv);
-        assert_eq!(xprv.to_string(), expected_xprv, "BIP-32 xprv mismatch at m/{path}");
-        assert_eq!(xpub.to_string(), expected_xpub, "BIP-32 xpub mismatch at m/{path}");
+        assert_eq!(
+            xprv.to_string(),
+            expected_xprv,
+            "BIP-32 xprv mismatch at m/{path}"
+        );
+        assert_eq!(
+            xpub.to_string(),
+            expected_xpub,
+            "BIP-32 xpub mismatch at m/{path}"
+        );
     }
 }
 
@@ -156,7 +169,11 @@ fn taproot_derivation_matches_raw_rust_bitcoin_differential() {
 
     for i in 0u32..4 {
         // zinc-core: descriptor → definite → scriptPubKey.
-        let zinc_spk = desc.external.at_derivation_index(i).unwrap().script_pubkey();
+        let zinc_spk = desc
+            .external
+            .at_derivation_index(i)
+            .unwrap()
+            .script_pubkey();
 
         // Raw rust-bitcoin: derive m/86'/0'/0'/0/i, tweak the x-only key into a p2tr output.
         let dp = DerivationPath::from_str(&format!("86'/0'/0'/0/{i}")).unwrap();
@@ -172,7 +189,11 @@ fn taproot_derivation_matches_raw_rust_bitcoin_differential() {
     }
 
     // External ground truth: index 0 equals the BIP-86 spec scriptPubKey.
-    let spk0 = desc.external.at_derivation_index(0).unwrap().script_pubkey();
+    let spk0 = desc
+        .external
+        .at_derivation_index(0)
+        .unwrap()
+        .script_pubkey();
     assert_eq!(
         to_hex(spk0.as_bytes()),
         "5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",

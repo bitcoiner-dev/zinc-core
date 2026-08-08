@@ -8,9 +8,7 @@ mod native {
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     pub async fn run() -> Result<(), String> {
-        let esplora_url = if let Ok(url) = std::env::var("ESPLORA_URL") {
-            url
-        } else {
+        let Ok(esplora_url) = std::env::var("ESPLORA_URL") else {
             eprintln!(
                 "Set ESPLORA_URL to run this example (for example: https://mempool.space/api)"
             );

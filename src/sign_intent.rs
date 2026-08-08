@@ -132,7 +132,10 @@ impl PairingRequestV1 {
     }
 
     pub fn pairing_id_digest(&self) -> Result<[u8; 32], ZincError> {
-        domain_separated_digest(DOMAIN_PAIRING_REQUEST, &self.canonical_json()?)
+        Ok(domain_separated_digest(
+            DOMAIN_PAIRING_REQUEST,
+            &self.canonical_json()?,
+        ))
     }
 
     pub fn pairing_id_hex(&self) -> Result<String, ZincError> {
@@ -228,7 +231,10 @@ impl PairingAckV1 {
     }
 
     pub fn ack_id_digest(&self) -> Result<[u8; 32], ZincError> {
-        domain_separated_digest(DOMAIN_PAIRING_ACK, &self.canonical_json()?)
+        Ok(domain_separated_digest(
+            DOMAIN_PAIRING_ACK,
+            &self.canonical_json()?,
+        ))
     }
 
     pub fn ack_id_hex(&self) -> Result<String, ZincError> {
@@ -373,7 +379,10 @@ impl SignIntentV1 {
     }
 
     pub fn intent_id_digest(&self) -> Result<[u8; 32], ZincError> {
-        domain_separated_digest(DOMAIN_SIGN_INTENT, &self.canonical_json()?)
+        Ok(domain_separated_digest(
+            DOMAIN_SIGN_INTENT,
+            &self.canonical_json()?,
+        ))
     }
 
     pub fn intent_id_hex(&self) -> Result<String, ZincError> {
@@ -465,7 +474,10 @@ impl SignIntentReceiptV1 {
     }
 
     pub fn receipt_id_digest(&self) -> Result<[u8; 32], ZincError> {
-        domain_separated_digest(DOMAIN_SIGN_INTENT_RECEIPT, &self.canonical_json()?)
+        Ok(domain_separated_digest(
+            DOMAIN_SIGN_INTENT_RECEIPT,
+            &self.canonical_json()?,
+        ))
     }
 
     pub fn receipt_id_hex(&self) -> Result<String, ZincError> {
@@ -599,7 +611,10 @@ impl PairingAckEnvelopeV1 {
     }
 
     pub fn envelope_id_digest(&self) -> Result<[u8; 32], ZincError> {
-        domain_separated_digest(DOMAIN_PAIRING_ACK_ENVELOPE, &self.canonical_json()?)
+        Ok(domain_separated_digest(
+            DOMAIN_PAIRING_ACK_ENVELOPE,
+            &self.canonical_json()?,
+        ))
     }
 
     pub fn envelope_id_hex(&self) -> Result<String, ZincError> {
@@ -797,7 +812,10 @@ impl PairingCompleteReceiptV1 {
     }
 
     pub fn receipt_id_digest(&self) -> Result<[u8; 32], ZincError> {
-        domain_separated_digest(DOMAIN_PAIRING_COMPLETE_RECEIPT, &self.canonical_json()?)
+        Ok(domain_separated_digest(
+            DOMAIN_PAIRING_COMPLETE_RECEIPT,
+            &self.canonical_json()?,
+        ))
     }
 
     pub fn receipt_id_hex(&self) -> Result<String, ZincError> {
@@ -989,13 +1007,10 @@ pub fn verify_sign_seller_input_scope(
         )));
     }
 
-    let details = match &signed_intent.intent.payload {
-        SignIntentPayloadV1::SignSellerInput(details) => details,
-        _ => {
-            return Err(ZincError::OfferError(
-                "sign intent payload action must be SignSellerInput".to_string(),
-            ))
-        }
+    let SignIntentPayloadV1::SignSellerInput(details) = &signed_intent.intent.payload else {
+        return Err(ZincError::OfferError(
+            "sign intent payload action must be SignSellerInput".to_string(),
+        ));
     };
     details.validate()?;
 
@@ -1715,7 +1730,7 @@ pub fn generate_secret_key_hex() -> Result<String, ZincError> {
 
 pub fn pairing_tag_hash_hex(pairing_id: &str) -> Result<String, ZincError> {
     validate_hex64("pairing id", pairing_id)?;
-    let digest = domain_separated_digest(DOMAIN_PAIRING_TAG_HASH, pairing_id.as_bytes())?;
+    let digest = domain_separated_digest(DOMAIN_PAIRING_TAG_HASH, pairing_id.as_bytes());
     Ok(digest_hex(&digest))
 }
 
@@ -2060,17 +2075,17 @@ fn is_supported_network(network: &str) -> bool {
     matches!(network, "mainnet" | "signet" | "testnet" | "regtest")
 }
 
-fn domain_separated_digest(domain: &str, canonical_payload: &[u8]) -> Result<[u8; 32], ZincError> {
+fn domain_separated_digest(domain: &str, canonical_payload: &[u8]) -> [u8; 32] {
     let mut bytes = Vec::with_capacity(domain.len() + 1 + canonical_payload.len());
     bytes.extend_from_slice(domain.as_bytes());
     bytes.push(0u8);
     bytes.extend_from_slice(canonical_payload);
     let digest = sha256::Hash::hash(&bytes);
-    Ok(digest.to_byte_array())
+    digest.to_byte_array()
 }
 
 fn digest_hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(digest)
 }
 
 fn pubkey_hex_from_secret(secret_key: &SecretKey) -> String {
@@ -2096,7 +2111,7 @@ fn sign_payload_with_expected_pubkey(
         )));
     }
 
-    let digest = domain_separated_digest(domain, canonical_payload)?;
+    let digest = domain_separated_digest(domain, canonical_payload);
     let message = Message::from_digest(digest);
     let secp = Secp256k1::new();
     let keypair = Keypair::from_secret_key(&secp, &secret_key);
@@ -2114,7 +2129,7 @@ fn verify_payload_signature(
         .map_err(|e| ZincError::OfferError(format!("invalid signature pubkey: {e}")))?;
     let signature = Signature::from_str(signature_hex)
         .map_err(|e| ZincError::OfferError(format!("invalid schnorr signature: {e}")))?;
-    let digest = domain_separated_digest(domain, canonical_payload)?;
+    let digest = domain_separated_digest(domain, canonical_payload);
     let message = Message::from_digest(digest);
 
     let secp = Secp256k1::verification_only();

@@ -1422,11 +1422,13 @@ fn test_input_and_output_shift_maintains_valid_signature_and_secures_payout() {
     psbt.unsigned_tx.input.insert(0, dummy_input);
     psbt.unsigned_tx.output.insert(0, dummy_output);
 
-    let mut dummy_psbt_input = bdk_wallet::bitcoin::psbt::Input::default();
-    dummy_psbt_input.witness_utxo = Some(TxOut {
-        value: Amount::from_sat(1000),
-        script_pubkey: ScriptBuf::new(),
-    });
+    let dummy_psbt_input = bdk_wallet::bitcoin::psbt::Input {
+        witness_utxo: Some(TxOut {
+            value: Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::new(),
+        }),
+        ..Default::default()
+    };
     psbt.inputs.insert(0, dummy_psbt_input);
     psbt.outputs
         .insert(0, bdk_wallet::bitcoin::psbt::Output::default());

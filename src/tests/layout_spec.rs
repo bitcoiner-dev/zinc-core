@@ -307,7 +307,7 @@ fn with_layout_rejects_non_seed_wallets_and_bad_layouts() {
 #[test]
 fn layout_spec_serde_round_trips_with_wire_names() {
     let spec = layout(86, Some((49, ScriptKind::ShWpkh)), DerivationMode::Index);
-    let json = serde_json::to_value(&spec).expect("serialize");
+    let json = serde_json::to_value(spec).expect("serialize");
     assert_eq!(
         json,
         serde_json::json!({

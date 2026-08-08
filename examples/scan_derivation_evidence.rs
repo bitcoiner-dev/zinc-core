@@ -120,7 +120,6 @@ fn default_vectors_path() -> PathBuf {
 
 fn parse_network(network: Option<&str>) -> BitcoinNetwork {
     match network.unwrap_or("mainnet") {
-        "mainnet" => BitcoinNetwork::Bitcoin,
         "signet" => BitcoinNetwork::Signet,
         "regtest" => BitcoinNetwork::Regtest,
         _ => BitcoinNetwork::Bitcoin,

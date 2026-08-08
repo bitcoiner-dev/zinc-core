@@ -127,7 +127,7 @@ mod tests {
             psbt.unsigned_tx.output[0].script_pubkey,
             recipient.script_pubkey()
         );
-        assert!(matches!(Runestone::decipher(&psbt.unsigned_tx), None));
+        assert!(Runestone::decipher(&psbt.unsigned_tx).is_none());
         wallet
             .validate_rune_transfer_psbt(&psbt, &result.intent)
             .unwrap();

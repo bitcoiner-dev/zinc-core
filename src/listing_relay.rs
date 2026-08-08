@@ -317,9 +317,8 @@ fn is_eose_frame(frame: &str, subscription_id: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let arr = match value.as_array() {
-        Some(items) => items,
-        None => return false,
+    let Some(arr) = value.as_array() else {
+        return false;
     };
     if arr.len() != 2 {
         return false;

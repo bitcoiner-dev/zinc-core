@@ -12,7 +12,7 @@ mod tests {
 
         // Mock response
         // 1. Mock List Response
-        let _m1 = server
+        let m1 = server
             .mock("GET", format!("/address/{address}").as_str())
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -27,7 +27,7 @@ mod tests {
             .await;
 
         // 2. Mock Details Response
-        let _m2 = server
+        let m2 = server
             .mock(
                 "GET",
                 "/inscription/6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799i0",
@@ -68,8 +68,8 @@ mod tests {
         );
         assert_eq!(inscriptions[0].number, 100);
 
-        _m1.assert_async().await;
-        _m2.assert_async().await;
+        m1.assert_async().await;
+        m2.assert_async().await;
     }
 
     const ADDR: &str = "bc1p5d7rjq7g6rdk2y6876ndge59123232nsq68efq";
@@ -105,8 +105,7 @@ mod tests {
         let err = client
             .get_address_asset_snapshot(ADDR)
             .await
-            .err()
-            .expect("500 must error");
+            .expect_err("500 must error");
         assert!(err.to_string().contains("API Error (Address)"), "{err}");
     }
 
@@ -125,8 +124,7 @@ mod tests {
         let err = client
             .get_address_asset_snapshot(ADDR)
             .await
-            .err()
-            .expect("malformed json must error");
+            .expect_err("malformed json must error");
         assert!(
             err.to_string().contains("Failed to parse Address JSON"),
             "{err}"
@@ -146,8 +144,7 @@ mod tests {
         let err = client
             .get_inscription_details("abc123i0")
             .await
-            .err()
-            .expect("404 details must error");
+            .expect_err("404 details must error");
         assert!(err.to_string().contains("API Error (Details"), "{err}");
     }
 
@@ -188,8 +185,7 @@ mod tests {
         let err = client
             .get_inscription_content("abc123i0")
             .await
-            .err()
-            .expect("500 content must error");
+            .expect_err("500 content must error");
         assert!(err.to_string().contains("API Error (Content"), "{err}");
     }
 
@@ -222,8 +218,7 @@ mod tests {
         let err = client
             .get_indexing_height()
             .await
-            .err()
-            .expect("non-numeric height must error");
+            .expect_err("non-numeric height must error");
         assert!(err.to_string().contains("Invalid blockheight"), "{err}");
     }
 
@@ -234,8 +229,7 @@ mod tests {
         let err = client
             .submit_offer_psbt("   ")
             .await
-            .err()
-            .expect("empty payload must error");
+            .expect_err("empty payload must error");
         assert!(err.to_string().contains("cannot be empty"), "{err}");
     }
 

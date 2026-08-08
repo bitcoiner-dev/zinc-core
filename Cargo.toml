@@ -106,10 +106,13 @@ lto = true
 unsafe_code = "deny"
 
 [lints.clippy]
-all = "warn"
-correctness = "deny"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 # Suppress noisy/low-value lints
+default_trait_access = "allow"
+fn_params_excessive_bools = "allow"
+implicit_hasher = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
@@ -117,6 +120,9 @@ module_name_repetitions = "allow"
 cast_possible_truncation = "allow"
 items_after_statements = "allow"
 needless_pass_by_value = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
 # Ensure blockers stay denied
 todo = "deny"
 unimplemented = "deny"

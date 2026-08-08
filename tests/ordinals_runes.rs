@@ -24,7 +24,7 @@ fn outpoint(i: u8) -> OutPoint {
 fn p2tr_script(seed: u8) -> ScriptBuf {
     // A syntactically valid P2TR script (OP_1 <32 bytes>); fine for analysis.
     let mut bytes = vec![0x51, 0x20];
-    bytes.extend(std::iter::repeat_n(seed, 32));
+    bytes.extend(std::iter::repeat(seed).take(32));
     ScriptBuf::from_bytes(bytes)
 }
 

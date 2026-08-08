@@ -244,8 +244,12 @@ pub struct PreparedExternalSigningRequestV2 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrepareExternalSigningErrorV2 {
-    PreparationFailed { message: String },
-    RequirementsInvalid { message: String },
+    PreparationFailed {
+        message: String,
+    },
+    RequirementsInvalid {
+        message: String,
+    },
     CapabilityRejected {
         requirements: ExternalSigningRequirementsV2,
         compatibility: ExternalSignerCompatibilityV2,
@@ -416,9 +420,7 @@ pub fn derive_external_signing_requirements_v2(
     })
 }
 
-fn key_source_to_derivation(
-    key_source: &bitcoin::bip32::KeySource,
-) -> ExternalSigningDerivationV1 {
+fn key_source_to_derivation(key_source: &bitcoin::bip32::KeySource) -> ExternalSigningDerivationV1 {
     let rendered_path = key_source.1.to_string();
     ExternalSigningDerivationV1 {
         master_fingerprint_hex: key_source.0.to_string().to_lowercase(),
@@ -450,9 +452,7 @@ fn input_derivation(
     }
 }
 
-fn output_derivation(
-    output: &bitcoin::psbt::Output,
-) -> Option<ExternalSigningDerivationV1> {
+fn output_derivation(output: &bitcoin::psbt::Output) -> Option<ExternalSigningDerivationV1> {
     output
         .tap_key_origins
         .values()
@@ -506,9 +506,9 @@ pub fn derive_external_signing_plan_v2(
                 .value
         };
         let default_sighash_type = match input_type {
-                ExternalSigningInputTypeV1::P2trKeyPath
-                | ExternalSigningInputTypeV1::P2trScriptPath => 0,
-                _ => 1,
+            ExternalSigningInputTypeV1::P2trKeyPath
+            | ExternalSigningInputTypeV1::P2trScriptPath => 0,
+            _ => 1,
         };
         let sighash_type = psbt.inputs[index]
             .sighash_type
@@ -586,7 +586,10 @@ pub fn check_external_signer_compatibility_v2(
                 capabilities.signer, requirements.schema_version, capabilities.schema_version
             ),
         ));
-        return ExternalSignerCompatibilityV2 { compatible: false, rejections };
+        return ExternalSignerCompatibilityV2 {
+            compatible: false,
+            rejections,
+        };
     }
 
     for required in &requirements.required_inputs {
@@ -609,16 +612,16 @@ pub fn check_external_signer_compatibility_v2(
             continue;
         };
 
-        if !policy.supported_sighash_types.contains(&required.sighash_type) {
+        if !policy
+            .supported_sighash_types
+            .contains(&required.sighash_type)
+        {
             let mut rejection = rejection_v2(
                 CapabilityRejectionCodeV2::SighashUnsupportedForInput,
                 format!("input.{}.sighash", required.index),
                 format!(
                     "{} cannot sign {:?} input #{} with sighash value {}",
-                    capabilities.signer,
-                    required.input_type,
-                    required.index,
-                    required.sighash_type
+                    capabilities.signer, required.input_type, required.index, required.sighash_type
                 ),
             );
             rejection.input_index = Some(required.index);
@@ -646,7 +649,10 @@ pub fn check_external_signer_compatibility_v2(
         rejections.push(rejection_v2(
             CapabilityRejectionCodeV2::CapabilityUnsupported,
             "transaction.external_inputs",
-            format!("{} cannot safely process external inputs", capabilities.signer),
+            format!(
+                "{} cannot safely process external inputs",
+                capabilities.signer
+            ),
         ));
     }
     if requirements.requires_selective_signing && !capabilities.supports_selective_signing {

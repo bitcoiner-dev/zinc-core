@@ -124,7 +124,7 @@ mod tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let m = ZincMnemonic::parse(phrase).unwrap();
         let seed = m.to_seed("");
-        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = hex::encode(seed);
         assert_eq!(
             hex,
             "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4"

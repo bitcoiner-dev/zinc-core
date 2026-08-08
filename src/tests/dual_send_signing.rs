@@ -75,9 +75,8 @@ fn finalized_pubkey_matches_native_witness(prevout: &TxOut, witness: &bitcoin::W
     if script.len() != 22 || script[0] != 0x00 || script[1] != 0x14 {
         return false;
     }
-    let pubkey = match witness.iter().nth(1) {
-        Some(bytes) => bytes,
-        None => return false,
+    let Some(pubkey) = witness.iter().nth(1) else {
+        return false;
     };
     let pubkey_hash = hash160::Hash::hash(pubkey);
     script[2..22] == pubkey_hash[..]
@@ -112,9 +111,8 @@ fn finalized_pubkey_matches_nested_witness(
         return false;
     }
 
-    let pubkey = match witness.iter().nth(1) {
-        Some(bytes) => bytes,
-        None => return false,
+    let Some(pubkey) = witness.iter().nth(1) else {
+        return false;
     };
     let pubkey_hash = hash160::Hash::hash(pubkey);
     redeem_script[2..22] == pubkey_hash[..]

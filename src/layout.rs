@@ -98,7 +98,7 @@ impl LayoutSpec {
         }
         const MAX_HARDENED: u32 = 0x7FFF_FFFF;
         if self.vault.purpose > MAX_HARDENED
-            || self.payment.map_or(false, |p| p.purpose > MAX_HARDENED)
+            || self.payment.is_some_and(|p| p.purpose > MAX_HARDENED)
         {
             return Err("Layout purpose is out of range".to_string());
         }
@@ -144,7 +144,7 @@ fn coin_type(network: Network) -> u32 {
 fn derive_branch(
     xprv: &Xpriv,
     network: Network,
-    branch: &BranchSpec,
+    branch: BranchSpec,
     account: u32,
     chain: u32,
     start_index: u32,
@@ -194,7 +194,7 @@ pub fn derive_layout_addresses(
     let vault = derive_branch(
         &xprv,
         network,
-        &layout.vault,
+        layout.vault,
         account,
         chain,
         start_index,
@@ -204,7 +204,7 @@ pub fn derive_layout_addresses(
         Some(branch) => Some(derive_branch(
             &xprv,
             network,
-            branch,
+            *branch,
             account,
             chain,
             start_index,
