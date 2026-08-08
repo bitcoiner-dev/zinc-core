@@ -16,13 +16,13 @@ use zinc_core::*;
 #[wasm_bindgen_test]
 fn test_decrypt_wallet_contract() {
     let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    let password = "strong_password_123";
+    let key = JsValue::from(generate_vault_key()).as_string().unwrap();
 
     // 1. Encrypt
-    let encrypted_json = encrypt_wallet(mnemonic, password).unwrap();
+    let encrypted_json = encrypt_wallet_with_key(mnemonic, &key).unwrap();
 
     // 2. Decrypt
-    let result_js = decrypt_wallet(&encrypted_json, password).unwrap();
+    let result_js = decrypt_wallet_with_key(&encrypted_json, &key).unwrap();
 
     // 3. Verify Contract
     // Check if it's a Map (which was the bug case, but if we support it, we check keys)

@@ -21,7 +21,9 @@ use crate::sign_intent::{
     NOSTR_SIGN_INTENT_APP_TAG_VALUE, NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE,
     NOSTR_SIGN_INTENT_TYPE_TAG_VALUE, PAIRING_TRANSPORT_EVENT_KIND,
 };
-use crate::{decrypt_secret_internal, encrypt_secret_internal};
+use crate::{
+    decrypt_secret_with_key_internal, encrypt_secret_with_key_internal, generate_vault_key_internal,
+};
 use base64::Engine;
 use bdk_wallet::bitcoin::hashes::Hash as _;
 use bdk_wallet::bitcoin::psbt::Psbt;
@@ -416,10 +418,11 @@ fn generate_secret_key_hex_returns_valid_32_byte_hex() {
 }
 
 #[test]
-fn encrypt_secret_internal_roundtrip() {
+fn encrypt_secret_with_key_internal_roundtrip() {
     let secret = generate_secret_key_hex().expect("generate secret");
-    let encrypted = encrypt_secret_internal(&secret, "test-password").expect("encrypt secret");
-    let decrypted = decrypt_secret_internal(&encrypted, "test-password").expect("decrypt secret");
+    let key = generate_vault_key_internal();
+    let encrypted = encrypt_secret_with_key_internal(&secret, &key).expect("encrypt secret");
+    let decrypted = decrypt_secret_with_key_internal(&encrypted, &key).expect("decrypt secret");
     assert_eq!(decrypted.as_str(), secret);
 }
 

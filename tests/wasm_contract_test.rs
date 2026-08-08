@@ -8,8 +8,8 @@
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 use zinc_core::{
-    decrypt_secret, decrypt_wallet, decrypt_wallet_with_key, derive_address, encrypt_secret,
-    encrypt_wallet, encrypt_wallet_with_key, generate_vault_key, validate_mnemonic, ZincWasmWallet,
+    decrypt_secret_with_key, decrypt_wallet_with_key, derive_address, encrypt_secret_with_key,
+    encrypt_wallet_with_key, generate_vault_key, validate_mnemonic, ZincWasmWallet,
 };
 
 const PHRASE: &str =
@@ -54,15 +54,18 @@ fn derive_address_returns_regtest_taproot_and_rejects_bad_network() {
 
 #[wasm_bindgen_test]
 fn encrypt_then_decrypt_wallet_round_trips_phrase() {
-    let enc = encrypt_wallet(PHRASE, "pw-123").expect("encrypt");
-    let dec = to_json(decrypt_wallet(&enc, "pw-123").expect("decrypt"));
+    let key = JsValue::from(generate_vault_key()).as_string().unwrap();
+    let enc = encrypt_wallet_with_key(PHRASE, &key).expect("encrypt");
+    let dec = to_json(decrypt_wallet_with_key(&enc, &key).expect("decrypt"));
     assert_eq!(dec["phrase"].as_str().expect("phrase"), PHRASE);
 }
 
 #[wasm_bindgen_test]
-fn decrypt_wallet_with_wrong_password_errors() {
-    let enc = encrypt_wallet(PHRASE, "pw-123").expect("encrypt");
-    assert!(decrypt_wallet(&enc, "wrong-password").is_err());
+fn decrypt_wallet_with_wrong_key_errors() {
+    let key = JsValue::from(generate_vault_key()).as_string().unwrap();
+    let wrong_key = JsValue::from(generate_vault_key()).as_string().unwrap();
+    let enc = encrypt_wallet_with_key(PHRASE, &key).expect("encrypt");
+    assert!(decrypt_wallet_with_key(&enc, &wrong_key).is_err());
 }
 
 #[wasm_bindgen_test]
@@ -89,9 +92,44 @@ fn keystore_wallet_decryption_preserves_the_wasm_response_shape() {
 }
 
 #[wasm_bindgen_test]
+fn legacy_v3_empty_salt_decrypts_across_the_wasm_boundary() {
+    let key = JsValue::from(generate_vault_key())
+        .as_string()
+        .expect("vault key string");
+    let encrypted = encrypt_wallet_with_key(PHRASE, &key).expect("encrypt keystore wallet");
+    let mut legacy: serde_json::Value = serde_json::from_str(&encrypted).expect("vault json");
+    legacy
+        .as_object_mut()
+        .expect("vault object")
+        .insert("salt".to_string(), serde_json::Value::String(String::new()));
+
+    let decrypted = decrypt_wallet_with_key(&legacy.to_string(), &key)
+        .expect("legacy version-three vault should decrypt");
+    assert_eq!(to_json(decrypted)["phrase"].as_str(), Some(PHRASE));
+}
+
+#[wasm_bindgen_test]
+fn non_empty_legacy_salt_is_rejected_across_the_wasm_boundary() {
+    let key = JsValue::from(generate_vault_key())
+        .as_string()
+        .expect("vault key string");
+    let encrypted = encrypt_wallet_with_key(PHRASE, &key).expect("encrypt keystore wallet");
+    let mut invalid: serde_json::Value = serde_json::from_str(&encrypted).expect("vault json");
+    invalid.as_object_mut().expect("vault object").insert(
+        "salt".to_string(),
+        serde_json::Value::String("not-empty".to_string()),
+    );
+
+    assert!(decrypt_wallet_with_key(&invalid.to_string(), &key).is_err());
+}
+
+#[wasm_bindgen_test]
 fn encrypt_then_decrypt_secret_round_trips() {
-    let enc = encrypt_secret("super-secret-value", "pw").expect("encrypt secret");
-    let decrypted = decrypt_secret(&enc, "pw").expect("decrypt secret");
+    let key = JsValue::from(generate_vault_key())
+        .as_string()
+        .expect("vault key string");
+    let enc = encrypt_secret_with_key("super-secret-value", &key).expect("encrypt secret");
+    let decrypted = decrypt_secret_with_key(&enc, &key).expect("decrypt secret");
     assert_eq!(
         JsValue::from(decrypted).as_string().as_deref(),
         Some("super-secret-value")
@@ -101,19 +139,22 @@ fn encrypt_then_decrypt_secret_round_trips() {
 // ---------------- constructors ----------------
 
 #[wasm_bindgen_test]
-fn new_encrypted_builds_a_usable_wallet() {
-    let enc = encrypt_wallet(PHRASE, "pw").expect("encrypt");
-    let w = ZincWasmWallet::new_encrypted(
+fn new_encrypted_with_key_builds_a_usable_wallet() {
+    let key = JsValue::from(generate_vault_key())
+        .as_string()
+        .expect("vault key string");
+    let enc = encrypt_wallet_with_key(PHRASE, &key).expect("encrypt");
+    let w = ZincWasmWallet::new_encrypted_with_key(
         "regtest",
         &enc,
-        "pw",
+        &key,
         Some("unified".to_string()),
         None,
         Some(0),
         None,
         None,
     )
-    .expect("new_encrypted");
+    .expect("new_encrypted_with_key");
     let accts = to_json(w.get_accounts(1).expect("accounts"));
     assert_eq!(accts.as_array().expect("accounts array").len(), 1);
     let first_pubkey = accts[0]["taprootPublicKey"]
@@ -134,12 +175,18 @@ fn new_encrypted_builds_a_usable_wallet() {
 }
 
 #[wasm_bindgen_test]
-fn new_encrypted_with_wrong_password_errors() {
-    let enc = encrypt_wallet(PHRASE, "pw").expect("encrypt");
-    assert!(ZincWasmWallet::new_encrypted(
+fn new_encrypted_with_wrong_key_errors() {
+    let key = JsValue::from(generate_vault_key())
+        .as_string()
+        .expect("vault key string");
+    let wrong_key = JsValue::from(generate_vault_key())
+        .as_string()
+        .expect("wrong vault key string");
+    let enc = encrypt_wallet_with_key(PHRASE, &key).expect("encrypt");
+    assert!(ZincWasmWallet::new_encrypted_with_key(
         "regtest",
         &enc,
-        "nope",
+        &wrong_key,
         Some("unified".to_string()),
         None,
         Some(0),

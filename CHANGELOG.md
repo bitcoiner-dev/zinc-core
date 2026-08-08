@@ -30,8 +30,13 @@ All notable changes to this project will be documented in this file.
   `vaultAddress` / `vaultPublicKey` account-input aliases.
 - **Breaking:** stop emitting and accepting the non-standard Nostr `expires` tag;
   offer and listing events use NIP-40 `expiration` exclusively.
-- **Breaking:** reject password-vault format v1. Password-encrypted secrets use
-  v2; seed vaults should use the hardware-keystore v3 format.
+- **Breaking:** remove password-derived v1/v2 vault encryption and decryption,
+  including the `encrypt_wallet`, `decrypt_wallet`, `encrypt_secret`,
+  `decrypt_secret`, and `ZincWasmWallet.new_encrypted` WASM interfaces. Persisted
+  secret material must use a random version-3 DEK held by platform secure storage.
+- Add version-3 generic-secret encryption and direct encrypted-wallet construction
+  through `encrypt_secret_with_key`, `decrypt_secret_with_key`, and
+  `ZincWasmWallet.new_encrypted_with_key`.
 - Remove the crates.io public-API SemVer compatibility gate while Zinc remains
   pre-release and has no external consumers.
 

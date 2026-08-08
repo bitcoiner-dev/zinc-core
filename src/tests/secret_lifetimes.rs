@@ -3,7 +3,8 @@
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::{
-    decrypt_secret_internal, encrypt_secret_internal, DecryptResponse, WalletMaterial, WalletResult,
+    decrypt_secret_with_key_internal, encrypt_secret_with_key_internal,
+    generate_vault_key_internal, DecryptResponse, WalletMaterial, WalletResult,
 };
 use crate::{keys::ZincMnemonic, Network, WalletBuilder, WalletKind};
 use bdk_wallet::KeychainKind;
@@ -18,8 +19,9 @@ fn mnemonic_result_owners_zeroize_automatically() {
 
 #[test]
 fn decrypted_secret_preserves_zeroizing_ownership() {
-    let encrypted = encrypt_secret_internal("sensitive plaintext", "password").unwrap();
-    let decrypted: Zeroizing<String> = decrypt_secret_internal(&encrypted, "password").unwrap();
+    let key = generate_vault_key_internal();
+    let encrypted = encrypt_secret_with_key_internal("sensitive plaintext", &key).unwrap();
+    let decrypted: Zeroizing<String> = decrypt_secret_with_key_internal(&encrypted, &key).unwrap();
     assert_eq!(decrypted.as_str(), "sensitive plaintext");
 }
 
