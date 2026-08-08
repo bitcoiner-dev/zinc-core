@@ -2070,7 +2070,14 @@ fn domain_separated_digest(domain: &str, canonical_payload: &[u8]) -> Result<[u8
 }
 
 fn digest_hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    // PERFORMANCE OPTIMIZATION (Bolt): Replaced slow format! macro in loop with direct bitwise lookup table mapping
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX_CHARS[(byte >> 4) as usize]);
+        out.push(HEX_CHARS[(byte & 0x0F) as usize]);
+    }
+    String::from_utf8(out).unwrap()
 }
 
 fn pubkey_hex_from_secret(secret_key: &SecretKey) -> String {
