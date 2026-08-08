@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- Keep every persistent BDK wallet watch-only, including while a seed profile is
+  unlocked. Authorized signing operations now derive short-lived BDK signer
+  containers from the master key, pass them explicitly to BDK, and drop them
+  before returning; persisted changesets contain public descriptors only.
+- Locking a seed wallet erases the master Xpriv and invalidates signing without
+  relying on mutation of retained BDK signer maps. Even a BDK signer handle
+  captured before lock is empty and cannot retain signing capability.
+- External-sign preparation now enriches PSBT descriptor metadata with an
+  explicitly empty signer set, so preparation cannot accidentally add a
+  software signature.
+
+### Changed
+- **Breaking:** upgrade BDK Wallet from 2.4 to 3.1 and migrate software signing
+  to `Wallet::sign_with_signers`. Seed descriptors exposed to the live wallet,
+  persistence, and sync layers are public-only.
+- Remove `Clone` from master-key-owning wallet and discovery types and erase the
+  master Xpriv when its owning `WalletKind` is dropped.
+- Prepare the crate as version 0.12.0. The MSRV remains Rust 1.88: BDK Wallet
+  3.1 requires Rust 1.85, while Zinc's already-maintained dependency graph still
+  determines the higher floor.
+
 ## [0.11.0] - 2026-08-08
 
 ### Added

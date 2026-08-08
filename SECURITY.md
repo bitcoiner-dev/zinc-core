@@ -2,14 +2,14 @@
 
 ## Supported Versions
 
-Security fixes are provided for the current `0.10.x` release line. Earlier
+Security fixes are provided for the current `0.11.x` release line. Earlier
 pre-release lines are unsupported because the project intentionally removes
 obsolete security-sensitive APIs rather than maintaining compatibility shims.
 
 | Version | Supported |
 |---|---|
-| `0.10.x` | Yes |
-| `<= 0.9.x` | No |
+| `0.11.x` | Yes |
+| `<= 0.10.x` | No |
 
 ## Reporting a Vulnerability
 

@@ -132,8 +132,9 @@ check remains the post-device trust gate.
 - Mnemonics, vault keys, decrypted responses, and stateful wallet material use
   zeroizing owners where the Rust/WASM boundary permits it.
 - Hosts must call `lock_private_material` (`lockPrivateMaterial` in WASM) before
-  releasing an unlocked wallet; it scrubs the master key and consumes the live
-  BDK signer handles so later signing fails closed.
+  releasing an unlocked wallet; it scrubs the master key so later signing fails
+  closed. Persistent BDK wallets remain watch-only even while unlocked; software
+  signer containers exist only for the duration of an authorized signing call.
 - Hardware-wallet constructors reject descriptors containing private keys, and
   sensitive wallet kinds use redacted `Debug` output.
 - Reporting process: see [SECURITY.md](./SECURITY.md).
