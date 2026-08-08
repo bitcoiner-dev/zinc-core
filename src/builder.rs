@@ -3210,9 +3210,8 @@ impl ZincWallet {
                     .fee_vb(with_change_vsize)
                     .map(Amount::to_sat)
                     .ok_or_else(|| ZincError::WalletError("Fee overflow".to_string()))?;
-                let btc_change = total_input
-                    .checked_sub(base_output_value.saturating_add(with_change_fee))
-                    .unwrap_or_default();
+                let btc_change =
+                    total_input.saturating_sub(base_output_value.saturating_add(with_change_fee));
                 if btc_change >= btc_change_script.minimal_non_dust().to_sat() {
                     if let Some(output) = with_change.last_mut() {
                         output.value = Amount::from_sat(btc_change);

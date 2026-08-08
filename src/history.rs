@@ -120,8 +120,7 @@ impl ZincWallet {
 
             let fee_sats = wallet
                 .calculate_fee(&tx.tx_node.tx)
-                .map(bitcoin::Amount::to_sat)
-                .unwrap_or(0);
+                .map_or(0, bitcoin::Amount::to_sat);
 
             let confirmation_time = match tx.chain_position {
                 bdk_chain::ChainPosition::Confirmed { anchor, .. } => {
