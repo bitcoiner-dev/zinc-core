@@ -1,0 +1,4 @@
+[resolver]
+# Keep routine `cargo update` and Dependabot changes within the package's
+# declared `rust-version`; the dedicated MSRV CI job verifies the result.
+incompatible-rust-versions = "fallback"

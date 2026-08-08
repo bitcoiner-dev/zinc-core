@@ -14,8 +14,8 @@ use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
 use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
 use bdk_wallet::bitcoin::OutPoint;
 use getrandom::getrandom;
+use nostr::key::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
 use nostr::nips::nip44;
-use nostr::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -1533,11 +1533,17 @@ pub fn encrypt_pairing_transport_content(
     )?;
     let sender_secret_key = parse_nostr_secret_key_hex(sender_secret_key_hex)?;
     let recipient_pubkey = parse_nostr_pubkey_hex(recipient_pubkey_hex)?;
-    nip44::encrypt(
+    let mut nonce = [0_u8; 32];
+    getrandom(&mut nonce).map_err(|e| {
+        ZincError::OfferError(format!(
+            "failed to generate pairing transport encryption nonce: {e}"
+        ))
+    })?;
+    nip44::encrypt_with_nonce(
         &sender_secret_key,
         &recipient_pubkey,
         payload_json,
-        nip44::Version::V2,
+        nip44::Nonce::V2(nonce),
     )
     .map_err(|e| ZincError::OfferError(format!("failed to encrypt pairing transport payload: {e}")))
 }

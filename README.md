@@ -18,7 +18,7 @@ Key capabilities:
 
 ```toml
 [dependencies]
-zinc-core = "0.10.0"
+zinc-core = "0.11.0"
 ```
 
 ## What You Get
