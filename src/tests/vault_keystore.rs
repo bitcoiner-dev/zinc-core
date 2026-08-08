@@ -2,7 +2,7 @@
 //!
 //! These exercise the JS-facing `*_internal` functions that the wasm bindings wrap, covering
 //! the full mnemonic round-trip through a hex-encoded data encryption key, the hex-parsing
-//! guards, and the cross-path rejection between the password (v1/v2) and keystore (v3) formats.
+//! guards, and the cross-path rejection between the password-v2 and keystore-v3 formats.
 
 use crate::{
     crypto, decrypt_wallet_with_key_internal, encrypt_wallet_internal,

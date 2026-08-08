@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-08
+
 ### Added
 - Versioned, vendor-neutral external-signer capability negotiation. Zinc now
   derives input, output, sighash, signing-scope, and device-limit requirements
@@ -20,6 +22,18 @@ All notable changes to this project will be documented in this file.
   prefix and kept distinct from ordinary push-data `OP_RETURN` outputs. A signer
   must explicitly advertise Runestone representation support; otherwise the
   request is rejected before device I/O.
+
+### Changed
+- **Breaking:** remove the deprecated positional Rust/WASM `create_psbt` APIs;
+  hosts must use the typed `createPsbt(request)` contract.
+- **Breaking:** remove the retired `vault` / `vaultPublicKey` address aliases and
+  `vaultAddress` / `vaultPublicKey` account-input aliases.
+- **Breaking:** stop emitting and accepting the non-standard Nostr `expires` tag;
+  offer and listing events use NIP-40 `expiration` exclusively.
+- **Breaking:** reject password-vault format v1. Password-encrypted secrets use
+  v2; seed vaults should use the hardware-keystore v3 format.
+- Remove the crates.io public-API SemVer compatibility gate while Zinc remains
+  pre-release and has no external consumers.
 
 ## [0.9.0] - 2026-08-03
 

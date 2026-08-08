@@ -98,8 +98,8 @@ WASM exports include:
 ## External Signer Capabilities
 
 Hardware adapters own provider/model/firmware/transport detection and produce an
-`ExternalSignerCapabilitiesV1`. `zinc-core` does not contain vendor branches. It
-derives `ExternalSigningRequirementsV1` from the exact prepared PSBT and requires
+`ExternalSignerCapabilitiesV2`. `zinc-core` does not contain vendor branches. It
+derives `ExternalSigningRequirementsV2` from the exact prepared PSBT and requires
 every input type, output type, sighash, signing-scope feature, and device limit to
 match before returning a dispatchable request.
 

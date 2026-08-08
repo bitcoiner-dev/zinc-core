@@ -13,13 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::error::ZincError;
 
-/// Argon2 parameters for key derivation.
-/// Version 1: 64MB memory, 3 iterations - secure but slow for browser.
-const V1_M_COST: u32 = 65536; // 64 MB
-const V1_T_COST: u32 = 3;
-const V1_P_COST: u32 = 1;
-
-/// Version 2: 32MB memory, 1 iteration - ~3x faster, balanced for UX.
+/// Version 2 password-vault Argon2 parameters: 32MB memory, 1 iteration.
 const V2_M_COST: u32 = 32768; // 32 MB
 const V2_T_COST: u32 = 1;
 const V2_P_COST: u32 = 1;
@@ -34,7 +28,7 @@ pub struct EncryptedWallet {
     /// Encrypted seed (base64 encoded)
     pub ciphertext: String,
     /// Version for future format changes.
-    /// 1 = Argon2 64MB/3iter, 2 = Argon2 32MB/1iter (both password-derived),
+    /// 2 = Argon2 32MB/1iter (password-derived),
     /// 3 = random 256-bit DEK held in the platform hardware keystore (NOT password-derived).
     pub version: u8,
 }
@@ -44,7 +38,7 @@ pub fn encrypt_seed(seed: &[u8], password: &str) -> Result<EncryptedWallet, Zinc
     // Generate random salt
     let salt = SaltString::generate(&mut OsRng);
 
-    // Default to newest version (v2) for new encryptions
+    // Password-encrypted vaults use the sole supported password format, v2.
     let version = 2;
 
     // Derive key using Argon2id
@@ -76,7 +70,7 @@ pub fn decrypt_seed(
     encrypted: &EncryptedWallet,
     password: &str,
 ) -> Result<Zeroizing<Vec<u8>>, ZincError> {
-    // Derive key using Argon2id with version-specific parameters
+    // Derive the password-vault key using the v2 Argon2id parameters.
     let key = derive_key(password, &encrypted.salt, encrypted.version)?;
 
     // Decode nonce and ciphertext
@@ -168,7 +162,6 @@ pub fn decrypt_seed_with_key(
 /// Derive a 256-bit key from password using Argon2id.
 fn derive_key(password: &str, salt: &str, version: u8) -> Result<Zeroizing<[u8; 32]>, ZincError> {
     let (m, t, p) = match version {
-        1 => (V1_M_COST, V1_T_COST, V1_P_COST),
         2 => (V2_M_COST, V2_T_COST, V2_P_COST),
         _ => {
             return Err(ZincError::EncryptionError(format!(
@@ -296,17 +289,21 @@ mod tests {
     }
 
     #[test]
-    fn derive_key_versions_differ_and_are_deterministic() {
+    fn retired_v1_password_vault_is_rejected() {
+        let mut encrypted = encrypt_seed(b"seed", "pw").unwrap();
+        encrypted.version = 1;
+
+        assert!(decrypt_seed(&encrypted, "pw").is_err());
+    }
+
+    #[test]
+    fn derive_key_v2_is_deterministic() {
         // `derive_key` consumes the salt as raw bytes; any >=8-byte string is valid.
         let salt = "saltsaltsalt1234";
-        let k1a = derive_key("pw", salt, 1).unwrap();
-        let k1b = derive_key("pw", salt, 1).unwrap();
-        let k2 = derive_key("pw", salt, 2).unwrap();
+        let k2a = derive_key("pw", salt, 2).unwrap();
+        let k2b = derive_key("pw", salt, 2).unwrap();
 
-        // Deterministic for a fixed (password, salt, version).
-        assert_eq!(&*k1a, &*k1b);
-        // Different Argon2 params (v1 = 64MB/3, v2 = 32MB/1) must yield different keys.
-        assert_ne!(&*k1a, &*k2);
+        assert_eq!(&*k2a, &*k2b);
     }
 
     #[test]
@@ -350,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_decrypt_with_key_rejects_a_password_derived_vault() {
-        // Symmetrically, the keystore-DEK path must not accept a v1/v2 (password) vault.
+        // Symmetrically, the keystore-DEK path must not accept a v2 password vault.
         let encrypted = encrypt_seed(b"seed", "pw").unwrap(); // version 2
         assert!(decrypt_seed_with_key(&encrypted, &[7u8; 32]).is_err());
     }
