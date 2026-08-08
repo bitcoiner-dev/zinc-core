@@ -12,13 +12,13 @@ fn test_full_creation_flow() {
     assert_eq!(words.len(), 12);
     assert!(!phrase.is_empty());
 
-    // 2. Encrypt Wallet (Simulate "Set Password")
-    let password = "super_secure_password";
-    let encrypted_blob = encrypt_wallet_internal(phrase, password).expect("Encryption failed");
+    // 2. Encrypt Wallet under a random keystore DEK.
+    let key = generate_vault_key_internal();
+    let encrypted_blob = encrypt_wallet_with_key_internal(phrase, &key).expect("Encryption failed");
 
-    // 3. Decrypt Wallet (Simulate "Unlock")
+    // 3. Decrypt Wallet (Simulate keystore-backed unlock).
     let decrypted_res =
-        decrypt_wallet_internal(&encrypted_blob, password).expect("Decryption failed");
+        decrypt_wallet_with_key_internal(&encrypted_blob, &key).expect("Decryption failed");
 
     // 4. Verify Identity
     assert_eq!(&decrypted_res.phrase, phrase);
@@ -34,13 +34,13 @@ fn test_full_restore_flow() {
     assert!(validate_mnemonic_internal(original_phrase));
 
     // 3. Encrypt (Simulate "Set Password")
-    let password = "restore_password_123";
+    let key = generate_vault_key_internal();
     let encrypted_blob =
-        encrypt_wallet_internal(original_phrase, password).expect("Encryption failed");
+        encrypt_wallet_with_key_internal(original_phrase, &key).expect("Encryption failed");
 
     // 4. Decrypt (Simulate "Unlock" to use)
     let decrypted_res =
-        decrypt_wallet_internal(&encrypted_blob, password).expect("Decryption failed");
+        decrypt_wallet_with_key_internal(&encrypted_blob, &key).expect("Decryption failed");
 
     // 5. Verify restored matches original
     assert_eq!(decrypted_res.phrase, original_phrase);

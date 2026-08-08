@@ -85,7 +85,9 @@ ESPLORA_URL=https://mempool.space/api \
 ## WASM Integration Notes
 
 WASM exports include:
-- **Stateless helpers**: `generate_wallet`, `validate_mnemonic`, `derive_address`, `encrypt_wallet`, `decrypt_wallet`
+- **Stateless helpers**: `validate_mnemonic`, `derive_address`, `generate_vault_key`,
+  `encrypt_wallet_with_key`, `decrypt_wallet_with_key`, `encrypt_secret_with_key`,
+  `decrypt_secret_with_key`
 - **Stateful handles**: `ZincWasmWallet` (supports Mnemonic, Watch, and **Hardware** profiles)
 - **Discovery**: `probeHardwareAccounts` for ultra-fast parallel account scanning
 - **Hardware Signing**: `prepareExternalSignPsbt` and `verifyExternalSignedPsbt`

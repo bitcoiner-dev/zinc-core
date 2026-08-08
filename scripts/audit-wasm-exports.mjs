@@ -5,8 +5,17 @@ const artifact = resolve(process.argv[2] ?? 'pkg/zinc_core_bg.wasm');
 const module = new WebAssembly.Module(readFileSync(artifact));
 const exports = WebAssembly.Module.exports(module).map((entry) => entry.name);
 
-if (exports.includes('generate_wallet')) {
-  throw new Error('production zinc-core WASM must not export generate_wallet');
+for (const forbidden of [
+  'generate_wallet',
+  'encrypt_wallet',
+  'decrypt_wallet',
+  'encrypt_secret',
+  'decrypt_secret',
+  'zincwasmwallet_new_encrypted',
+]) {
+  if (exports.includes(forbidden)) {
+    throw new Error(`production zinc-core WASM must not export ${forbidden}`);
+  }
 }
 
 console.log('zinc-core WASM export audit passed');

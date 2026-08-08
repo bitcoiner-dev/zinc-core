@@ -2,12 +2,13 @@
 //!
 //! These exercise the JS-facing `*_internal` functions that the wasm bindings wrap, covering
 //! the full mnemonic round-trip through a hex-encoded data encryption key, the hex-parsing
-//! guards, and the cross-path rejection between the password-v2 and keystore-v3 formats.
+//! guards, and structural rejection of retired password-derived vaults.
 
 use crate::{
-    crypto, decrypt_wallet_with_key_internal, encrypt_wallet_internal,
+    create_password_verifier_internal, crypto, decrypt_secret_with_key_internal,
+    decrypt_wallet_with_key_internal, encrypt_secret_with_key_internal,
     encrypt_wallet_with_key_internal, generate_vault_key, generate_vault_key_internal,
-    parse_vault_key_hex,
+    parse_vault_key_hex, verify_password_internal,
 };
 use zeroize::Zeroizing;
 
@@ -42,13 +43,27 @@ fn v3_wallet_round_trips_through_the_hex_key() {
 
     let vault = encrypt_wallet_with_key_internal(TEST_MNEMONIC, &key_hex).expect("encrypt v3");
     // The persisted blob must self-identify as version 3 so unlock routes to the keystore path.
-    let parsed: crypto::EncryptedWallet = serde_json::from_str(&vault).unwrap();
+    let parsed: crypto::EncryptedVault = serde_json::from_str(&vault).unwrap();
     assert_eq!(parsed.version, 3);
-    assert!(parsed.salt.is_empty(), "v3 carries no password salt");
 
     let recovered = decrypt_wallet_with_key_internal(&vault, &key_hex).expect("decrypt v3");
     assert_eq!(recovered.phrase, TEST_MNEMONIC);
     assert_eq!(recovered.words.len(), 12);
+}
+
+#[test]
+fn legacy_v3_wallet_with_empty_salt_unlocks_through_the_public_seam() {
+    let key_hex = generate_vault_key_internal();
+    let vault = encrypt_wallet_with_key_internal(TEST_MNEMONIC, &key_hex).expect("encrypt v3");
+    let mut legacy: serde_json::Value = serde_json::from_str(&vault).expect("vault json");
+    legacy
+        .as_object_mut()
+        .expect("vault object")
+        .insert("salt".to_string(), serde_json::Value::String(String::new()));
+
+    let recovered = decrypt_wallet_with_key_internal(&legacy.to_string(), &key_hex)
+        .expect("legacy version-three vault should decrypt");
+    assert_eq!(recovered.phrase, TEST_MNEMONIC);
 }
 
 #[test]
@@ -72,13 +87,28 @@ fn malformed_vault_keys_are_rejected_not_panicked() {
 }
 
 #[test]
-fn a_password_vault_cannot_be_opened_by_the_keystore_path() {
-    // A leaked v2 (Argon2-PIN) vault must not be accepted by the v3 keystore-DEK path, and vice
-    // versa — the two formats are cryptographically and structurally distinct.
-    let v2_vault = encrypt_wallet_internal(TEST_MNEMONIC, "123456").expect("v2 vault");
+fn password_vault_shape_cannot_be_opened_by_the_keystore_path() {
+    let v2_vault =
+        r#"{"salt":"c2FsdA==","nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA==","version":2}"#;
     let key_hex = generate_vault_key_internal();
     assert!(
         decrypt_wallet_with_key_internal(&v2_vault, &key_hex).is_err(),
         "v3 path must refuse a version-2 vault"
     );
+}
+
+#[test]
+fn v3_generic_secret_round_trips_through_the_hex_key() {
+    let key_hex = generate_vault_key_internal();
+    let vault = encrypt_secret_with_key_internal("private descriptor", &key_hex).unwrap();
+    let recovered = decrypt_secret_with_key_internal(&vault, &key_hex).unwrap();
+    assert_eq!(recovered.as_str(), "private descriptor");
+}
+
+#[test]
+fn password_verifier_authenticates_without_encrypting_material() {
+    let verifier = create_password_verifier_internal("correct horse").unwrap();
+    assert!(verifier.starts_with("$argon2id$"));
+    assert!(verify_password_internal(&verifier, "correct horse").unwrap());
+    assert!(!verify_password_internal(&verifier, "wrong battery").unwrap());
 }
