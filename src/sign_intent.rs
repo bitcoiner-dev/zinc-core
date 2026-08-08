@@ -2069,8 +2069,16 @@ fn domain_separated_digest(domain: &str, canonical_payload: &[u8]) -> Result<[u8
     Ok(digest.to_byte_array())
 }
 
+// PERFORMANCE OPTIMIZATION (Bolt):
+// Replaced format!("{b:02x}") in a loop with zero-dependency bitwise mapping
+// to avoid generic formatting and UTF-8 validation overhead.
 fn digest_hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = Vec::with_capacity(digest.len() * 2);
+    for &b in digest.iter() {
+        out.push(b"0123456789abcdef"[(b >> 4) as usize]);
+        out.push(b"0123456789abcdef"[(b & 0xf) as usize]);
+    }
+    String::from_utf8(out).unwrap()
 }
 
 fn pubkey_hex_from_secret(secret_key: &SecretKey) -> String {

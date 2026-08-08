@@ -125,7 +125,15 @@ mod tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let m = ZincMnemonic::parse(phrase).unwrap();
         let seed = m.to_seed("");
-        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        // PERFORMANCE OPTIMIZATION (Bolt):
+        // Replaced format!("{b:02x}") in a loop with zero-dependency bitwise mapping
+        // to avoid generic formatting and UTF-8 validation overhead.
+        let mut out = Vec::with_capacity(seed.len() * 2);
+        for &b in seed.iter() {
+            out.push(b"0123456789abcdef"[(b >> 4) as usize]);
+            out.push(b"0123456789abcdef"[(b & 0xf) as usize]);
+        }
+        let hex = String::from_utf8(out).unwrap();
         assert_eq!(
             hex,
             "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4"
