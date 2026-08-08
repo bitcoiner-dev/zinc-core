@@ -1754,21 +1754,15 @@ fn ensure_event_tags_match(
     Ok(())
 }
 
+// PERFORMANCE OPTIMIZATION (Bolt): Replace char pushing and math with a static lookup table to improve performance.
 fn bytes_to_hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push(nibble_to_hex(byte >> 4));
-        out.push(nibble_to_hex(byte & 0x0f));
+        out.push(HEX_CHARS[(byte >> 4) as usize]);
+        out.push(HEX_CHARS[(byte & 0x0f) as usize]);
     }
-    out
-}
-
-fn nibble_to_hex(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => '0',
-    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 fn ensure_event_pairing_hash_matches(
