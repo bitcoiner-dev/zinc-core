@@ -22,6 +22,15 @@ All notable changes to this project will be documented in this file.
   prefix and kept distinct from ordinary push-data `OP_RETURN` outputs. A signer
   must explicitly advertise Runestone representation support; otherwise the
   request is rejected before device I/O.
+- Hardware-wallet construction rejects descriptors containing extended or WIF
+  private keys, and sensitive wallet kinds use redacted `Debug` implementations.
+- Mnemonics, vault keys, decrypted responses, and stateful wallet material use
+  zeroizing owners where their Rust/WASM representations permit it. Explicit
+  wallet lock now scrubs the master private key and consumes live BDK signer
+  handles so the locked object cannot continue signing.
+- Vault-key parsing no longer creates ordinary intermediate decoded buffers, and
+  the retained version-3 encryption/decryption paths keep plaintext and key
+  owners zeroizing through parsing and serialization boundaries.
 
 ### Changed
 - **Breaking:** remove the deprecated positional Rust/WASM `create_psbt` APIs;
