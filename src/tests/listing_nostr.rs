@@ -61,6 +61,7 @@ fn nostr_listing_event_roundtrip_verifies_and_decodes() {
         event.tag_value("expiration"),
         Some(expected_expiration.as_str())
     );
+    assert_eq!(event.tag_value("expires"), None);
 
     event.verify().expect("signature should verify");
     let decoded = event.decode_listing().expect("listing should decode");

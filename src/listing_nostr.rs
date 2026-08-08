@@ -11,7 +11,6 @@ use std::str::FromStr;
 pub const LISTING_EVENT_KIND: u64 = 8_757;
 pub(crate) const LISTING_SCHEMA_TAG_VALUE: &str = "zinc-listing-v1";
 const NIP40_EXPIRATION_TAG_KEY: &str = "expiration";
-const LEGACY_EXPIRES_TAG_KEY: &str = "expires";
 
 /// Nostr event carrying a canonical serialized [`ListingEnvelopeV1`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,10 +57,6 @@ impl NostrListingEvent {
             vec!["listing_id".to_string(), listing_id],
             vec![
                 NIP40_EXPIRATION_TAG_KEY.to_string(),
-                listing.expires_at_unix.to_string(),
-            ],
-            vec![
-                LEGACY_EXPIRES_TAG_KEY.to_string(),
                 listing.expires_at_unix.to_string(),
             ],
         ];
@@ -141,7 +136,6 @@ impl NostrListingEvent {
         }
 
         validate_expiration_tag_matches_listing(self, &listing, NIP40_EXPIRATION_TAG_KEY)?;
-        validate_expiration_tag_matches_listing(self, &listing, LEGACY_EXPIRES_TAG_KEY)?;
 
         Ok(listing)
     }

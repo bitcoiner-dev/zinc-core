@@ -126,34 +126,3 @@ fn test_sign_psbt_invalid_base64() {
         "Expected base64 error, got: {err_msg}"
     );
 }
-
-#[test]
-#[allow(deprecated)]
-fn test_create_psbt_wrapper_matches_typed_path_error_surface() {
-    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    let seed = bip39::Mnemonic::parse(phrase)
-        .expect("valid mnemonic")
-        .to_seed("");
-
-    let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
-        .with_scheme(AddressScheme::Unified)
-        .build()
-        .expect("wallet build");
-
-    wallet.apply_verified_ordinals_update(vec![], std::collections::HashSet::new(), vec![]);
-
-    let recipient = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-    let amount_sats = 10_000;
-    let fee_rate = 1;
-
-    let request = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate as f64)
-        .expect("valid request");
-    let typed_err = wallet
-        .create_psbt_base64(&request)
-        .expect_err("empty wallet should fail");
-    let wrapper_err = wallet
-        .create_psbt(recipient, amount_sats, fee_rate)
-        .expect_err("empty wallet should fail");
-
-    assert_eq!(typed_err.to_string(), wrapper_err);
-}

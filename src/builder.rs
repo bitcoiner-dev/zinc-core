@@ -686,10 +686,8 @@ pub struct Account {
     /// Human-readable account label.
     pub label: String,
     /// Taproot receive address.
-    #[serde(alias = "vaultAddress")]
     pub taproot_address: String,
     /// Taproot public key for account receive path.
-    #[serde(alias = "vaultPublicKey")]
     pub taproot_public_key: String,
     /// Payment receive address when in dual mode.
     pub payment_address: Option<String>,
@@ -3540,24 +3538,6 @@ impl ZincWallet {
         request: &crate::listing::CreateListingPurchaseRequest,
     ) -> Result<crate::listing::CreateListingPurchaseResultV1, ZincError> {
         crate::listing::create_listing_purchase(self, request)
-    }
-
-    /// Create an unsigned PSBT for sending BTC from transport-friendly inputs.
-    ///
-    /// This method is a migration wrapper for app-boundary callers. New native
-    /// Rust integrations should construct `CreatePsbtRequest` and call
-    /// `create_psbt_tx` or `create_psbt_base64`.
-    #[doc(hidden)]
-    #[deprecated(note = "Use create_psbt_base64 with CreatePsbtRequest")]
-    pub fn create_psbt(
-        &mut self,
-        recipient: &str,
-        amount_sats: u64,
-        fee_rate_sat_vb: u64,
-    ) -> Result<String, String> {
-        let request = CreatePsbtRequest::from_parts(recipient, amount_sats, fee_rate_sat_vb as f64)
-            .map_err(|e| e.to_string())?;
-        self.create_psbt_base64(&request).map_err(|e| e.to_string())
     }
 
     fn encode_psbt_base64(psbt: &Psbt) -> String {

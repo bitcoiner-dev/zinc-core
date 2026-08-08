@@ -53,6 +53,7 @@ fn nostr_offer_event_roundtrip_verifies_and_decodes() {
         event.tag_value("expiration"),
         Some(expected_expiration.as_str())
     );
+    assert_eq!(event.tag_value("expires"), None);
 
     event.verify().expect("signature should verify");
     let decoded = event.decode_offer().expect("offer should decode");
@@ -117,7 +118,6 @@ fn nostr_offer_event_decode_rejects_expiration_tag_mismatch() {
             "expiration".to_string(),
             (offer.expires_at_unix + 1).to_string(),
         ],
-        vec!["expires".to_string(), offer.expires_at_unix.to_string()],
     ];
     let payload = serde_json::json!([
         0,

@@ -11,7 +11,6 @@ use std::str::FromStr;
 pub const OFFER_EVENT_KIND: u64 = 8_756;
 const OFFER_SCHEMA_TAG_VALUE: &str = "zinc-offer-v1";
 const NIP40_EXPIRATION_TAG_KEY: &str = "expiration";
-const LEGACY_EXPIRES_TAG_KEY: &str = "expires";
 
 /// Nostr event carrying a canonical serialized [`OfferEnvelopeV1`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,10 +57,6 @@ impl NostrOfferEvent {
             vec!["offer_id".to_string(), offer_id],
             vec![
                 NIP40_EXPIRATION_TAG_KEY.to_string(),
-                offer.expires_at_unix.to_string(),
-            ],
-            vec![
-                LEGACY_EXPIRES_TAG_KEY.to_string(),
                 offer.expires_at_unix.to_string(),
             ],
         ];
@@ -141,7 +136,6 @@ impl NostrOfferEvent {
         }
 
         validate_expiration_tag_matches_offer(self, &offer, NIP40_EXPIRATION_TAG_KEY)?;
-        validate_expiration_tag_matches_offer(self, &offer, LEGACY_EXPIRES_TAG_KEY)?;
 
         Ok(offer)
     }

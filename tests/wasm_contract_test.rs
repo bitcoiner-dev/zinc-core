@@ -201,7 +201,7 @@ fn get_inscriptions_is_empty_array_for_fresh_wallet() {
 }
 
 #[wasm_bindgen_test]
-fn get_addresses_returns_taproot_and_aliased_payment_fields() {
+fn get_addresses_returns_canonical_address_fields() {
     // get_addresses returns an object/map of fields, not a bare array.
     let addrs = to_json(wallet().get_addresses().expect("addresses"));
     assert!(addrs.is_object(), "get_addresses returns a keyed object");
@@ -210,9 +210,10 @@ fn get_addresses_returns_taproot_and_aliased_payment_fields() {
         taproot.starts_with("bcrt1p"),
         "expected regtest taproot, got {taproot}"
     );
-    // Unified scheme aliases payment + the legacy `vault` field onto taproot.
+    // Unified scheme aliases payment onto taproot without emitting retired Zinc field names.
     assert_eq!(addrs["payment"].as_str(), Some(taproot));
-    assert_eq!(addrs["vault"].as_str(), Some(taproot));
+    assert!(addrs.get("vault").is_none());
+    assert!(addrs.get("vaultPublicKey").is_none());
 }
 
 #[wasm_bindgen_test]

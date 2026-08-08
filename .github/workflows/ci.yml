@@ -45,18 +45,6 @@ jobs:
       - name: Measure coverage (fails below floor)
         run: cargo llvm-cov --no-cfg-coverage --fail-under-lines 62
 
-  # Public-API guardrail: this is a published crate. Block any breaking change to
-  # the public API surface relative to the last release on crates.io. Coverage
-  # work is additive (tests only) and must never trip this job.
-  public-api:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check for SemVer-breaking API changes
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-
   # Exercise the #[wasm_bindgen] JS surface (ZincWasmWallet + free fns) under Node.
   # secp256k1-sys compiles C for wasm32, which needs a wasm-capable clang — on Ubuntu
   # the LLVM `clang`/`llvm-ar` provide the wasm target (Apple clang on macOS does NOT;

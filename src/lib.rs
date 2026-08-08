@@ -2096,10 +2096,7 @@ impl ZincWasmWallet {
                     "taproot": vault_addr.to_string(),
                     "taprootPublicKey": vault_pubkey,
                     "payment": payment_addr,
-                    "paymentPublicKey": payment_pubkey,
-                    // Backward-compatible aliases for older clients.
-                    "vault": vault_addr.to_string(),
-                    "vaultPublicKey": vault_pubkey
+                    "paymentPublicKey": payment_pubkey
                 });
                 serde_wasm_bindgen::to_value(&json).map_err(|e| JsValue::from(e.to_string()))
             }
@@ -3068,28 +3065,6 @@ impl ZincWasmWallet {
                 "Wallet busy (createListingPurchase): {e}"
             ))),
         }
-    }
-
-    /// Create an unsigned PSBT for sending BTC from positional args.
-    ///
-    /// Deprecated migration wrapper for consumers that haven't moved to
-    /// `createPsbt(request)` yet.
-    #[doc(hidden)]
-    pub fn create_psbt(
-        &self,
-        recipient: &str,
-        amount_sats: u64,
-        fee_rate_sat_vb: u64,
-    ) -> Result<String, JsValue> {
-        self.check_vitality()?;
-        self.create_psbt_with_transport(
-            crate::builder::CreatePsbtTransportRequest {
-                recipient: recipient.to_string(),
-                amount_sats,
-                fee_rate_sat_vb: fee_rate_sat_vb as f64,
-            },
-            "create_psbt",
-        )
     }
 
     /// Sign a PSBT using the wallet's internal keys.
