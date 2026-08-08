@@ -165,9 +165,8 @@ impl ZincWallet {
     ) -> Vec<InscriptionDetails> {
         let mut results = Vec::new();
         for (i, _) in tx.output.iter().enumerate() {
-            let vout = match u32::try_from(i) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Ok(vout) = u32::try_from(i) else {
+                continue;
             };
             let outpoint = bitcoin::OutPoint::new(txid, vout);
             // Find the inscription that matches this outpoint in our cache

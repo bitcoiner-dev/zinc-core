@@ -261,7 +261,7 @@ fn prepare_offer_acceptance_rejects_seller_input_not_first() {
 
 /// A hostile counterparty crafts an offer whose amounts validate perfectly but
 /// whose payout output pays an address they control. The value checks are
-/// self-consistent because ask_sats comes from the attacker's own envelope, so
+/// self-consistent because `ask_sats` comes from the attacker's own envelope, so
 /// only the script binding catches this — without it the seller signs their
 /// inscription away for nothing.
 #[test]

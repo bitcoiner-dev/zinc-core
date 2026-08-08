@@ -316,10 +316,9 @@ fn resolve_publisher_pubkey(
 
 fn network_name(network: bdk_wallet::bitcoin::Network) -> &'static str {
     match network {
-        bdk_wallet::bitcoin::Network::Bitcoin => "bitcoin",
+        bdk_wallet::bitcoin::Network::Bitcoin | bdk_wallet::bitcoin::Network::Testnet4 => "bitcoin",
         bdk_wallet::bitcoin::Network::Testnet => "testnet",
         bdk_wallet::bitcoin::Network::Signet => "signet",
         bdk_wallet::bitcoin::Network::Regtest => "regtest",
-        _ => "bitcoin",
     }
 }

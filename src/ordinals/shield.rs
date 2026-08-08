@@ -82,11 +82,11 @@ pub struct OutputInfo {
     /// Simulated rune amounts this output would receive.
     #[serde(default)]
     pub runes: Vec<RuneAmount>,
-    /// True when the script is OP_RETURN (runes allocated here are burned).
+    /// True when the script is `OP_RETURN` (runes allocated here are burned).
     #[serde(default)]
     pub is_op_return: bool,
     /// True when the value is below the script's minimal non-dust threshold.
-    /// Always `false` for OP_RETURN outputs.
+    /// Always `false` for `OP_RETURN` outputs.
     #[serde(default)]
     pub is_dust: bool,
 }
@@ -455,7 +455,7 @@ pub fn analyze_psbt_with_scope(
             .collect::<std::collections::HashSet<_>>()
     });
 
-    let mut analysis_psbt = psbt.clone();
+    let analysis_psbt = psbt.clone();
     let mut scoped_known_inscriptions: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::new();
     let mut scope_has_unknown_inputs = false;
 
@@ -561,7 +561,7 @@ pub fn analyze_psbt_with_scope(
     for (i, input) in analysis_psbt.inputs.iter().enumerate() {
         let in_scope = scope_set
             .as_ref()
-            .is_none_or(|allowed| allowed.contains(&i));
+            .map_or(true, |allowed| allowed.contains(&i));
 
         let utxo = &input.witness_utxo;
 

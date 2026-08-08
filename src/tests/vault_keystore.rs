@@ -92,7 +92,7 @@ fn password_vault_shape_cannot_be_opened_by_the_keystore_path() {
         r#"{"salt":"c2FsdA==","nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA==","version":2}"#;
     let key_hex = generate_vault_key_internal();
     assert!(
-        decrypt_wallet_with_key_internal(&v2_vault, &key_hex).is_err(),
+        decrypt_wallet_with_key_internal(v2_vault, &key_hex).is_err(),
         "v3 path must refuse a version-2 vault"
     );
 }

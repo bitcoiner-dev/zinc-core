@@ -548,10 +548,10 @@ mod tests {
         );
     }
 
-    /// The wallet holds the true TxOut for its own UTXOs, so a PSBT that
+    /// The wallet holds the true `TxOut` for its own UTXOs, so a PSBT that
     /// declares a different value for one of them is lying. The enrichment
     /// pass used to backfill only when BOTH UTXO fields were absent, so a
-    /// declared witness_utxo was never compared against what we knew.
+    /// declared `witness_utxo` was never compared against what we knew.
     #[test]
     fn rejects_witness_utxo_that_contradicts_a_wallet_owned_output() {
         let seed = [0u8; 64];
@@ -829,8 +829,8 @@ mod pairing_identity {
     use bdk_wallet::bitcoin::Network;
 
     /// The pairing identity pubkey is published in cleartext (as
-    /// NostrTransportEventV1.pubkey and as wallet_pubkey_hex inside
-    /// PairingAckV1 / SignIntentV1). It must therefore not be the key whose
+    /// NostrTransportEventV1.pubkey and as `wallet_pubkey_hex` inside
+    /// `PairingAckV1` / `SignIntentV1`). It must therefore not be the key whose
     /// BIP-86 tweak produces a funded address, or publishing it hands out the
     /// user's address, balance and full history.
     #[test]
@@ -948,7 +948,10 @@ mod pairing_identity {
         let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
         psbt.inputs[0].tap_key_origins.insert(
             reveal_xonly,
-            (vec![leaf_hash], (Fingerprint::from([0u8; 4]), DerivationPath::master())),
+            (
+                vec![leaf_hash],
+                (Fingerprint::from([0u8; 4]), DerivationPath::master()),
+            ),
         );
         psbt.inputs[0]
             .tap_scripts
@@ -958,7 +961,11 @@ mod pairing_identity {
         let signed_b64 = wallet
             .sign_psbt(
                 &b64,
-                Some(SignOptions { sign_inputs: None, sighash: None, finalize: false }),
+                Some(SignOptions {
+                    sign_inputs: None,
+                    sighash: None,
+                    finalize: false,
+                }),
             )
             .expect("sign_psbt returns Ok (refusing the leaf, not erroring)");
         let signed = Psbt::deserialize(&STANDARD.decode(signed_b64).unwrap()).unwrap();

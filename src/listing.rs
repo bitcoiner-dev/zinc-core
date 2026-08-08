@@ -180,7 +180,7 @@ impl ListingEnvelopeV1 {
     /// Compute the SHA-256 listing id hex string.
     pub fn listing_id_hex(&self) -> Result<String, ZincError> {
         let digest = self.listing_id_digest()?;
-        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+        Ok(hex::encode(digest))
     }
 }
 
@@ -540,7 +540,7 @@ pub fn finalize_listing_purchase(
         && request
             .change_script_pubkey
             .as_ref()
-            .is_none_or(|script| script.as_script().is_empty())
+            .map_or(true, |script| script.as_script().is_empty())
     {
         return Err(ZincError::OfferError(
             "change scriptPubKey is required when change_sats > 0".to_string(),
@@ -681,7 +681,7 @@ pub fn finalize_listing_purchase(
 
     let psbt_base64 = encode_psbt_base64(&psbt);
     let mut listing = request.listing.clone();
-    listing.sale_psbt_base64 = psbt_base64.clone();
+    listing.sale_psbt_base64.clone_from(&psbt_base64);
 
     Ok(FinalizeListingPurchaseResultV1 {
         listing,
@@ -848,8 +848,7 @@ pub fn create_listing_purchase(
     for index in &buyer_input_indices {
         if !input_has_signature(&psbt.inputs[*index]) {
             return Err(ZincError::OfferError(format!(
-                "buyer input #{} was not signed by this wallet",
-                index
+                "buyer input #{index} was not signed by this wallet"
             )));
         }
     }
@@ -863,7 +862,7 @@ pub fn create_listing_purchase(
 
     let psbt_base64 = encode_psbt_base64(&psbt);
     let mut listing = request.listing.clone();
-    listing.sale_psbt_base64 = psbt_base64.clone();
+    listing.sale_psbt_base64.clone_from(&psbt_base64);
     prepare_listing_sale_signature_with_policy(&listing, request.now_unix, true)?;
 
     Ok(CreateListingPurchaseResultV1 {

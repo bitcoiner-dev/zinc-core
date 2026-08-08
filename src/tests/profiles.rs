@@ -158,9 +158,8 @@ fn test_watch_address_mode_rejects_dual_scheme() {
         .expect("valid tracked address")
         .with_scheme(AddressScheme::Dual)
         .build();
-    let err = match result {
-        Ok(_) => panic!("dual scheme should not be allowed for address watch mode"),
-        Err(e) => e,
+    let Err(err) = result else {
+        panic!("dual scheme should not be allowed for address watch mode");
     };
     assert!(err.contains("Address watch profiles support unified scheme only"));
 }
@@ -179,9 +178,8 @@ fn test_watch_address_mode_rejects_non_taproot_address() {
         .to_string();
 
     let result = WalletBuilder::from_watch_only(network).with_watch_address(&non_taproot_address);
-    let err = match result {
-        Ok(_) => panic!("non-taproot watch address should be rejected"),
-        Err(e) => e,
+    let Err(err) = result else {
+        panic!("non-taproot watch address should be rejected");
     };
     assert!(err.contains("supports taproot"));
 }

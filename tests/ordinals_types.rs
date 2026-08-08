@@ -38,7 +38,7 @@ mod tests {
             inscription.id,
             "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799i0"
         );
-        assert_eq!(inscription.number, 3534343);
+        assert_eq!(inscription.number, 3_534_343);
         assert_eq!(inscription.content_type, Some("text/plain".to_string()));
         assert_eq!(inscription.value, Some(10000));
         assert_eq!(

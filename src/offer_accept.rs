@@ -29,7 +29,7 @@ pub struct OfferAcceptancePlanV1 {
 /// taken from the offer is one the attacker chose.
 ///
 /// SECURITY: this used to validate output *values* only, and never once
-/// referenced a script_pubkey. A hostile counterparty could craft an offer
+/// referenced a `script_pubkey`. A hostile counterparty could craft an offer
 /// whose amounts validate perfectly while output[1] pays an address they
 /// control — the seller signs their inscription away and receives nothing.
 /// The value check protects nothing on its own because `ask_sats` comes from

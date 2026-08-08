@@ -210,8 +210,7 @@ fn parse_offers_payload(body: &str) -> Result<Vec<String>, OrdError> {
         .map_err(|e| OrdError::RequestFailed(format!("Failed to parse offers JSON: {e}")))?;
 
     Ok(match parsed {
-        OffersResponse::Wrapped { offers } => offers,
-        OffersResponse::Bare(offers) => offers,
+        OffersResponse::Wrapped { offers } | OffersResponse::Bare(offers) => offers,
     })
 }
 
@@ -312,7 +311,10 @@ fn merge_rune_balances(entries: impl IntoIterator<Item = RuneBalance>) -> Vec<Ru
 
 fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
     match value {
-        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => Vec::new(),
         serde_json::Value::Array(items) => {
             let parsed =
                 items
@@ -397,7 +399,6 @@ fn parse_runes_balances_value(value: &serde_json::Value) -> Vec<RuneBalance> {
                 .collect::<Vec<_>>();
             merge_rune_balances(parsed)
         }
-        _ => Vec::new(),
     }
 }
 
@@ -1063,7 +1064,7 @@ mod tests {
     fn parse_runes_balances_supports_output_object_shape() {
         let value: serde_json::Value = serde_json::json!({
             "NO•ORDINARY•KIND": {
-                "amount": 150000,
+                "amount": 150_000,
                 "divisibility": 0,
                 "symbol": "🚪"
             },

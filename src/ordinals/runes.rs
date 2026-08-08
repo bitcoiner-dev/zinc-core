@@ -155,7 +155,7 @@ fn spaced_rune_name(etching: &ordinals::Etching) -> Option<String> {
 ///   `output == tx.output.len()` distributes across all non-OP_RETURN outputs
 ///   (evenly for `amount == 0`, with the remainder going one unit at a time to
 ///   the leading outputs; otherwise `amount` per output until exhausted).
-/// - Runes allocated to an OP_RETURN output are burned.
+/// - Runes allocated to an `OP_RETURN` output are burned.
 /// - Unallocated runes go to the pointer output when set, else the first
 ///   non-OP_RETURN output; if that target is missing they are burned.
 /// - An unknown mint amount is never guessed: the minted rune's flows are
@@ -269,22 +269,19 @@ pub(crate) fn simulate_rune_flow(
                     rune_id: mint.to_string(),
                     amount: mint_amount.map(|amount| amount.to_string()),
                 });
-                match mint_amount {
-                    Some(amount) => {
-                        let entry = unallocated.entry(mint).or_insert(0);
-                        *entry = entry.saturating_add(amount);
-                    }
-                    None => {
-                        actions.mint_amount_unknown = true;
-                        if unallocated.contains_key(&mint) {
-                            warnings.push(format!(
-                                "This transaction mints rune {mint}; the mint amount cannot be verified offline, so amounts shown for it are a lower bound."
-                            ));
-                        } else {
-                            warnings.push(format!(
-                                "This transaction mints rune {mint}; the mint amount cannot be verified offline."
-                            ));
-                        }
+                if let Some(amount) = mint_amount {
+                    let entry = unallocated.entry(mint).or_insert(0);
+                    *entry = entry.saturating_add(amount);
+                } else {
+                    actions.mint_amount_unknown = true;
+                    if unallocated.contains_key(&mint) {
+                        warnings.push(format!(
+                            "This transaction mints rune {mint}; the mint amount cannot be verified offline, so amounts shown for it are a lower bound."
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "This transaction mints rune {mint}; the mint amount cannot be verified offline."
+                        ));
                     }
                 }
             }

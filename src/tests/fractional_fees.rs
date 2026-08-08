@@ -171,9 +171,11 @@ mod tests {
     #[test]
     fn consolidate_at_fractional_rates_never_underpays() {
         let mut previous_fee = 0u64;
-        for rate in [0.1, 0.5, 0.9, 1.5] {
+        for rate_tenths in [1_u32, 5, 9, 15] {
+            let rate = f64::from(rate_tenths) / 10.0;
             let (fee, unsigned_vsize) = consolidate_fee_at(rate);
-            let floor = (unsigned_vsize as f64 * rate).ceil() as u64;
+            let unsigned_vsize = u64::try_from(unsigned_vsize).expect("vsize fits in u64");
+            let floor = (unsigned_vsize * u64::from(rate_tenths)).div_ceil(10);
             assert!(
                 fee >= floor,
                 "at {rate} sat/vB fee {fee} underpays floor {floor} (vsize {unsigned_vsize})"

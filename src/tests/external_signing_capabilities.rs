@@ -5,8 +5,8 @@ mod tests {
         check_external_signer_compatibility_v2, classify_external_signing_output,
         derive_external_signing_requirements_v2, CapabilityRejectionCodeV2,
         ExternalSignerCapabilitiesV2, ExternalSignerInputPolicyV2, ExternalSignerLimitsV1,
-        ExternalSigningInputRequirementV2, ExternalSigningInputTypeV1,
-        ExternalSigningOutputTypeV1, EXTERNAL_SIGNING_SCHEMA_V2,
+        ExternalSigningInputRequirementV2, ExternalSigningInputTypeV1, ExternalSigningOutputTypeV1,
+        EXTERNAL_SIGNING_SCHEMA_V2,
     };
     use bitcoin::hashes::Hash;
     use bitcoin::psbt::Psbt;
@@ -194,7 +194,10 @@ mod tests {
         let value = serde_json::to_value(capabilities).unwrap();
 
         assert_eq!(value["schemaVersion"], EXTERNAL_SIGNING_SCHEMA_V2);
-        assert_eq!(value["inputSigningPolicies"][0]["inputType"], "p2tr_key_path");
+        assert_eq!(
+            value["inputSigningPolicies"][0]["inputType"],
+            "p2tr_key_path"
+        );
         assert_eq!(value["supportedOutputTypes"][0], "runestone");
     }
 

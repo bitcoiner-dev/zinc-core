@@ -138,15 +138,15 @@ mod tests {
         );
 
         let txs = w.get_transactions(50);
-        let send = txs
+        let send_record = txs
             .iter()
             .find(|t| t.txid == spend.compute_txid().to_string())
             .expect("spend tx present");
-        assert_eq!(send.tx_type, "send");
+        assert_eq!(send_record.tx_type, "send");
         assert!(
-            send.amount_sats < 0,
+            send_record.amount_sats < 0,
             "spend reduces balance: {}",
-            send.amount_sats
+            send_record.amount_sats
         );
     }
 
