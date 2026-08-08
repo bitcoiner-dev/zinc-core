@@ -301,8 +301,7 @@ pub(crate) fn simulate_rune_flow(
                     // Distribute over all non-OP_RETURN outputs.
                     if edict.amount == 0 {
                         let count = non_op_return_outputs.len() as u128;
-                        if count > 0 {
-                            let share = *balance / count;
+                        if let Some(share) = (*balance).checked_div(count) {
                             let remainder = (*balance % count) as usize;
                             for (position, vout) in non_op_return_outputs.iter().enumerate() {
                                 let extra = u128::from(position < remainder);
