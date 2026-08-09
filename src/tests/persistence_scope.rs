@@ -1,4 +1,7 @@
-use crate::builder::{AddressScheme, PaymentAddressType, Seed64, WalletBuilder};
+use crate::builder::{
+    AddressScheme, CreatePsbtRequest, PaymentAddressType, Seed64, SignOptions, WalletBuilder,
+};
+use base64::Engine;
 use bdk_wallet::bitcoin::hashes::Hash;
 use bdk_wallet::bitcoin::{Amount, Network, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::ConfirmationBlockTime;
@@ -133,4 +136,58 @@ fn test_payment_type_scoped_persistence_does_not_leak_payment_utxos() {
         payment_unspent.is_empty(),
         "nested payment wallet should not inherit native payment UTXOs from persistence"
     );
+}
+
+#[test]
+fn restored_seed_wallet_signs_and_finalizes_from_persisted_state() {
+    let seed = [13u8; 64];
+    let mut original = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+        .with_scheme(AddressScheme::Dual)
+        .with_payment_address_type(PaymentAddressType::NativeSegwit)
+        .build()
+        .expect("original wallet");
+    apply_confirmed_payment_utxo(&mut original, 100_000, 3);
+
+    let persistence = serde_json::to_string(&original.export_changeset().expect("persistence"))
+        .expect("serialize persistence");
+    let mut restored = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array(seed))
+        .with_scheme(AddressScheme::Dual)
+        .with_payment_address_type(PaymentAddressType::NativeSegwit)
+        .with_persistence(&persistence)
+        .expect("accept persistence")
+        .build()
+        .expect("restored wallet");
+    restored.apply_verified_ordinals_update(vec![], std::collections::HashSet::new(), vec![]);
+
+    let recipient = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([14u8; 64]))
+        .with_scheme(AddressScheme::Dual)
+        .with_payment_address_type(PaymentAddressType::NativeSegwit)
+        .build()
+        .expect("recipient wallet")
+        .peek_payment_address(0)
+        .expect("recipient payment address")
+        .to_string();
+    let request = CreatePsbtRequest::from_parts(&recipient, 40_000, 1.0).expect("request");
+    let unsigned = restored
+        .create_psbt_base64(&request)
+        .expect("restored wallet should create a PSBT from persisted funds");
+    let signed = restored
+        .sign_psbt(
+            &unsigned,
+            Some(SignOptions {
+                sign_inputs: None,
+                sighash: None,
+                finalize: true,
+            }),
+        )
+        .expect("restored wallet should sign and finalize");
+
+    let signed_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signed)
+        .expect("decode signed PSBT");
+    let signed_psbt = bitcoin::psbt::Psbt::deserialize(&signed_bytes).expect("signed PSBT");
+    let transaction = signed_psbt
+        .extract_tx()
+        .expect("finalized PSBT should extract");
+    assert_eq!(transaction.input.len(), 1);
 }

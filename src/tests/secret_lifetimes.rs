@@ -72,3 +72,65 @@ fn locking_a_wallet_removes_live_signing_material() {
         .ids()
         .is_empty());
 }
+
+#[test]
+fn dual_seed_wallet_retains_only_public_descriptors_and_empty_signers() {
+    let wallet = WalletBuilder::from_seed(
+        Network::Regtest,
+        crate::builder::Seed64::from_array([7; 64]),
+    )
+    .with_scheme(crate::builder::AddressScheme::Dual)
+    .build()
+    .expect("dual seed wallet");
+
+    for bdk_wallet in [
+        &wallet.vault_wallet,
+        wallet
+            .payment_wallet
+            .as_ref()
+            .expect("dual wallet should include payment wallet"),
+    ] {
+        assert!(
+            bdk_wallet
+                .get_signers(KeychainKind::External)
+                .ids()
+                .is_empty(),
+            "external persistent signer map must be empty"
+        );
+        assert!(
+            bdk_wallet
+                .get_signers(KeychainKind::Internal)
+                .ids()
+                .is_empty(),
+            "internal persistent signer map must be empty"
+        );
+    }
+
+    let persistence = wallet.export_changeset().expect("persistence");
+    let taproot = persistence
+        .taproot
+        .expect("dual persistence should include taproot changeset");
+    let payment = persistence
+        .payment
+        .expect("dual persistence should include payment changeset");
+    for descriptor in [
+        taproot.descriptor,
+        taproot.change_descriptor,
+        payment.descriptor,
+        payment.change_descriptor,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let rendered = descriptor.to_string();
+        assert!(
+            !rendered.contains("prv"),
+            "private descriptor was persisted"
+        );
+        rendered
+            .parse::<bdk_wallet::descriptor::Descriptor<
+                bdk_wallet::descriptor::DescriptorPublicKey,
+            >>()
+            .expect("persisted payment descriptor must contain public keys only");
+    }
+}
