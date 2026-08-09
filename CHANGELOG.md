@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-08
+
 ### Security
 - Keep every persistent BDK wallet watch-only, including while a seed profile is
   unlocked. Authorized signing operations now derive short-lived BDK signer
