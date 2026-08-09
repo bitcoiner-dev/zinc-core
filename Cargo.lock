@@ -3236,7 +3236,7 @@ dependencies = [
  "mockito",
  "nostr",
  "ordinals",
- "rand 0.8.7",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde-wasm-bindgen",
