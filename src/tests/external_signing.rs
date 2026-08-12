@@ -258,6 +258,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_structurally_valid_but_cryptographically_invalid_signature() {
+        let (mut w, unsigned) = setup();
+        let signed = sign_all(&mut w, &unsigned);
+        let mut forged = decode(&signed);
+        let mut signature_bytes = forged.inputs[0]
+            .tap_key_sig
+            .expect("taproot signature")
+            .to_vec();
+        signature_bytes[0] ^= 1;
+        forged.inputs[0].tap_key_sig = Some(
+            bitcoin::taproot::Signature::from_slice(&signature_bytes)
+                .expect("mutated bytes remain structurally valid"),
+        );
+
+        let err = w
+            .verify_external_signed_psbt(&unsigned, &b64(&forged.serialize()), None, false)
+            .expect_err("a signature from the wrong key/message must fail");
+        assert!(err.contains("invalid Taproot signature"), "{err}");
+    }
+
+    #[test]
     fn verify_finalizes_into_witness() {
         let (mut w, unsigned) = setup();
         let signed = sign_all(&mut w, &unsigned);
@@ -507,6 +528,7 @@ mod tests {
             Vec::new(),
             std::collections::HashSet::new(),
             Vec::new(),
+            std::collections::HashSet::new(),
         );
         assert!(wallet.ordinals_verified());
         wallet.mark_ordinals_unverified();

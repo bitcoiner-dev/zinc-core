@@ -43,6 +43,182 @@ fn wasm_now_secs() -> u64 {
     }
 }
 
+fn verify_external_input_signatures(psbt: &Psbt, input_index: usize) -> Result<(), String> {
+    use bitcoin::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+    use bitcoin::sighash::{Prevouts, SighashCache};
+
+    let input = psbt
+        .inputs
+        .get(input_index)
+        .ok_or_else(|| format!("Security Violation: input #{input_index} is missing"))?;
+    let prevout = psbt
+        .spend_utxo(input_index)
+        .map_err(|e| format!("Security Violation: input #{input_index} has no spend UTXO: {e}"))?;
+    let secp = Secp256k1::verification_only();
+    let mut verified_count = 0usize;
+
+    if let Some(signature) = input.tap_key_sig {
+        if !prevout.script_pubkey.is_p2tr() {
+            return Err(format!(
+                "Security Violation: input #{input_index} has a Taproot key signature for a non-P2TR prevout"
+            ));
+        }
+        let output_key = XOnlyPublicKey::from_slice(&prevout.script_pubkey.as_bytes()[2..34])
+            .map_err(|e| format!("Security Violation: invalid P2TR output key: {e}"))?;
+        let spend_utxos = (0..psbt.inputs.len())
+            .map(|index| psbt.spend_utxo(index))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Security Violation: missing Taproot prevout: {e}"))?;
+        let prevouts = if (signature.sighash_type as u8) & 0x80 != 0 {
+            Prevouts::One(input_index, prevout)
+        } else {
+            Prevouts::All(&spend_utxos)
+        };
+        let sighash = SighashCache::new(&psbt.unsigned_tx)
+            .taproot_key_spend_signature_hash(input_index, &prevouts, signature.sighash_type)
+            .map_err(|e| format!("Security Violation: Taproot sighash failed: {e}"))?;
+        let message = Message::from_digest(sighash.to_byte_array());
+        secp.verify_schnorr(&signature.signature, &message, &output_key)
+            .map_err(|_| {
+                format!("Security Violation: input #{input_index} has an invalid Taproot signature")
+            })?;
+        verified_count += 1;
+    }
+
+    if !input.tap_script_sigs.is_empty() {
+        return Err(format!(
+            "Security Violation: input #{input_index} uses unsupported external Taproot script-path signatures"
+        ));
+    }
+
+    for (pubkey, signature) in &input.partial_sigs {
+        let signing_script = if prevout.script_pubkey.is_p2wpkh() {
+            &prevout.script_pubkey
+        } else if prevout.script_pubkey.is_p2sh()
+            && input
+                .redeem_script
+                .as_ref()
+                .is_some_and(|script| script.is_p2wpkh())
+        {
+            let redeem_script = input.redeem_script.as_ref().expect("checked redeem script");
+            if redeem_script.to_p2sh() != prevout.script_pubkey {
+                return Err(format!(
+                    "Security Violation: input #{input_index} redeem script is not authorized by the prevout"
+                ));
+            }
+            redeem_script
+        } else {
+            return Err(format!(
+                "Security Violation: input #{input_index} uses unsupported external ECDSA script type"
+            ));
+        };
+        let expected_script = bitcoin::ScriptBuf::new_p2wpkh(
+            &pubkey
+                .wpubkey_hash()
+                .map_err(|e| format!("Security Violation: uncompressed external pubkey: {e}"))?,
+        );
+        if expected_script.as_script() != signing_script.as_script() {
+            return Err(format!(
+                "Security Violation: input #{input_index} ECDSA pubkey is not authorized by the prevout"
+            ));
+        }
+        let mut signature_psbt = psbt.clone();
+        signature_psbt.inputs[input_index].sighash_type = Some(signature.sighash_type.into());
+        let (message, _) = signature_psbt
+            .sighash_ecdsa(input_index, &mut SighashCache::new(&psbt.unsigned_tx))
+            .map_err(|e| format!("Security Violation: ECDSA sighash failed: {e}"))?;
+        secp.verify_ecdsa(&message, &signature.signature, &pubkey.inner)
+            .map_err(|_| {
+                format!("Security Violation: input #{input_index} has an invalid ECDSA signature")
+            })?;
+        verified_count += 1;
+    }
+
+    if let Some(witness) = &input.final_script_witness {
+        let items: Vec<&[u8]> = witness.iter().collect();
+        if prevout.script_pubkey.is_p2tr() && items.len() == 1 {
+            let signature = bitcoin::taproot::Signature::from_slice(items[0]).map_err(|e| {
+                format!("Security Violation: invalid finalized Taproot signature: {e}")
+            })?;
+            let output_key =
+                XOnlyPublicKey::from_slice(&prevout.script_pubkey.as_bytes()[2..34])
+                    .map_err(|e| format!("Security Violation: invalid P2TR output key: {e}"))?;
+            let spend_utxos = (0..psbt.inputs.len())
+                .map(|index| psbt.spend_utxo(index))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Security Violation: missing Taproot prevout: {e}"))?;
+            let prevouts = if (signature.sighash_type as u8) & 0x80 != 0 {
+                Prevouts::One(input_index, prevout)
+            } else {
+                Prevouts::All(&spend_utxos)
+            };
+            let sighash = SighashCache::new(&psbt.unsigned_tx)
+                .taproot_key_spend_signature_hash(input_index, &prevouts, signature.sighash_type)
+                .map_err(|e| format!("Security Violation: Taproot sighash failed: {e}"))?;
+            let message = Message::from_digest(sighash.to_byte_array());
+            secp.verify_schnorr(&signature.signature, &message, &output_key)
+                .map_err(|_| {
+                    format!("Security Violation: input #{input_index} has an invalid finalized Taproot signature")
+                })?;
+            verified_count += 1;
+        } else if (prevout.script_pubkey.is_p2wpkh()
+            || (prevout.script_pubkey.is_p2sh()
+                && input
+                    .redeem_script
+                    .as_ref()
+                    .is_some_and(|script| script.is_p2wpkh())))
+            && items.len() == 2
+        {
+            let signature = bitcoin::ecdsa::Signature::from_slice(items[0]).map_err(|e| {
+                format!("Security Violation: invalid finalized ECDSA signature: {e}")
+            })?;
+            let pubkey = bitcoin::PublicKey::from_slice(items[1])
+                .map_err(|e| format!("Security Violation: invalid finalized ECDSA pubkey: {e}"))?;
+            let signing_script = input
+                .redeem_script
+                .as_ref()
+                .filter(|_| prevout.script_pubkey.is_p2sh())
+                .unwrap_or(&prevout.script_pubkey);
+            if prevout.script_pubkey.is_p2sh() && signing_script.to_p2sh() != prevout.script_pubkey
+            {
+                return Err(format!(
+                    "Security Violation: input #{input_index} finalized redeem script is not authorized by the prevout"
+                ));
+            }
+            let expected_script =
+                bitcoin::ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash().map_err(|e| {
+                    format!("Security Violation: uncompressed finalized pubkey: {e}")
+                })?);
+            if expected_script.as_script() != signing_script.as_script() {
+                return Err(format!(
+                    "Security Violation: input #{input_index} finalized pubkey is not authorized by the prevout"
+                ));
+            }
+            let mut signature_psbt = psbt.clone();
+            signature_psbt.inputs[input_index].sighash_type = Some(signature.sighash_type.into());
+            let (message, _) = signature_psbt
+                .sighash_ecdsa(input_index, &mut SighashCache::new(&psbt.unsigned_tx))
+                .map_err(|e| format!("Security Violation: ECDSA sighash failed: {e}"))?;
+            secp.verify_ecdsa(&message, &signature.signature, &pubkey.inner)
+                .map_err(|_| {
+                    format!("Security Violation: input #{input_index} has an invalid finalized ECDSA signature")
+                })?;
+            verified_count += 1;
+        } else {
+            return Err(format!(
+                "Security Violation: input #{input_index} has an unsupported finalized witness"
+            ));
+        }
+    }
+
+    if verified_count == 0 {
+        return Err(format!(
+            "Security Violation: Required input #{input_index} has no cryptographically verifiable signature"
+        ));
+    }
+    Ok(())
+}
+
 /// Optional controls for PSBT signing behavior.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -1792,8 +1968,9 @@ impl ZincWallet {
     pub fn apply_verified_ordinals_update(
         &mut self,
         inscriptions: Vec<crate::ordinals::types::Inscription>,
-        protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+        mut protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
         rune_balances: Vec<crate::ordinals::types::RuneBalance>,
+        classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
     ) -> usize {
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
@@ -1806,6 +1983,18 @@ impl ZincWallet {
                 "inscribed outpoint updated: {}",
                 inscription.satpoint.outpoint
             );
+        }
+
+        // Ord cannot classify unconfirmed outputs (or confirmed outputs above its tip).
+        // Treat every current wallet outpoint absent from the verified response as
+        // protected until a later sync classifies it. This preserves the core safety
+        // invariant without letting one unindexable output unlock the rest of the wallet.
+        for (outpoint, _) in self.collect_utxo_outpoints() {
+            if let Ok(outpoint) = outpoint.parse::<bitcoin::OutPoint>() {
+                if !classified_outpoints.contains(&outpoint) {
+                    protected_outpoints.insert(outpoint);
+                }
+            }
         }
 
         self.inscribed_utxos = protected_outpoints;
@@ -1890,7 +2079,6 @@ impl ZincWallet {
     /// Refresh only ordinals protection outpoints (no inscription metadata details).
     pub async fn sync_ordinals_protection(&mut self, ord_url: &str) -> Result<usize, String> {
         self.ordinals_verified = false;
-        let addresses = self.collect_active_addresses();
         let client = crate::ordinals::OrdClient::new(ord_url.to_string());
 
         // 0. Fetch Ord Indexer Tip to check for lag
@@ -1904,23 +2092,33 @@ impl ZincWallet {
 
         self.verify_ord_indexer_is_current(ord_height, wallet_height)?;
 
-        let mut protected_outpoints = std::collections::HashSet::new();
-        for addr_str in addresses {
-            let snapshot = client
-                .get_address_asset_snapshot(&addr_str)
-                .await
-                .map_err(|e| format!("Failed to fetch for {addr_str}: {e}"))?;
+        let queryable_outpoints: Vec<String> = self
+            .collect_utxo_outpoints()
+            .into_iter()
+            .filter_map(
+                |(outpoint, confirmation_height)| match confirmation_height {
+                    Some(height) if height <= ord_height => Some(outpoint),
+                    _ => None,
+                },
+            )
+            .collect();
+        let classified_outpoints = queryable_outpoints
+            .iter()
+            .filter_map(|outpoint| outpoint.parse::<bitcoin::OutPoint>().ok())
+            .collect();
+        let resolved = client
+            .resolve_assets_for_outpoints(&queryable_outpoints)
+            .await
+            .map_err(|e| format!("Failed to resolve wallet outpoints: {e}"))?;
 
-            let protected = client
-                .get_protected_outpoints_from_outputs(&snapshot.outputs)
-                .await
-                .map_err(|e| format!("Failed to fetch protected outputs for {addr_str}: {e}"))?;
-            protected_outpoints.extend(protected);
-        }
-
-        self.inscribed_utxos = protected_outpoints;
-        self.ordinals_verified = true;
-        Ok(self.inscribed_utxos.len())
+        let count = self.apply_verified_ordinals_update(
+            resolved.inscriptions,
+            resolved.protected_outpoints,
+            resolved.rune_balances,
+            classified_outpoints,
+        );
+        self.apply_outpoint_rune_holdings(resolved.outpoint_runes, resolved.rune_infos);
+        Ok(count)
     }
 
     /// Refresh inscription metadata used by UI and PSBT analysis.
@@ -4493,6 +4691,30 @@ impl ZincWallet {
         let check_indices: Vec<usize> = required_input_indices
             .map_or_else(|| (0..signed.inputs.len()).collect(), <[usize]>::to_vec);
 
+        // Verify signatures against the caller-approved PSBT metadata, never metadata
+        // returned by the untrusted device. A signer may add signatures/final witnesses,
+        // but it cannot redefine prevout values or scripts to make a bogus signature pass.
+        let mut verification_psbt = original.clone();
+        for (verification_input, signed_input) in verification_psbt
+            .inputs
+            .iter_mut()
+            .zip(signed.inputs.iter())
+        {
+            verification_input.tap_key_sig = signed_input.tap_key_sig;
+            verification_input
+                .tap_script_sigs
+                .clone_from(&signed_input.tap_script_sigs);
+            verification_input
+                .partial_sigs
+                .clone_from(&signed_input.partial_sigs);
+            verification_input
+                .final_script_witness
+                .clone_from(&signed_input.final_script_witness);
+            verification_input
+                .final_script_sig
+                .clone_from(&signed_input.final_script_sig);
+        }
+
         for &idx in &check_indices {
             if idx >= signed.inputs.len() {
                 return Err(format!(
@@ -4504,13 +4726,16 @@ impl ZincWallet {
             let has_signature = input.tap_key_sig.is_some()
                 || !input.tap_script_sigs.is_empty()
                 || !input.partial_sigs.is_empty()
-                || input.final_script_witness.is_some();
+                || input.final_script_witness.is_some()
+                || input.final_script_sig.is_some();
 
             if !has_signature {
                 return Err(format!(
                     "Security Violation: Required input #{idx} was not signed by the device"
                 ));
             }
+
+            verify_external_input_signatures(&verification_psbt, idx)?;
         }
 
         if required_input_indices.is_some() {
@@ -4527,7 +4752,8 @@ impl ZincWallet {
                 let signatures_changed = orig_input.tap_key_sig != signed_input.tap_key_sig
                     || orig_input.tap_script_sigs != signed_input.tap_script_sigs
                     || orig_input.partial_sigs != signed_input.partial_sigs
-                    || orig_input.final_script_witness != signed_input.final_script_witness;
+                    || orig_input.final_script_witness != signed_input.final_script_witness
+                    || orig_input.final_script_sig != signed_input.final_script_sig;
 
                 if signatures_changed {
                     return Err(format!(

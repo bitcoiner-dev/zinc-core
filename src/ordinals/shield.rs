@@ -551,6 +551,7 @@ pub fn analyze_psbt_with_scope(
     // that is really burned to fee.
     let mut total_input_value = 0u64;
     let mut accumulated_input_offset = 0u64;
+    let mut sat_flow_arithmetic_overflow = false;
 
     // Store absolute offsets of all inscriptions being moved
     // (InscriptionID/Key, AbsoluteOffset, OriginalInputValue)
@@ -630,7 +631,12 @@ pub fn analyze_psbt_with_scope(
                 outpoint
             );
             for (id, relative_offset) in items {
-                let absolute_offset = accumulated_input_offset + relative_offset;
+                let absolute_offset = accumulated_input_offset
+                    .checked_add(*relative_offset)
+                    .unwrap_or_else(|| {
+                        sat_flow_arithmetic_overflow = true;
+                        u64::MAX
+                    });
                 active_inscriptions.push((id.clone(), absolute_offset, value));
                 input_inscriptions_ids.push(id.clone());
             }
@@ -820,8 +826,17 @@ pub fn analyze_psbt_with_scope(
             }
         }
 
-        total_input_value += value;
-        accumulated_input_offset += value;
+        total_input_value = total_input_value.checked_add(value).unwrap_or_else(|| {
+            sat_flow_arithmetic_overflow = true;
+            u64::MAX
+        });
+        accumulated_input_offset =
+            accumulated_input_offset
+                .checked_add(value)
+                .unwrap_or_else(|| {
+                    sat_flow_arithmetic_overflow = true;
+                    u64::MAX
+                });
     }
 
     // 2. Map to Outputs
@@ -836,7 +851,12 @@ pub fn analyze_psbt_with_scope(
         })?;
 
         let output_value = output.value.to_sat();
-        let output_end = current_output_offset + output_value;
+        let output_end = current_output_offset
+            .checked_add(output_value)
+            .unwrap_or_else(|| {
+                sat_flow_arithmetic_overflow = true;
+                u64::MAX
+            });
 
         let address = bitcoin::Address::from_script(&output.script_pubkey, network)
             .ok()
@@ -890,7 +910,7 @@ pub fn analyze_psbt_with_scope(
                 && output_value < output.script_pubkey.minimal_non_dust().to_sat(),
         });
 
-        current_output_offset += output_value;
+        current_output_offset = output_end;
     }
 
     // 3. Check for Burns (Fees)
@@ -942,12 +962,20 @@ pub fn analyze_psbt_with_scope(
     // inscription after it and makes the fee meaningless. Publish nothing
     // computed from it: a wrong destination reads as reassurance, and the
     // burn-to-fee case is exactly where that reassurance is fatal.
-    let sat_flow_reliable = !scope_has_unknown_inputs;
-    if scope_has_unknown_inputs {
-        warnings.push(
-            "Some inputs have unknown value. Ordinal sat offsets are absolute across all inputs, so inscription destinations and the fee cannot be computed for this transaction."
-                .to_string(),
-        );
+    let sat_flow_reliable = !scope_has_unknown_inputs && !sat_flow_arithmetic_overflow;
+    if !sat_flow_reliable {
+        if scope_has_unknown_inputs {
+            warnings.push(
+                "Some inputs have unknown value. Ordinal sat offsets are absolute across all inputs, so inscription destinations and the fee cannot be computed for this transaction."
+                    .to_string(),
+            );
+        }
+        if sat_flow_arithmetic_overflow {
+            warnings.push(
+                "Input or output value totals overflowed u64. Ordinal sat destinations and the fee are unreliable for this malformed transaction."
+                    .to_string(),
+            );
+        }
 
         if active_inscriptions.is_empty() {
             if warning_level == WarningLevel::Safe {

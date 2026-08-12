@@ -220,7 +220,8 @@ pub struct AnchorOutput {
 pub struct FinalizeListingPurchaseRequest {
     /// Listing envelope whose sale PSBT already contains the seller sale-path signature.
     pub listing: ListingEnvelopeV1,
-    /// Buyer funding inputs to append after the passthrough inscription input.
+    /// Buyer funding inputs. The first is used as a sat-flow alignment input before
+    /// the passthrough input; at least one additional input must fund the purchase.
     pub buyer_inputs: Vec<ListingBuyerFundingInput>,
     /// Script receiving the inscription postage output.
     pub buyer_receive_script_pubkey: ScriptBuf,
@@ -518,17 +519,24 @@ pub fn sign_listing_coordinator_psbt(
     Ok(encode_psbt_base64(&psbt))
 }
 
-/// Append buyer funding and receive/change outputs to a seller-signed listing sale PSBT.
+/// Insert the buyer's first funding input and receive output ahead of the seller pair.
 ///
 /// The seller's `SIGHASH_SINGLE|ANYONECANPAY` signature commits only to the passthrough
-/// input and seller payout output at the same index. This function preserves that pair
-/// and appends the buyer side of the transaction without adding coordinator signatures.
+/// input and seller payout output at the same index. Shifting that pair together to index 1
+/// preserves the signature while ensuring the inscription sat from seller input #1 flows to
+/// buyer output #0 after the buyer's input #0 funds that earlier output.
 pub fn finalize_listing_purchase(
     request: &FinalizeListingPurchaseRequest,
 ) -> Result<FinalizeListingPurchaseResultV1, ZincError> {
     if request.buyer_inputs.is_empty() {
         return Err(ZincError::OfferError(
             "listing purchase requires at least one buyer funding input".to_string(),
+        ));
+    }
+    if request.buyer_inputs.len() < 2 {
+        return Err(ZincError::OfferError(
+            "listing purchase requires two buyer inputs so sat flow can be aligned safely"
+                .to_string(),
         ));
     }
     if request.buyer_receive_script_pubkey.is_empty() {
@@ -600,12 +608,33 @@ pub fn finalize_listing_purchase(
             .ok_or_else(|| ZincError::OfferError("buyer input value overflows u64".to_string()))?;
     }
 
-    let buyer_receive_output_index = psbt.unsigned_tx.output.len();
-    psbt.unsigned_tx.output.push(TxOut {
-        value: Amount::from_sat(request.listing.postage_sats),
-        script_pubkey: request.buyer_receive_script_pubkey.clone(),
-    });
-    psbt.outputs.push(PsbtOutput::default());
+    let buyer_receive_output_index = 0;
+    let buyer_receive_sats = request.buyer_inputs[0]
+        .witness_utxo
+        .value
+        .to_sat()
+        .checked_add(request.listing.postage_sats)
+        .ok_or_else(|| ZincError::OfferError("buyer receive value overflows u64".to_string()))?;
+    psbt.unsigned_tx.output.insert(
+        0,
+        TxOut {
+            value: Amount::from_sat(buyer_receive_sats),
+            script_pubkey: request.buyer_receive_script_pubkey.clone(),
+        },
+    );
+    psbt.outputs.insert(0, PsbtOutput::default());
+
+    let first_buyer_input = &request.buyer_inputs[0];
+    psbt.unsigned_tx
+        .input
+        .insert(0, template_txin(first_buyer_input.previous_output));
+    psbt.inputs.insert(
+        0,
+        PsbtInput {
+            witness_utxo: Some(first_buyer_input.witness_utxo.clone()),
+            ..PsbtInput::default()
+        },
+    );
 
     let change_output_index = if request.change_sats > 0 {
         let index = psbt.unsigned_tx.output.len();
@@ -644,7 +673,7 @@ pub fn finalize_listing_purchase(
         None
     };
 
-    for buyer_input in &request.buyer_inputs {
+    for buyer_input in request.buyer_inputs.iter().skip(1) {
         psbt.unsigned_tx
             .input
             .push(template_txin(buyer_input.previous_output));
@@ -653,6 +682,8 @@ pub fn finalize_listing_purchase(
             ..PsbtInput::default()
         });
     }
+
+    ensure_seller_sat_range_reaches_output(&psbt, 1, buyer_receive_output_index)?;
 
     let total_input_sats = request
         .listing
@@ -687,7 +718,7 @@ pub fn finalize_listing_purchase(
         listing,
         psbt_base64,
         fee_sats,
-        seller_input_index: plan.seller_input_index,
+        seller_input_index: 1,
         buyer_receive_output_index,
         change_output_index,
         anchor_output_index,
@@ -760,7 +791,8 @@ pub fn create_listing_purchase(
         .vault_wallet
         .peek_address(KeychainKind::External, 0)
         .script_pubkey();
-    let protected_outpoints = wallet.inscribed_utxos.iter().copied().collect();
+    let protected_outpoints: std::collections::HashSet<OutPoint> =
+        wallet.inscribed_utxos.iter().copied().collect();
     let payment_role = wallet.scheme == AddressScheme::Dual;
     let signing_wallet = if payment_role {
         wallet
@@ -773,12 +805,27 @@ pub fn create_listing_purchase(
     let change_script = signing_wallet
         .peek_address(KeychainKind::External, 0)
         .script_pubkey();
+    let buyer_outpoints: Vec<OutPoint> = signing_wallet
+        .list_unspent()
+        .filter(|utxo| !protected_outpoints.contains(&utxo.outpoint))
+        .take(2)
+        .map(|utxo| utxo.outpoint)
+        .collect();
+    if buyer_outpoints.len() < 2 {
+        return Err(ZincError::OfferError(
+            "listing purchase requires at least two cardinal buyer UTXOs for safe sat-flow alignment"
+                .to_string(),
+        ));
+    }
 
     let mut builder = signing_wallet.build_tx();
     if !wallet.inscribed_utxos.is_empty() {
-        builder.unspendable(protected_outpoints);
+        builder.unspendable(protected_outpoints.iter().copied().collect());
     }
     builder.ordering(TxOrdering::Untouched);
+    builder
+        .add_utxos(&buyer_outpoints)
+        .map_err(|e| ZincError::OfferError(format!("failed adding buyer inputs: {e}")))?;
     builder
         .add_recipient(seller_payout_script, Amount::from_sat(seller_payout_sats))
         .add_recipient(
@@ -808,11 +855,64 @@ pub fn create_listing_purchase(
                 "listing purchase psbt is missing passthrough input {passthrough_outpoint}"
             ))
         })?;
-    if seller_input_index != 0 {
-        return Err(ZincError::OfferError(format!(
-            "listing purchase passthrough input must be index 0; found {seller_input_index}"
-        )));
+    if psbt.inputs.len() < 3 || psbt.unsigned_tx.output.len() < 3 {
+        return Err(ZincError::OfferError(
+            "listing purchase needs two buyer inputs and a change output for safe sat-flow alignment"
+                .to_string(),
+        ));
     }
+    let change_value = psbt.unsigned_tx.output[2].value.to_sat();
+    let alignment_input_index = (0..psbt.inputs.len())
+        .filter(|index| *index != seller_input_index)
+        .find(|index| {
+            input_prevout(&psbt, *index).is_ok_and(|prevout| prevout.value.to_sat() < change_value)
+        })
+        .ok_or_else(|| {
+            ZincError::OfferError(
+                "buyer change is too small to align inscription sat flow safely".to_string(),
+            )
+        })?;
+    let mut input_order = vec![alignment_input_index, seller_input_index];
+    input_order.extend(
+        (0..psbt.inputs.len())
+            .filter(|index| *index != alignment_input_index && *index != seller_input_index),
+    );
+    psbt.unsigned_tx.input = input_order
+        .iter()
+        .map(|index| psbt.unsigned_tx.input[*index].clone())
+        .collect();
+    psbt.inputs = input_order
+        .iter()
+        .map(|index| psbt.inputs[*index].clone())
+        .collect();
+    psbt.unsigned_tx.output.swap(0, 1);
+    psbt.outputs.swap(0, 1);
+    let seller_input_index = 1;
+    let alignment_value = input_prevout(&psbt, 0)?.value.to_sat();
+    psbt.unsigned_tx.output[0].value = Amount::from_sat(
+        psbt.unsigned_tx.output[0]
+            .value
+            .to_sat()
+            .checked_add(alignment_value)
+            .ok_or_else(|| {
+                ZincError::OfferError("buyer receive value overflows u64".to_string())
+            })?,
+    );
+    psbt.unsigned_tx.output[2].value = Amount::from_sat(
+        psbt.unsigned_tx.output[2]
+            .value
+            .to_sat()
+            .checked_sub(alignment_value)
+            .ok_or_else(|| ZincError::OfferError("buyer change underflows".to_string()))?,
+    );
+    if psbt.unsigned_tx.output[2].value
+        < psbt.unsigned_tx.output[2].script_pubkey.minimal_non_dust()
+    {
+        return Err(ZincError::OfferError(
+            "buyer change would be dust after sat-flow alignment".to_string(),
+        ));
+    }
+    ensure_seller_sat_range_reaches_output(&psbt, seller_input_index, 0)?;
 
     validate_seller_input(
         &request.listing,
@@ -873,7 +973,7 @@ pub fn create_listing_purchase(
         fee_sats,
         seller_input_index,
         buyer_input_count: buyer_input_indices.len(),
-        buyer_receive_output_index: 1,
+        buyer_receive_output_index: 0,
     })
 }
 
@@ -1318,6 +1418,44 @@ fn input_has_signature(input: &PsbtInput) -> bool {
         || !input.partial_sigs.is_empty()
         || input.tap_key_sig.is_some()
         || !input.tap_script_sigs.is_empty()
+}
+
+fn ensure_seller_sat_range_reaches_output(
+    psbt: &Psbt,
+    seller_input_index: usize,
+    buyer_output_index: usize,
+) -> Result<(), ZincError> {
+    let seller_sat_range_start = (0..seller_input_index).try_fold(0u64, |total, index| {
+        total
+            .checked_add(input_prevout(psbt, index)?.value.to_sat())
+            .ok_or_else(|| ZincError::OfferError("input sat-flow offset overflows u64".to_string()))
+    })?;
+    let buyer_output_start = psbt.unsigned_tx.output[..buyer_output_index]
+        .iter()
+        .try_fold(0u64, |total, output| {
+            total.checked_add(output.value.to_sat()).ok_or_else(|| {
+                ZincError::OfferError("output sat-flow offset overflows u64".to_string())
+            })
+        })?;
+    let buyer_output = psbt
+        .unsigned_tx
+        .output
+        .get(buyer_output_index)
+        .ok_or_else(|| ZincError::OfferError("buyer receive output is missing".to_string()))?;
+    let buyer_output_end = buyer_output_start
+        .checked_add(buyer_output.value.to_sat())
+        .ok_or_else(|| {
+            ZincError::OfferError("buyer output sat-flow range overflows u64".to_string())
+        })?;
+    let seller_sat_range_end = seller_sat_range_start
+        .checked_add(input_prevout(psbt, seller_input_index)?.value.to_sat())
+        .ok_or_else(|| ZincError::OfferError("seller sat-flow range overflows u64".to_string()))?;
+    if seller_sat_range_start < buyer_output_start || seller_sat_range_end > buyer_output_end {
+        return Err(ZincError::OfferError(format!(
+            "listing sat-flow violation: seller input range {seller_sat_range_start}..{seller_sat_range_end} is not contained in buyer output #{buyer_output_index} range {buyer_output_start}..{buyer_output_end}"
+        )));
+    }
+    Ok(())
 }
 
 fn psbt_fee_sats(psbt: &Psbt) -> Result<u64, ZincError> {

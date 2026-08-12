@@ -2737,6 +2737,10 @@ impl ZincWasmWallet {
                     _ => None,
                 })
                 .collect();
+            let classified_outpoints = queryable_outpoints
+                .iter()
+                .filter_map(|outpoint| outpoint.parse().ok())
+                .collect();
             if queryable_outpoints.len() < total_outpoints {
                 zinc_log_debug!(target: LOG_TARGET_WASM,
                     "sync_ordinals: skipping {} outpoint(s) not yet indexable by ord (unconfirmed or above ord height {})",
@@ -2799,6 +2803,7 @@ impl ZincWasmWallet {
                             all_inscriptions,
                             protected_outpoints,
                             rune_balances,
+                            classified_outpoints,
                         );
                         inner.apply_outpoint_rune_holdings(outpoint_runes, rune_infos);
                         inner.is_syncing = false; // FINISHED
@@ -3407,6 +3412,7 @@ impl ZincWasmWallet {
         created_at_unix: i64,
         signed_psbt_base64: Option<String>,
         artifact_json: Option<String>,
+        expected_payout_script_pubkey_hex: Option<String>,
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
         let signed_intent: crate::sign_intent::SignedSignIntentV1 =
@@ -3423,6 +3429,12 @@ impl ZincWasmWallet {
                     created_at_unix,
                     signed_psbt_base64.as_deref(),
                     artifact_json.as_deref(),
+                    expected_payout_script_pubkey_hex
+                        .as_deref()
+                        .map(crate::sign_intent::script_from_hex)
+                        .transpose()
+                        .map_err(|e| JsValue::from_str(&e.to_string()))?
+                        .as_deref(),
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
                 serde_json::to_string(&signed_receipt).map_err(|e| {
@@ -3443,11 +3455,18 @@ impl ZincWasmWallet {
         &self,
         signed_intent_json: &str,
         now_unix: i64,
+        expected_payout_script_pubkey_hex: &str,
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
-        let plan =
-            crate::sign_intent::verify_sign_seller_input_scope_json(signed_intent_json, now_unix)
+        let expected_payout_script =
+            crate::sign_intent::script_from_hex(expected_payout_script_pubkey_hex)
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let plan = crate::sign_intent::verify_sign_seller_input_scope_json(
+            signed_intent_json,
+            now_unix,
+            expected_payout_script.as_script(),
+        )
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
         serde_json::to_string(&plan)
             .map_err(|e| JsValue::from_str(&format!("failed to serialize scope plan: {e}")))
     }

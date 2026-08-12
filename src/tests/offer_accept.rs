@@ -13,12 +13,16 @@ const SELLER_POSTAGE_SATS: u64 = 330;
 /// The accepting wallet's own payout script. Derived locally in production,
 /// never read out of the offer envelope.
 fn expected_payout_script() -> ScriptBuf {
-    ScriptBuf::from_hex("0014000102030405060708090a0b0c0d0e0f1011121314").expect("valid script")
+    ScriptBuf::from_hex("0014000102030405060708090a0b0c0d0e0f10111213").expect("valid script")
 }
 
 /// A script the attacker controls.
 fn attacker_payout_script() -> ScriptBuf {
     ScriptBuf::from_hex("0014ffeeddccbbaa99887766554433221100ffeeddcc").expect("valid script")
+}
+
+fn buyer_receive_script() -> ScriptBuf {
+    ScriptBuf::from_hex("00141112131415161718191a1b1c1d1e1f2021222324").expect("valid script")
 }
 
 fn sample_seller_txid() -> Txid {
@@ -108,7 +112,7 @@ fn psbt_base64_paying(
         output: vec![
             TxOut {
                 value: Amount::from_sat(SELLER_POSTAGE_SATS),
-                script_pubkey: ScriptBuf::new(),
+                script_pubkey: buyer_receive_script(),
             },
             TxOut {
                 value: Amount::from_sat(ASK_SATS + SELLER_POSTAGE_SATS),
@@ -333,7 +337,57 @@ fn prepare_offer_acceptance_rejects_non_ord_output_layout() {
 
     let err = prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
         .expect_err("must reject non-canonical outputs");
-    assert!(err
-        .to_string()
-        .contains("buyer postage output must be first"));
+    assert!(
+        err.to_string()
+            .contains("buyer postage output must be first"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn prepare_offer_acceptance_rejects_op_return_buyer_output() {
+    let now_unix = 1_800_000_000;
+    let seller_outpoint = OutPoint {
+        txid: sample_seller_txid(),
+        vout: 0,
+    };
+    let mut psbt = {
+        let encoded = psbt_base64(seller_outpoint, false, false, true);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("base64");
+        Psbt::deserialize(&bytes).expect("psbt")
+    };
+    psbt.unsigned_tx.output[0].script_pubkey = ScriptBuf::from_hex("6a").expect("OP_RETURN");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
+
+    prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("an OP_RETURN buyer output must be rejected");
+}
+
+#[test]
+fn prepare_offer_acceptance_rejects_extra_outputs() {
+    let now_unix = 1_800_000_000;
+    let seller_outpoint = OutPoint {
+        txid: sample_seller_txid(),
+        vout: 0,
+    };
+    let mut psbt = {
+        let encoded = psbt_base64(seller_outpoint, false, false, true);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("base64");
+        Psbt::deserialize(&bytes).expect("psbt")
+    };
+    psbt.unsigned_tx.output.push(TxOut {
+        value: Amount::from_sat(0),
+        script_pubkey: ScriptBuf::from_hex("6a").expect("OP_RETURN"),
+    });
+    psbt.outputs.push(Default::default());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    let offer = build_offer(now_unix, seller_outpoint, encoded, now_unix + 3600);
+
+    prepare_offer_acceptance(&offer, now_unix, expected_payout_script().as_script())
+        .expect_err("extra outputs must be rejected");
 }
