@@ -60,6 +60,7 @@ fn main() -> Result<(), String> {
         vec![tracked_inscription],
         HashSet::from([tracked_outpoint]),
         Vec::new(),
+        HashSet::from([tracked_outpoint]),
     );
 
     let psbt = build_demo_psbt(tracked_outpoint, 10_000, 9_999)?;

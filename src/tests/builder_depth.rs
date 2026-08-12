@@ -138,6 +138,23 @@ mod tests {
     }
 
     #[test]
+    fn verified_ordinals_update_quarantines_unclassified_wallet_outpoints() {
+        let mut w = unified();
+        let ops = fund(&mut w, &[(10_000, true), (30_000, false)]);
+        let classified = HashSet::from([ops[0]]);
+
+        w.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new(), classified);
+
+        assert!(w.ordinals_verified());
+        assert!(!w.inscribed_utxos.contains(&ops[0]));
+        assert!(
+            w.inscribed_utxos.contains(&ops[1]),
+            "an unconfirmed outpoint omitted from the Ord query must be quarantined"
+        );
+        assert_eq!(w.get_balance().spendable.trusted_pending.to_sat(), 0);
+    }
+
+    #[test]
     fn get_balance_excludes_inscribed_from_spendable() {
         let mut w = unified();
         let ops = fund(&mut w, &[(10_000, true), (50_000, true)]);
@@ -212,7 +229,12 @@ mod tests {
                 last_active_indices: last,
             })
             .unwrap();
-        w.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new());
+        let classified = w
+            .collect_utxo_outpoints()
+            .into_iter()
+            .filter_map(|(outpoint, _)| outpoint.parse().ok())
+            .collect();
+        w.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new(), classified);
 
         let funded = w
             .dapp_address_candidates(Some(3))

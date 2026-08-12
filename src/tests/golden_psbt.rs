@@ -104,7 +104,12 @@ fn funded_wallet(values: &[u64]) -> (ZincWallet, Address, Vec<OutPoint>, u64) {
 
     // Clear the ordinals safety lock (no inscriptions, nothing protected, no runes) so the
     // planners are willing to build. This is the sanctioned test bypass.
-    wallet.apply_verified_ordinals_update(vec![], HashSet::new(), vec![]);
+    let classified = wallet
+        .collect_utxo_outpoints()
+        .into_iter()
+        .filter_map(|(outpoint, _)| outpoint.parse().ok())
+        .collect();
+    wallet.apply_verified_ordinals_update(vec![], HashSet::new(), vec![], classified);
 
     (wallet, addr, ops, values.iter().sum())
 }

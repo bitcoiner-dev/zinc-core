@@ -11,15 +11,17 @@ use crate::sign_intent::{
     validate_pairing_ack_envelope_json, validate_signed_pairing_ack_json,
     validate_signed_pairing_complete_receipt_json, validate_signed_pairing_request_json,
     validate_signed_sign_intent_json, validate_signed_sign_intent_receipt_json,
-    verify_pairing_approval, verify_sign_seller_input_scope, BuildBuyerOfferIntentV1,
-    CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1, PairingAckEnvelopeV1,
-    PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1, PairingRequestV1,
-    SignIntentActionV1, SignIntentPayloadV1, SignIntentReceiptStatusV1, SignIntentReceiptV1,
-    SignIntentV1, SignSellerInputIntentV1, SignedPairingAckV1, SignedPairingCompleteReceiptV1,
-    SignedPairingRequestV1, SignedSignIntentReceiptV1, SignedSignIntentV1,
-    NOSTR_PAIRING_ACK_TYPE_TAG_VALUE, NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE,
-    NOSTR_SIGN_INTENT_APP_TAG_VALUE, NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE,
-    NOSTR_SIGN_INTENT_TYPE_TAG_VALUE, PAIRING_TRANSPORT_EVENT_KIND,
+    verify_pairing_approval,
+    verify_sign_seller_input_scope as verify_sign_seller_input_scope_with_payout,
+    BuildBuyerOfferIntentV1, CapabilityPolicyV1, NostrTransportEventV1, PairingAckDecisionV1,
+    PairingAckEnvelopeV1, PairingAckV1, PairingCompleteReceiptStatusV1, PairingCompleteReceiptV1,
+    PairingRequestV1, SignIntentActionV1, SignIntentPayloadV1, SignIntentReceiptStatusV1,
+    SignIntentReceiptV1, SignIntentV1, SignSellerInputIntentV1, SignedPairingAckV1,
+    SignedPairingCompleteReceiptV1, SignedPairingRequestV1, SignedSignIntentReceiptV1,
+    SignedSignIntentV1, NOSTR_PAIRING_ACK_TYPE_TAG_VALUE,
+    NOSTR_PAIRING_COMPLETE_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_APP_TAG_VALUE,
+    NOSTR_SIGN_INTENT_RECEIPT_TYPE_TAG_VALUE, NOSTR_SIGN_INTENT_TYPE_TAG_VALUE,
+    PAIRING_TRANSPORT_EVENT_KIND,
 };
 use crate::{
     decrypt_secret_with_key_internal, encrypt_secret_with_key_internal, generate_vault_key_internal,
@@ -82,6 +84,29 @@ fn sample_approved_ack(request: &PairingRequestV1) -> PairingAckV1 {
 const SIGN_SELLER_INPUT_ASK_SATS: u64 = 100_000;
 const SIGN_SELLER_INPUT_POSTAGE_SATS: u64 = 330;
 
+fn sign_seller_expected_payout_script() -> ScriptBuf {
+    ScriptBuf::from_hex("0014000102030405060708090a0b0c0d0e0f1011121314").expect("valid script")
+}
+
+fn sign_seller_attacker_payout_script() -> ScriptBuf {
+    ScriptBuf::from_hex("0014ffeeddccbbaa99887766554433221100ffeeddcc").expect("valid script")
+}
+
+fn sign_seller_buyer_receive_script() -> ScriptBuf {
+    ScriptBuf::from_hex("00141112131415161718191a1b1c1d1e1f2021222324").expect("valid script")
+}
+
+fn verify_sign_seller_input_scope(
+    signed_intent: &SignedSignIntentV1,
+    now_unix: i64,
+) -> Result<crate::SignSellerInputScopeV1, crate::ZincError> {
+    verify_sign_seller_input_scope_with_payout(
+        signed_intent,
+        now_unix,
+        sign_seller_expected_payout_script().as_script(),
+    )
+}
+
 fn sign_seller_input_seller_txid() -> Txid {
     Txid::from_slice(&[0x11; 32]).expect("valid seller txid")
 }
@@ -97,6 +122,26 @@ fn sign_seller_input_psbt_base64(
     buyer_signed: bool,
     swap_outputs: bool,
     mutate_seller_payout: bool,
+) -> String {
+    sign_seller_input_psbt_base64_paying(
+        expected_seller_outpoint,
+        include_duplicate_seller_input,
+        seller_signed,
+        buyer_signed,
+        swap_outputs,
+        mutate_seller_payout,
+        sign_seller_expected_payout_script(),
+    )
+}
+
+fn sign_seller_input_psbt_base64_paying(
+    expected_seller_outpoint: OutPoint,
+    include_duplicate_seller_input: bool,
+    seller_signed: bool,
+    buyer_signed: bool,
+    swap_outputs: bool,
+    mutate_seller_payout: bool,
+    seller_payout_script: ScriptBuf,
 ) -> String {
     let mut inputs = vec![
         TxIn {
@@ -127,11 +172,11 @@ fn sign_seller_input_psbt_base64(
     let mut outputs = vec![
         TxOut {
             value: Amount::from_sat(SIGN_SELLER_INPUT_POSTAGE_SATS),
-            script_pubkey: ScriptBuf::new(),
+            script_pubkey: sign_seller_buyer_receive_script(),
         },
         TxOut {
             value: Amount::from_sat(SIGN_SELLER_INPUT_ASK_SATS + SIGN_SELLER_INPUT_POSTAGE_SATS),
-            script_pubkey: ScriptBuf::new(),
+            script_pubkey: seller_payout_script,
         },
     ];
 
@@ -365,6 +410,7 @@ fn build_signed_sign_intent_approved_receipt_sets_expected_fields() {
         1_710_000_220,
         Some("signed-psbt-base64"),
         None,
+        Some(sign_seller_expected_payout_script().as_script()),
     )
     .expect("approved receipt");
 
@@ -399,6 +445,7 @@ fn build_signed_sign_intent_approved_receipt_rejects_scope_escape() {
         1_710_000_220,
         Some("cHNidA=="),
         None,
+        Some(sign_seller_expected_payout_script().as_script()),
     )
     .expect_err("unsigned buyer input must fail");
     assert!(err
@@ -448,6 +495,31 @@ fn verify_sign_seller_input_scope_accepts_valid_intent() {
         expected_seller_outpoint.to_string()
     );
     assert_eq!(plan.expected_ask_sats, SIGN_SELLER_INPUT_ASK_SATS);
+}
+
+#[test]
+fn verify_sign_seller_input_scope_rejects_payout_to_a_foreign_script() {
+    let expected_seller_outpoint = OutPoint {
+        txid: sign_seller_input_seller_txid(),
+        vout: 0,
+    };
+    let signed_intent = signed_sign_seller_input_intent(
+        sign_seller_input_psbt_base64_paying(
+            expected_seller_outpoint,
+            false,
+            false,
+            true,
+            false,
+            false,
+            sign_seller_attacker_payout_script(),
+        ),
+        expected_seller_outpoint,
+        SIGN_SELLER_INPUT_ASK_SATS,
+        1_710_000_900,
+    );
+
+    verify_sign_seller_input_scope(&signed_intent, 1_710_000_210)
+        .expect_err("a foreign payout script must be rejected");
 }
 
 #[test]

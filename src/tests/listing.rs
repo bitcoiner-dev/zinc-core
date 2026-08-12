@@ -68,7 +68,12 @@ fn funded_unified_wallet(mark_ordinals_verified: bool) -> crate::ZincWallet {
         .expect("wallet build");
 
     if mark_ordinals_verified {
-        wallet.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new());
+        wallet.apply_verified_ordinals_update(
+            Vec::new(),
+            HashSet::new(),
+            Vec::new(),
+            HashSet::new(),
+        );
     }
 
     let receive_script = wallet
@@ -76,11 +81,23 @@ fn funded_unified_wallet(mark_ordinals_verified: bool) -> crate::ZincWallet {
         .reveal_next_address(bdk_wallet::KeychainKind::External)
         .address
         .script_pubkey();
-    let tx = create_dummy_tx(250_000, receive_script, 19);
+    let tx = create_dummy_tx(100_000, receive_script.clone(), 19);
+    let tx2 = create_dummy_tx(150_000, receive_script, 20);
     let mut graph = bdk_wallet::chain::TxGraph::default();
     let _ = graph.insert_tx(tx.clone());
+    let _ = graph.insert_tx(tx2.clone());
     let _ = graph.insert_anchor(
         tx.compute_txid(),
+        ConfirmationBlockTime {
+            block_id: bdk_wallet::chain::BlockId {
+                height: 101,
+                hash: bdk_wallet::bitcoin::BlockHash::all_zeros(),
+            },
+            confirmation_time: 1001,
+        },
+    );
+    let _ = graph.insert_anchor(
+        tx2.compute_txid(),
         ConfirmationBlockTime {
             block_id: bdk_wallet::chain::BlockId {
                 height: 101,
@@ -528,6 +545,19 @@ fn buyer_funding_input(value_sats: u64) -> ListingBuyerFundingInput {
     }
 }
 
+fn buyer_funding_inputs(funding_value_sats: u64) -> Vec<ListingBuyerFundingInput> {
+    vec![
+        ListingBuyerFundingInput {
+            previous_output: OutPoint::new(sample_txid(0x43), 1),
+            witness_utxo: TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: buyer_receive_script(),
+            },
+        },
+        buyer_funding_input(funding_value_sats),
+    ]
+}
+
 #[test]
 fn finalize_listing_purchase_builds_buyer_funded_psbt_preserving_seller_signature() {
     let (request, listing) = signed_sale_listing();
@@ -535,7 +565,7 @@ fn finalize_listing_purchase_builds_buyer_funded_psbt_preserving_seller_signatur
 
     let finalized = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(buyer_input_value)],
+        buyer_inputs: buyer_funding_inputs(buyer_input_value),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: Some(seller_payout_script()),
         change_sats: 5_000,
@@ -546,32 +576,32 @@ fn finalize_listing_purchase_builds_buyer_funded_psbt_preserving_seller_signatur
     let psbt = decode_psbt(&finalized.psbt_base64);
 
     assert_eq!(finalized.fee_sats, 250);
-    assert_eq!(finalized.seller_input_index, 0);
-    assert_eq!(finalized.buyer_receive_output_index, 1);
+    assert_eq!(finalized.seller_input_index, 1);
+    assert_eq!(finalized.buyer_receive_output_index, 0);
     assert_eq!(finalized.change_output_index, Some(2));
-    assert_eq!(psbt.unsigned_tx.input.len(), 2);
-    assert_eq!(psbt.inputs.len(), 2);
+    assert_eq!(psbt.unsigned_tx.input.len(), 3);
+    assert_eq!(psbt.inputs.len(), 3);
     assert_eq!(psbt.unsigned_tx.output.len(), 3);
     assert_eq!(psbt.outputs.len(), 3);
     assert_eq!(
         psbt.unsigned_tx.output[0].value,
-        Amount::from_sat(ASK_SATS + POSTAGE_SATS)
+        Amount::from_sat(10_000 + POSTAGE_SATS)
     );
     assert_eq!(
         psbt.unsigned_tx.output[0].script_pubkey,
-        seller_payout_script()
+        buyer_receive_script()
     );
     assert_eq!(
         psbt.unsigned_tx.output[1].value,
-        Amount::from_sat(POSTAGE_SATS)
+        Amount::from_sat(ASK_SATS + POSTAGE_SATS)
     );
     assert_eq!(
         psbt.unsigned_tx.output[1].script_pubkey,
-        buyer_receive_script()
+        seller_payout_script()
     );
     assert_eq!(psbt.unsigned_tx.output[2].value, Amount::from_sat(5_000));
     assert_eq!(
-        psbt.inputs[1]
+        psbt.inputs[2]
             .witness_utxo
             .as_ref()
             .expect("buyer prevout")
@@ -580,16 +610,33 @@ fn finalize_listing_purchase_builds_buyer_funded_psbt_preserving_seller_signatur
     );
 
     let seller = XOnlyPublicKey::from_str(SELLER_PUBKEY_HEX).expect("seller pubkey");
-    let (_control_block, (script, leaf_version)) = psbt.inputs[0]
+    let (_control_block, (script, leaf_version)) = psbt.inputs[1]
         .tap_scripts
         .iter()
         .next()
         .expect("tap script");
     let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
-    assert!(psbt.inputs[0]
+    assert!(psbt.inputs[1]
         .tap_script_sigs
         .contains_key(&(seller, leaf_hash)));
     assert_eq!(finalized.listing.sale_psbt_base64, finalized.psbt_base64);
+}
+
+#[test]
+fn finalize_listing_purchase_rejects_a_single_unalignable_buyer_input() {
+    let (request, listing) = signed_sale_listing();
+    let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
+        listing,
+        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500)],
+        buyer_receive_script_pubkey: buyer_receive_script(),
+        change_script_pubkey: None,
+        change_sats: 0,
+        anchor_output: None,
+        now_unix: request.created_at_unix + 2,
+    })
+    .expect_err("one buyer input cannot align the inscription sat safely");
+
+    assert!(err.to_string().contains("requires two buyer inputs"));
 }
 
 #[test]
@@ -597,7 +644,7 @@ fn finalized_listing_purchase_can_be_pinned_by_coordinator_default_signature() {
     let (request, listing) = signed_sale_listing();
     let finalized = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS + 500),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -614,15 +661,15 @@ fn finalized_listing_purchase_can_be_pinned_by_coordinator_default_signature() {
     .expect("coordinator final signing");
     let signed = decode_psbt(&coordinator_signed_base64);
 
-    assert_eq!(signed.inputs[0].tap_script_sigs.len(), 2);
+    assert_eq!(signed.inputs[1].tap_script_sigs.len(), 2);
     let coordinator = XOnlyPublicKey::from_str(COORDINATOR_PUBKEY_HEX).expect("coordinator pubkey");
-    let (_control_block, (script, leaf_version)) = signed.inputs[0]
+    let (_control_block, (script, leaf_version)) = signed.inputs[1]
         .tap_scripts
         .iter()
         .next()
         .expect("tap script");
     let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
-    let coordinator_sig = signed.inputs[0]
+    let coordinator_sig = signed.inputs[1]
         .tap_script_sigs
         .get(&(coordinator, leaf_hash))
         .expect("coordinator sig");
@@ -635,7 +682,7 @@ fn finalized_listing_purchase_can_be_pinned_by_coordinator_default_signature() {
         .collect();
     let sighash = SighashCache::new(&signed.unsigned_tx)
         .taproot_script_spend_signature_hash(
-            0,
+            1,
             &Prevouts::All(&prevouts),
             leaf_hash,
             TapSighashType::Default,
@@ -654,7 +701,7 @@ fn finalize_listing_purchase_rejects_missing_seller_signature() {
 
     let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS + 500),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -676,13 +723,16 @@ fn finalize_listing_purchase_rejects_duplicate_passthrough_buyer_input() {
 
     let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![ListingBuyerFundingInput {
-            previous_output: passthrough_outpoint,
-            witness_utxo: TxOut {
-                value: Amount::from_sat(ASK_SATS + POSTAGE_SATS + 500),
-                script_pubkey: buyer_receive_script(),
+        buyer_inputs: vec![
+            ListingBuyerFundingInput {
+                previous_output: passthrough_outpoint,
+                witness_utxo: TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: buyer_receive_script(),
+                },
             },
-        }],
+            buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500),
+        ],
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -699,7 +749,7 @@ fn finalize_listing_purchase_rejects_insufficient_funding_and_zero_fee() {
     let (request, listing) = signed_sale_listing();
     let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing: listing.clone(),
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS - 1)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS - 1),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -711,7 +761,7 @@ fn finalize_listing_purchase_rejects_insufficient_funding_and_zero_fee() {
 
     let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -727,7 +777,7 @@ fn finalize_listing_purchase_rejects_missing_receive_or_change_script() {
     let (request, listing) = signed_sale_listing();
     let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing: listing.clone(),
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS + 500),
         buyer_receive_script_pubkey: ScriptBuf::new(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -739,7 +789,7 @@ fn finalize_listing_purchase_rejects_missing_receive_or_change_script() {
 
     let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS + 500),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 1,
@@ -762,7 +812,7 @@ fn finalize_listing_purchase_rejects_already_coordinator_signed_psbt() {
 
     let err = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS + 500),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -791,40 +841,46 @@ fn wallet_create_listing_purchase_funds_and_signs_buyer_inputs_only() {
         .expect("listing purchase");
     let psbt = decode_psbt(&purchase.psbt_base64);
 
-    assert_eq!(purchase.seller_input_index, 0);
-    assert_eq!(purchase.buyer_receive_output_index, 1);
-    assert!(purchase.buyer_input_count > 0);
+    assert_eq!(purchase.seller_input_index, 1);
+    assert_eq!(purchase.buyer_receive_output_index, 0);
+    assert!(purchase.buyer_input_count >= 2);
     assert!(purchase.fee_sats > 0);
     assert_eq!(purchase.listing.sale_psbt_base64, purchase.psbt_base64);
     assert_eq!(
-        psbt.unsigned_tx.input[0].previous_output.to_string(),
+        psbt.unsigned_tx.input[1].previous_output.to_string(),
         purchase.listing.passthrough_outpoint
     );
+    let alignment_input_sats = psbt.inputs[0]
+        .witness_utxo
+        .as_ref()
+        .expect("alignment input prevout")
+        .value
+        .to_sat();
     assert_eq!(
         psbt.unsigned_tx.output[0].value,
-        Amount::from_sat(ASK_SATS + POSTAGE_SATS)
+        Amount::from_sat(alignment_input_sats + POSTAGE_SATS)
     );
     assert_eq!(
         psbt.unsigned_tx.output[0].script_pubkey,
-        seller_payout_script()
+        buyer_receive_script
     );
     assert_eq!(
         psbt.unsigned_tx.output[1].value,
-        Amount::from_sat(POSTAGE_SATS)
+        Amount::from_sat(ASK_SATS + POSTAGE_SATS)
     );
     assert_eq!(
         psbt.unsigned_tx.output[1].script_pubkey,
-        buyer_receive_script
+        seller_payout_script()
     );
 
     let seller = XOnlyPublicKey::from_str(SELLER_PUBKEY_HEX).expect("seller pubkey");
-    let (_control_block, (script, leaf_version)) = psbt.inputs[0]
+    let (_control_block, (script, leaf_version)) = psbt.inputs[1]
         .tap_scripts
         .iter()
         .next()
         .expect("tap script");
     let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
-    let seller_sig = psbt.inputs[0]
+    let seller_sig = psbt.inputs[1]
         .tap_script_sigs
         .get(&(seller, leaf_hash))
         .expect("seller sig");
@@ -832,9 +888,12 @@ fn wallet_create_listing_purchase_funds_and_signs_buyer_inputs_only() {
         seller_sig.sighash_type,
         TapSighashType::SinglePlusAnyoneCanPay
     );
-    assert!(psbt.inputs[0].final_script_witness.is_none());
+    assert!(psbt.inputs[1].final_script_witness.is_none());
 
-    for index in 1..psbt.inputs.len() {
+    for index in 0..psbt.inputs.len() {
+        if index == 1 {
+            continue;
+        }
         assert!(
             input_has_signature(&psbt.inputs[index]),
             "buyer input {index} must be signed"
@@ -862,14 +921,14 @@ fn wallet_created_listing_purchase_can_be_coordinator_pinned() {
     let psbt = decode_psbt(&coordinator_signed_base64);
 
     let coordinator = XOnlyPublicKey::from_str(COORDINATOR_PUBKEY_HEX).expect("coordinator pubkey");
-    let (_control_block, (script, leaf_version)) = psbt.inputs[0]
+    let (_control_block, (script, leaf_version)) = psbt.inputs[1]
         .tap_scripts
         .iter()
         .next()
         .expect("tap script");
     let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
     assert_eq!(
-        psbt.inputs[0]
+        psbt.inputs[1]
             .tap_script_sigs
             .get(&(coordinator, leaf_hash))
             .expect("coordinator sig")
@@ -883,7 +942,7 @@ fn finalize_listing_sale_builds_passthrough_witness_and_extracts_tx() {
     let (request, listing) = signed_sale_listing();
     let finalized = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(ASK_SATS + POSTAGE_SATS + 500)],
+        buyer_inputs: buyer_funding_inputs(ASK_SATS + POSTAGE_SATS + 500),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,
@@ -893,7 +952,8 @@ fn finalize_listing_sale_builds_passthrough_witness_and_extracts_tx() {
     .expect("buyer finalization");
     let mut listing = finalized.listing;
     let mut sale_psbt = decode_psbt(&listing.sale_psbt_base64);
-    sale_psbt.inputs[1].final_script_witness = Some(Witness::from_slice(&[b"buyer-sig".to_vec()]));
+    sale_psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&[b"buyer-sig".to_vec()]));
+    sale_psbt.inputs[2].final_script_witness = Some(Witness::from_slice(&[b"buyer-sig".to_vec()]));
     listing.sale_psbt_base64 = encode_psbt(&sale_psbt);
     listing.sale_psbt_base64 = sign_listing_coordinator_psbt(
         &listing,
@@ -906,12 +966,12 @@ fn finalize_listing_sale_builds_passthrough_witness_and_extracts_tx() {
         finalize_listing_sale(&listing, request.created_at_unix + 4).expect("sale finalization");
     let finalized_psbt = decode_psbt(&result.finalized_psbt_base64);
     let extracted_tx = finalized_psbt.clone().extract_tx().expect("extract tx");
-    let witness = finalized_psbt.inputs[0]
+    let witness = finalized_psbt.inputs[1]
         .final_script_witness
         .as_ref()
         .expect("passthrough witness");
 
-    assert_eq!(result.seller_input_index, 0);
+    assert_eq!(result.seller_input_index, 1);
     assert_eq!(result.passthrough_witness_items, 4);
     assert_eq!(witness.len(), 4);
     assert_eq!(witness.nth(0).expect("coordinator sig").len(), 64);
@@ -926,7 +986,7 @@ fn finalize_listing_sale_builds_passthrough_witness_and_extracts_tx() {
         hex::encode(witness.nth(2).expect("script")),
         format!("20{SELLER_PUBKEY_HEX}ac20{COORDINATOR_PUBKEY_HEX}ba529c")
     );
-    assert_eq!(extracted_tx.input[0].witness, *witness);
+    assert_eq!(extracted_tx.input[1].witness, *witness);
     assert_eq!(result.txid, extracted_tx.compute_txid().to_string());
     assert_eq!(
         result.tx_hex,
@@ -953,6 +1013,10 @@ fn full_wallet_listing_purchase_flow_reaches_broadcast_transaction() {
             .expect("seller signing");
 
     let mut wallet = funded_unified_wallet(true);
+    let buyer_receive_script = wallet
+        .vault_wallet
+        .peek_address(bdk_wallet::KeychainKind::External, 0)
+        .script_pubkey();
     let purchase = wallet
         .create_listing_purchase(&CreateListingPurchaseRequest {
             listing,
@@ -970,17 +1034,27 @@ fn full_wallet_listing_purchase_flow_reaches_broadcast_transaction() {
     let finalized =
         finalize_listing_sale(&listing, request.created_at_unix + 4).expect("sale finalization");
     let psbt = decode_psbt(&finalized.finalized_psbt_base64);
-    let tx = psbt.extract_tx().expect("extract tx");
+    let tx = psbt.clone().extract_tx().expect("extract tx");
 
-    assert_eq!(finalized.seller_input_index, 0);
+    assert_eq!(finalized.seller_input_index, 1);
     assert_eq!(finalized.passthrough_witness_items, 4);
     assert_eq!(finalized.txid, tx.compute_txid().to_string());
+    let alignment_input_sats = psbt.inputs[0]
+        .witness_utxo
+        .as_ref()
+        .expect("alignment input prevout")
+        .value
+        .to_sat();
     assert_eq!(
         tx.output[0].value,
+        Amount::from_sat(alignment_input_sats + POSTAGE_SATS)
+    );
+    assert_eq!(tx.output[0].script_pubkey, buyer_receive_script);
+    assert_eq!(
+        tx.output[1].value,
         Amount::from_sat(request.ask_sats + POSTAGE_SATS)
     );
-    assert_eq!(tx.output[0].script_pubkey, seller_payout_script());
-    assert_eq!(tx.output[1].value, Amount::from_sat(POSTAGE_SATS));
+    assert_eq!(tx.output[1].script_pubkey, seller_payout_script());
     for input in &tx.input {
         assert!(!input.witness.is_empty(), "every input must be finalized");
     }
@@ -1604,7 +1678,7 @@ fn finalize_listing_purchase_adds_cpfp_anchor_output_when_requested() {
 
     let finalized = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(buyer_input_value)],
+        buyer_inputs: buyer_funding_inputs(buyer_input_value),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: Some(seller_payout_script()),
         change_sats: 5_000,
@@ -1633,7 +1707,7 @@ fn finalize_listing_purchase_omits_anchor_when_not_requested() {
 
     let finalized = finalize_listing_purchase(&FinalizeListingPurchaseRequest {
         listing,
-        buyer_inputs: vec![buyer_funding_input(buyer_input_value)],
+        buyer_inputs: buyer_funding_inputs(buyer_input_value),
         buyer_receive_script_pubkey: buyer_receive_script(),
         change_script_pubkey: None,
         change_sats: 0,

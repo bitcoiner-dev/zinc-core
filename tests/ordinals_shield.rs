@@ -227,4 +227,74 @@ mod tests {
             analysis.warnings
         );
     }
+
+    #[test]
+    fn test_analyze_psbt_marks_input_value_overflow_unreliable() {
+        let psbt = build_test_psbt(vec![
+            (
+                make_outpoint(50),
+                Some(TxOut {
+                    value: bitcoin::Amount::from_sat(u64::MAX),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }),
+            ),
+            (
+                make_outpoint(51),
+                Some(TxOut {
+                    value: bitcoin::Amount::from_sat(1),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }),
+            ),
+        ]);
+
+        let analysis = analyze_psbt_with_scope(
+            &psbt,
+            &std::collections::HashMap::new(),
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .expect("overflow must produce a fail-closed analysis, not panic");
+
+        assert!(!analysis.sat_flow_reliable);
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("overflow")));
+    }
+
+    #[test]
+    fn test_analyze_psbt_marks_output_value_overflow_unreliable() {
+        let mut psbt = build_test_psbt(vec![(
+            make_outpoint(52),
+            Some(TxOut {
+                value: bitcoin::Amount::from_sat(u64::MAX),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }),
+        )]);
+        psbt.unsigned_tx.output = vec![
+            TxOut {
+                value: bitcoin::Amount::from_sat(u64::MAX),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            },
+            TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            },
+        ];
+        psbt.outputs = vec![Default::default(), Default::default()];
+
+        let analysis = analyze_psbt_with_scope(
+            &psbt,
+            &std::collections::HashMap::new(),
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .expect("overflow must produce a fail-closed analysis, not panic");
+
+        assert!(!analysis.sat_flow_reliable);
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("overflow")));
+    }
 }
