@@ -143,7 +143,14 @@ mod tests {
         let ops = fund(&mut w, &[(10_000, true), (30_000, false)]);
         let classified = HashSet::from([ops[0]]);
 
-        w.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new(), classified);
+        w.apply_verified_ordinals_update(
+            Vec::new(),
+            HashSet::new(),
+            Vec::new(),
+            classified,
+            w.chain_state_generation(),
+        )
+        .unwrap();
 
         assert!(w.ordinals_verified());
         assert!(!w.inscribed_utxos.contains(&ops[0]));
@@ -234,7 +241,14 @@ mod tests {
             .into_iter()
             .filter_map(|(outpoint, _)| outpoint.parse().ok())
             .collect();
-        w.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new(), classified);
+        w.apply_verified_ordinals_update(
+            Vec::new(),
+            HashSet::new(),
+            Vec::new(),
+            classified,
+            w.chain_state_generation(),
+        )
+        .unwrap();
 
         let funded = w
             .dapp_address_candidates(Some(3))

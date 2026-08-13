@@ -65,11 +65,11 @@ pub mod sign_intent;
 
 // Re-exports for convenience
 pub use builder::{
-    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest,
-    CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan, DiscoveryContext,
-    PaymentAddressType, ProfileMode, RuneTransferIntent, RuneTransferResult, ScanPolicy, Seed64,
-    SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, WalletKind, ZincBalance,
-    ZincPersistence, ZincSyncRequest, ZincWallet,
+    Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CreatePsbtRequest,
+    CreatePsbtTransportRequest, CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan,
+    DiscoveryContext, PaymentAddressType, ProfileMode, RuneTransferIntent, RuneTransferResult,
+    ScanPolicy, Seed64, SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, WalletKind,
+    ZincBalance, ZincPersistence, ZincSyncRequest, ZincWallet,
 };
 pub use error::{ZincError, ZincResult};
 pub use external_signing::{
@@ -2632,7 +2632,7 @@ impl ZincWasmWallet {
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
             // 1. Collect info needed for sync (Borrow Read)
-            let (outpoints, wallet_height, sync_generation) = {
+            let (outpoints, wallet_height, sync_generation, chain_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if !inner.try_begin_sync(js_sys::Date::now()) {
@@ -2663,7 +2663,12 @@ impl ZincWasmWallet {
                             ));
                         }
                         let height = inner.vault_wallet.local_chain().tip().height();
-                        (ops, height, inner.account_generation())
+                        (
+                            ops,
+                            height,
+                            inner.account_generation(),
+                            inner.chain_state_generation(),
+                        )
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: FAILED TO BORROW INNER: {:?}", e);
@@ -2799,12 +2804,15 @@ impl ZincWasmWallet {
                         if inner.account_generation() != sync_generation {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
-                        let c = inner.apply_verified_ordinals_update(
-                            all_inscriptions,
-                            protected_outpoints,
-                            rune_balances,
-                            classified_outpoints,
-                        );
+                        let c = inner
+                            .apply_verified_ordinals_update(
+                                all_inscriptions,
+                                protected_outpoints,
+                                rune_balances,
+                                classified_outpoints,
+                                chain_generation,
+                            )
+                            .map_err(|error| JsValue::from_str(&error))?;
                         inner.apply_outpoint_rune_holdings(outpoint_runes, rune_infos);
                         inner.is_syncing = false; // FINISHED
                         c
@@ -2860,6 +2868,32 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Invalid request: {e}")))?;
 
         self.create_psbt_with_transport(transport, "createPsbt")
+    }
+
+    /// Create an ordinary Bitcoin transfer and return its engine-issued intent.
+    #[wasm_bindgen(js_name = createBitcoinTransfer)]
+    pub fn create_bitcoin_transfer_request(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        let transport: crate::builder::CreatePsbtTransportRequest =
+            serde_wasm_bindgen::from_value(request)
+                .map_err(|error| JsValue::from_str(&format!("Invalid request: {error}")))?;
+        let request = crate::builder::CreatePsbtRequest::try_from(transport)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                let result = inner
+                    .create_bitcoin_transfer(&request)
+                    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+                serde_wasm_bindgen::to_value(&result).map_err(|error| {
+                    JsValue::from_str(&format!(
+                        "Failed to serialize Bitcoin transfer result: {error}"
+                    ))
+                })
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (createBitcoinTransfer): {error}"
+            ))),
+        }
     }
 
     /// Build and fully audit an unsigned Rune transfer.
@@ -3043,6 +3077,68 @@ impl ZincWasmWallet {
                 .map_err(JsValue::from),
             Err(e) => Err(JsValue::from_str(&format!("Wallet busy (sign_psbt): {e}"))),
         }
+    }
+
+    /// Sign an ordinary Bitcoin transfer only after revalidating its exact intent.
+    #[wasm_bindgen(js_name = signBitcoinTransferPsbt)]
+    pub fn sign_bitcoin_transfer_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+        options: JsValue,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let intent: crate::builder::BitcoinTransferIntent = serde_wasm_bindgen::from_value(intent)
+            .map_err(|error| {
+                JsValue::from_str(&format!("Invalid Bitcoin transfer intent: {error}"))
+            })?;
+        let sign_options: Option<crate::builder::SignOptions> =
+            if options.is_null() || options.is_undefined() {
+                None
+            } else {
+                Some(
+                    serde_wasm_bindgen::from_value(options)
+                        .map_err(|error| JsValue::from_str(&format!("Invalid options: {error}")))?,
+                )
+            };
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .sign_bitcoin_transfer_psbt(psbt_base64, &intent, sign_options)
+                .map_err(JsValue::from),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (signBitcoinTransferPsbt): {error}"
+            ))),
+        }
+    }
+
+    /// Validate an ordinary transfer intent without signing (for browser hardware flows).
+    #[wasm_bindgen(js_name = validateBitcoinTransferPsbt)]
+    pub fn validate_bitcoin_transfer_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+    ) -> Result<(), JsValue> {
+        use base64::Engine;
+
+        self.check_vitality()?;
+        let intent: crate::builder::BitcoinTransferIntent = serde_wasm_bindgen::from_value(intent)
+            .map_err(|error| {
+                JsValue::from_str(&format!("Invalid Bitcoin transfer intent: {error}"))
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| JsValue::from_str(&format!("Invalid base64: {error}")))?;
+        let psbt = bitcoin::Psbt::deserialize(&bytes)
+            .map_err(|error| JsValue::from_str(&format!("Invalid PSBT: {error}")))?;
+        self.inner
+            .try_borrow()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (validateBitcoinTransferPsbt): {error}"
+                ))
+            })?
+            .validate_bitcoin_transfer_psbt(&psbt, &intent)
+            .map_err(|error| JsValue::from_str(&format!("Security Violation: {error}")))
     }
 
     /// Sign a Rune transfer only after revalidating its exact engine-issued
@@ -3412,7 +3508,6 @@ impl ZincWasmWallet {
         created_at_unix: i64,
         signed_psbt_base64: Option<String>,
         artifact_json: Option<String>,
-        expected_payout_script_pubkey_hex: Option<String>,
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
         let signed_intent: crate::sign_intent::SignedSignIntentV1 =
@@ -3423,18 +3518,16 @@ impl ZincWasmWallet {
                 let secret_hex = inner
                     .get_pairing_secret_key_hex()
                     .map_err(|e| JsValue::from_str(&e))?;
+                let expected_payout_script = inner
+                    .peek_payment_address(0)
+                    .map(|address| address.script_pubkey());
                 let signed_receipt = crate::sign_intent::build_signed_sign_intent_approved_receipt(
                     &signed_intent,
                     &secret_hex,
                     created_at_unix,
                     signed_psbt_base64.as_deref(),
                     artifact_json.as_deref(),
-                    expected_payout_script_pubkey_hex
-                        .as_deref()
-                        .map(crate::sign_intent::script_from_hex)
-                        .transpose()
-                        .map_err(|e| JsValue::from_str(&e.to_string()))?
-                        .as_deref(),
+                    expected_payout_script.as_deref(),
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
                 serde_json::to_string(&signed_receipt).map_err(|e| {
@@ -3455,12 +3548,19 @@ impl ZincWasmWallet {
         &self,
         signed_intent_json: &str,
         now_unix: i64,
-        expected_payout_script_pubkey_hex: &str,
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
-        let expected_payout_script =
-            crate::sign_intent::script_from_hex(expected_payout_script_pubkey_hex)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let expected_payout_script = self
+            .inner
+            .try_borrow()
+            .map_err(|e| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (verify_sign_seller_input_scope_json): {e}"
+                ))
+            })?
+            .peek_payment_address(0)
+            .ok_or_else(|| JsValue::from_str("Payment wallet missing"))?
+            .script_pubkey();
         let plan = crate::sign_intent::verify_sign_seller_input_scope_json(
             signed_intent_json,
             now_unix,

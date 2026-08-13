@@ -109,7 +109,15 @@ fn funded_wallet(values: &[u64]) -> (ZincWallet, Address, Vec<OutPoint>, u64) {
         .into_iter()
         .filter_map(|(outpoint, _)| outpoint.parse().ok())
         .collect();
-    wallet.apply_verified_ordinals_update(vec![], HashSet::new(), vec![], classified);
+    wallet
+        .apply_verified_ordinals_update(
+            vec![],
+            HashSet::new(),
+            vec![],
+            classified,
+            wallet.chain_state_generation(),
+        )
+        .unwrap();
 
     (wallet, addr, ops, values.iter().sum())
 }
