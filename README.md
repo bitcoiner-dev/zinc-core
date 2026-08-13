@@ -119,6 +119,22 @@ Hosts should use the compatibility report for UI preflight and call
 again at the trusted sign boundary. The existing `verify_external_signed_psbt`
 check remains the post-device trust gate.
 
+## Transaction Authorization
+
+Signing and external-signer preparation share one fail-closed authorization
+path. Any wallet input must have a complete classification from the current
+chain-state generation; a later chain sync invalidates that classification.
+The path rejects known inscription burns, Rune burns/cenotaphs, incomplete fee
+or sat-flow data for wallet spends, and fees that cross the integer-only absurd
+fee ceiling.
+
+First-party ordinary Bitcoin and Rune sends carry an engine-issued intent from
+construction to signing. `sign_bitcoin_transfer_psbt` and
+`prepare_external_bitcoin_transfer_signing_request` revalidate the exact
+recipient, amount, ordered inputs, wallet-owned change, and fee. Generic dapp
+PSBTs remain supported, but they receive the same asset, freshness, sighash,
+prevout, and fee policy without an intent-specific exception.
+
 ## Logging Model
 
 - Default runtime level is `warn`

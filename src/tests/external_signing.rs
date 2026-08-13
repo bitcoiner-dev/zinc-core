@@ -43,6 +43,10 @@ mod tests {
     /// Funded wallet + an unsigned single-input PSBT (base64) spending that UTXO back to the
     /// wallet, with `witness_utxo` populated so BDK can sign it.
     fn setup() -> (ZincWallet, String) {
+        setup_with_values(50_000, 49_000)
+    }
+
+    fn setup_with_values(input_value: u64, output_value: u64) -> (ZincWallet, String) {
         let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0u8; 64]))
             .with_scheme(AddressScheme::Unified)
             .build()
@@ -53,7 +57,7 @@ mod tests {
             .address;
         let script = addr.script_pubkey();
 
-        let prev = dummy_tx(50_000, script.clone(), 1);
+        let prev = dummy_tx(input_value, script.clone(), 1);
         let mut graph = TxGraph::<ConfirmationBlockTime>::default();
         let _ = graph.insert_tx(prev.clone());
         let _ = graph.insert_anchor(
@@ -76,6 +80,7 @@ mod tests {
                 last_active_indices: last,
             })
             .unwrap();
+        wallet.mark_current_wallet_outpoints_classified_for_test();
 
         let unsigned = Transaction {
             version: bdk_wallet::bitcoin::transaction::Version::TWO,
@@ -87,7 +92,7 @@ mod tests {
                 witness: bdk_wallet::bitcoin::Witness::default(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(49_000),
+                value: Amount::from_sat(output_value),
                 script_pubkey: script,
             }],
         };
@@ -411,6 +416,114 @@ mod tests {
     }
 
     #[test]
+    fn signing_and_external_preparation_require_current_asset_classification() {
+        let (mut wallet, unsigned) = setup();
+        wallet.mark_ordinals_unverified();
+
+        let sign_error = wallet.sign_psbt(&unsigned, None).unwrap_err();
+        assert!(sign_error.contains("missing or stale"), "{sign_error}");
+        let prepare_error = wallet
+            .prepare_external_sign_psbt(&unsigned, None)
+            .unwrap_err();
+        assert!(
+            prepare_error.contains("missing or stale"),
+            "{prepare_error}"
+        );
+    }
+
+    #[test]
+    fn signing_and_external_preparation_reject_unclassified_wallet_input() {
+        let (mut wallet, unsigned) = setup();
+        wallet.classified_outpoints.clear();
+
+        let sign_error = wallet.sign_psbt(&unsigned, None).unwrap_err();
+        assert!(sign_error.contains("was not classified"), "{sign_error}");
+        let prepare_error = wallet
+            .prepare_external_sign_psbt(&unsigned, None)
+            .unwrap_err();
+        assert!(
+            prepare_error.contains("was not classified"),
+            "{prepare_error}"
+        );
+    }
+
+    #[test]
+    fn signing_and_external_preparation_reject_known_inscription_burn() {
+        use crate::ordinals::types::{Inscription, Satpoint};
+
+        let (mut wallet, unsigned) = setup();
+        let psbt = decode(&unsigned);
+        let outpoint = psbt.unsigned_tx.input[0].previous_output;
+        wallet
+            .apply_verified_ordinals_update(
+                vec![Inscription {
+                    id: "burn-test-inscription".to_string(),
+                    number: 1,
+                    satpoint: Satpoint {
+                        outpoint,
+                        offset: 49_500,
+                    },
+                    content_type: None,
+                    value: Some(50_000),
+                    content_length: None,
+                    timestamp: None,
+                }],
+                [outpoint].into_iter().collect(),
+                Vec::new(),
+                [outpoint].into_iter().collect(),
+                wallet.chain_state_generation(),
+            )
+            .unwrap();
+
+        let sign_error = wallet.sign_psbt(&unsigned, None).unwrap_err();
+        assert!(
+            sign_error.contains("would burn inscription"),
+            "{sign_error}"
+        );
+        let prepare_error = wallet
+            .prepare_external_sign_psbt(&unsigned, None)
+            .unwrap_err();
+        assert!(
+            prepare_error.contains("would burn inscription"),
+            "{prepare_error}"
+        );
+    }
+
+    #[test]
+    fn absurd_fee_ceiling_is_identical_for_software_and_external_signing() {
+        use crate::builder::ABSURD_FEE_SATS;
+
+        let (mut at_boundary_wallet, at_boundary) =
+            setup_with_values(2_000_000, 2_000_000 - ABSURD_FEE_SATS);
+        at_boundary_wallet
+            .sign_psbt(&at_boundary, None)
+            .expect("the exact absolute boundary remains signable");
+        let (at_boundary_wallet, at_boundary) =
+            setup_with_values(2_000_000, 2_000_000 - ABSURD_FEE_SATS);
+        at_boundary_wallet
+            .prepare_external_sign_psbt(&at_boundary, None)
+            .expect("the exact external-signing boundary remains signable");
+
+        let absurd_fee = ABSURD_FEE_SATS + 1;
+        let (mut software_wallet, software_psbt) =
+            setup_with_values(2_000_000, 2_000_000 - absurd_fee);
+        let software_error = software_wallet.sign_psbt(&software_psbt, None).unwrap_err();
+        assert!(
+            software_error.contains("absurd mining fee"),
+            "{software_error}"
+        );
+
+        let (external_wallet, external_psbt) = setup_with_values(2_000_000, 2_000_000 - absurd_fee);
+        let external_error = external_wallet
+            .prepare_external_sign_psbt(&external_psbt, None)
+            .unwrap_err();
+        assert!(
+            external_error.contains("absurd mining fee"),
+            "{external_error}"
+        );
+    }
+
+    #[test]
     fn capability_enforced_preparation_returns_psbt_and_exact_requirements() {
         use crate::external_signing::{
             ExternalSignerCapabilitiesV2, ExternalSignerInputPolicyV2,
@@ -524,14 +637,52 @@ mod tests {
         // setup() applies tx anchors but never extends the local chain.
         assert_eq!(wallet.chain_tip_height(), 0);
 
-        wallet.apply_verified_ordinals_update(
-            Vec::new(),
-            std::collections::HashSet::new(),
-            Vec::new(),
-            std::collections::HashSet::new(),
-        );
+        wallet
+            .apply_verified_ordinals_update(
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                wallet.chain_state_generation(),
+            )
+            .unwrap();
         assert!(wallet.ordinals_verified());
         wallet.mark_ordinals_unverified();
+        assert!(!wallet.ordinals_verified());
+    }
+
+    #[test]
+    fn chain_update_invalidates_asset_state_and_stale_result_cannot_restore_it() {
+        let (mut wallet, _) = setup();
+        let stale_generation = wallet.chain_state_generation();
+        assert!(wallet.ordinals_verified());
+
+        wallet
+            .apply_sync(
+                bdk_wallet::Update {
+                    tx_update: Default::default(),
+                    chain: Default::default(),
+                    last_active_indices: Default::default(),
+                },
+                None::<bdk_wallet::Update>,
+            )
+            .unwrap();
+        assert_eq!(
+            wallet.chain_state_generation(),
+            stale_generation.wrapping_add(1)
+        );
+        assert!(!wallet.ordinals_verified());
+
+        let error = wallet
+            .apply_verified_ordinals_update(
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                stale_generation,
+            )
+            .unwrap_err();
+        assert!(error.contains("Stale ordinals update"), "{error}");
         assert!(!wallet.ordinals_verified());
     }
 }

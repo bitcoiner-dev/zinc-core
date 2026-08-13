@@ -41,12 +41,15 @@ fn funded_unified_wallet(mark_ordinals_verified: bool) -> crate::ZincWallet {
         .expect("wallet build");
 
     if mark_ordinals_verified {
-        wallet.apply_verified_ordinals_update(
-            Vec::new(),
-            HashSet::new(),
-            Vec::new(),
-            HashSet::new(),
-        );
+        wallet
+            .apply_verified_ordinals_update(
+                Vec::new(),
+                HashSet::new(),
+                Vec::new(),
+                HashSet::new(),
+                wallet.chain_state_generation(),
+            )
+            .unwrap();
     }
 
     let receive_script = wallet
@@ -81,6 +84,9 @@ fn funded_unified_wallet(mark_ordinals_verified: bool) -> crate::ZincWallet {
         .vault_wallet
         .apply_update(update)
         .expect("apply update");
+    if mark_ordinals_verified {
+        wallet.mark_current_wallet_outpoints_classified_for_test();
+    }
 
     wallet
 }

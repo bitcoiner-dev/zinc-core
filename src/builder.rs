@@ -296,6 +296,13 @@ pub fn fee_for_vsize(rate: FeeRate, vsize: u64) -> u64 {
     rate.fee_vb(vsize).map_or(u64::MAX, Amount::to_sat)
 }
 
+/// Absolute component of the fail-closed absurd-fee ceiling.
+pub const ABSURD_FEE_SATS: u64 = 1_000_000;
+/// Rate component of the fail-closed absurd-fee ceiling.
+pub const ABSURD_FEE_RATE_SAT_VB: u64 = 5_000;
+/// Absolute ceiling used only when a signed size cannot be estimated.
+pub const ABSURD_UNESTIMATED_FEE_SATS: u64 = 10_000_000;
+
 /// Typed request for PSBT creation in native Rust flows.
 #[derive(Debug, Clone)]
 pub struct CreatePsbtRequest {
@@ -337,6 +344,32 @@ pub struct CreatePsbtTransportRequest {
     pub amount_sats: u64,
     /// Fee rate in sat/vB. Fractional (sub-sat) rates are supported.
     pub fee_rate_sat_vb: f64,
+}
+
+/// Exact ordinary-Bitcoin transfer contract carried from construction to signing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BitcoinTransferIntent {
+    /// Network-checked recipient address.
+    pub recipient: String,
+    /// Exact recipient value in satoshis.
+    pub amount_sats: u64,
+    /// Output index selected for the recipient during construction.
+    pub recipient_vout: u32,
+    /// Exact ordered input set selected during construction.
+    pub input_outpoints: Vec<String>,
+    /// Exact mining fee authorized by the constructed transaction.
+    pub fee_sats: u64,
+}
+
+/// Audited ordinary-Bitcoin transfer construction result.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BitcoinTransferResult {
+    /// Unsigned PSBT encoded as base64.
+    pub psbt: String,
+    /// Intent that must be supplied again at the signing boundary.
+    pub intent: BitcoinTransferIntent,
 }
 
 impl TryFrom<CreatePsbtTransportRequest> for CreatePsbtRequest {
@@ -760,6 +793,12 @@ pub struct ZincWallet {
     pub(crate) ordinals_verified: bool,
     /// Whether inscription metadata refresh has completed.
     pub(crate) ordinals_metadata_complete: bool,
+    /// Monotonic generation of the BDK chain/UTXO state.
+    pub(crate) chain_state_generation: u64,
+    /// Chain generation for which the current asset classification was produced.
+    pub(crate) ordinals_verified_generation: Option<u64>,
+    /// Wallet outpoints explicitly covered by the verified Ord response.
+    pub(crate) classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
     /// Cryptographic identity of this wallet (Seed or Hardware).
     pub(crate) kind: WalletKind,
     /// Public derivation metadata used to create short-lived BDK signers for seed wallets.
@@ -1439,6 +1478,37 @@ impl ZincWallet {
         self.ordinals_metadata_complete
     }
 
+    /// Return the generation callers must bind to an asynchronous asset resolve.
+    #[must_use]
+    pub fn chain_state_generation(&self) -> u64 {
+        self.chain_state_generation
+    }
+
+    fn asset_state_is_current(&self) -> bool {
+        self.ordinals_verified
+            && self.ordinals_metadata_complete
+            && self.ordinals_verified_generation == Some(self.chain_state_generation)
+    }
+
+    fn invalidate_asset_state(&mut self) {
+        self.ordinals_verified = false;
+        self.ordinals_metadata_complete = false;
+        self.ordinals_verified_generation = None;
+        self.classified_outpoints.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_current_wallet_outpoints_classified_for_test(&mut self) {
+        self.classified_outpoints = self
+            .collect_utxo_outpoints()
+            .into_iter()
+            .filter_map(|(outpoint, _)| outpoint.parse().ok())
+            .collect();
+        self.ordinals_verified = true;
+        self.ordinals_metadata_complete = true;
+        self.ordinals_verified_generation = Some(self.chain_state_generation);
+    }
+
     /// Height of the wallet's local chain tip. Lets hosts that orchestrate
     /// ordinals syncs outside the wallet lock run the same indexer-lag check
     /// as [`Self::sync_ordinals_protection`].
@@ -1451,7 +1521,7 @@ impl ZincWallet {
     /// that detect a lagging ord indexer during a lock-free ordinals refresh —
     /// mirrors what the in-wallet sync methods do on that error path.
     pub fn mark_ordinals_unverified(&mut self) {
-        self.ordinals_verified = false;
+        self.invalidate_asset_state();
     }
 
     /// Return `true` when the wallet uses unified addressing.
@@ -1717,6 +1787,11 @@ impl ZincWallet {
         vault_update: impl Into<bdk_wallet::Update>,
         payment_update: Option<impl Into<bdk_wallet::Update>>,
     ) -> Result<Vec<String>, String> {
+        // Chain data and asset classifications are one snapshot. Invalidate
+        // before applying either update so even a partial apply followed by an
+        // error cannot leave an older Ord result marked current.
+        self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+        self.invalidate_asset_state();
         let mut all_events = Vec::new();
 
         // 1. Apply Vault Update
@@ -1785,9 +1860,9 @@ impl ZincWallet {
         }
 
         // 3. Increment account generation to invalidate any in-flight syncs
-        self.account_generation += 1;
-        self.ordinals_verified = false;
-        self.ordinals_metadata_complete = false;
+        self.account_generation = self.account_generation.wrapping_add(1);
+        self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+        self.invalidate_asset_state();
         // In-flight syncs of the old generation bail on the generation check without clearing
         // the latch, so release it here or the new account could never sync.
         self.is_syncing = false;
@@ -1971,7 +2046,14 @@ impl ZincWallet {
         mut protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
         rune_balances: Vec<crate::ordinals::types::RuneBalance>,
         classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
-    ) -> usize {
+        expected_chain_generation: u64,
+    ) -> Result<usize, String> {
+        if expected_chain_generation != self.chain_state_generation {
+            return Err(format!(
+                "Stale ordinals update: expected chain generation {expected_chain_generation}, current generation is {}",
+                self.chain_state_generation
+            ));
+        }
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
             "applying ordinals update: {} inscriptions received",
@@ -2000,15 +2082,17 @@ impl ZincWallet {
         self.inscribed_utxos = protected_outpoints;
         self.inscriptions = inscriptions;
         self.rune_balances = rune_balances;
+        self.classified_outpoints = classified_outpoints;
         self.ordinals_verified = true;
         self.ordinals_metadata_complete = true;
+        self.ordinals_verified_generation = Some(expected_chain_generation);
 
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
             "total inscribed_utxos set size: {}",
             self.inscribed_utxos.len()
         );
-        self.inscriptions.len()
+        Ok(self.inscriptions.len())
     }
 
     /// Apply per-outpoint rune holdings and rune metadata from a verified ord
@@ -2058,6 +2142,8 @@ impl ZincWallet {
         self.outpoint_runes.clear();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = true;
+        self.ordinals_verified_generation = None;
+        self.classified_outpoints.clear();
 
         self.inscriptions.len()
     }
@@ -2078,7 +2164,8 @@ impl ZincWallet {
 
     /// Refresh only ordinals protection outpoints (no inscription metadata details).
     pub async fn sync_ordinals_protection(&mut self, ord_url: &str) -> Result<usize, String> {
-        self.ordinals_verified = false;
+        self.invalidate_asset_state();
+        let chain_generation = self.chain_state_generation;
         let client = crate::ordinals::OrdClient::new(ord_url.to_string());
 
         // 0. Fetch Ord Indexer Tip to check for lag
@@ -2116,7 +2203,8 @@ impl ZincWallet {
             resolved.protected_outpoints,
             resolved.rune_balances,
             classified_outpoints,
-        );
+            chain_generation,
+        )?;
         self.apply_outpoint_rune_holdings(resolved.outpoint_runes, resolved.rune_infos);
         Ok(count)
     }
@@ -3868,6 +3956,115 @@ impl ZincWallet {
         Ok(Self::encode_psbt_base64(&psbt))
     }
 
+    /// Create an ordinary Bitcoin transfer together with the exact intent that
+    /// must be revalidated immediately before signing.
+    pub fn create_bitcoin_transfer(
+        &mut self,
+        request: &CreatePsbtRequest,
+    ) -> Result<BitcoinTransferResult, ZincError> {
+        let psbt = self.create_psbt_tx(request)?;
+        let recipient = request
+            .recipient
+            .clone()
+            .require_network(self.vault_wallet.network())
+            .map_err(|error| ZincError::ConfigError(format!("Network mismatch: {error}")))?;
+        let recipient_vout = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|output| {
+                output.script_pubkey == recipient.script_pubkey() && output.value == request.amount
+            })
+            .ok_or_else(|| {
+                ZincError::WalletError(
+                    "Constructed transaction is missing its requested recipient output".to_string(),
+                )
+            })?;
+        let recipient_vout = u32::try_from(recipient_vout).map_err(|_| {
+            ZincError::WalletError("Recipient output index exceeds u32".to_string())
+        })?;
+        let fee_sats = Self::exact_psbt_fee_sats(&psbt).map_err(ZincError::WalletError)?;
+        let intent = BitcoinTransferIntent {
+            recipient: recipient.to_string(),
+            amount_sats: request.amount.to_sat(),
+            recipient_vout,
+            input_outpoints: psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .map(|input| input.previous_output.to_string())
+                .collect(),
+            fee_sats,
+        };
+        self.validate_bitcoin_transfer_psbt(&psbt, &intent)
+            .map_err(ZincError::WalletError)?;
+        Ok(BitcoinTransferResult {
+            psbt: Self::encode_psbt_base64(&psbt),
+            intent,
+        })
+    }
+
+    /// Revalidate an engine-issued ordinary transfer intent against exact PSBT bytes.
+    pub fn validate_bitcoin_transfer_psbt(
+        &self,
+        psbt: &Psbt,
+        intent: &BitcoinTransferIntent,
+    ) -> Result<(), String> {
+        let recipient = Address::from_str(&intent.recipient)
+            .map_err(|error| format!("Invalid Bitcoin transfer recipient: {error}"))?
+            .require_network(self.vault_wallet.network())
+            .map_err(|error| format!("Bitcoin transfer recipient network mismatch: {error}"))?;
+        let recipient_index = usize::try_from(intent.recipient_vout)
+            .map_err(|_| "Bitcoin recipient output index is invalid".to_string())?;
+        let recipient_output = psbt
+            .unsigned_tx
+            .output
+            .get(recipient_index)
+            .ok_or_else(|| "Bitcoin recipient output is missing".to_string())?;
+        if recipient_output.script_pubkey != recipient.script_pubkey()
+            || recipient_output.value.to_sat() != intent.amount_sats
+        {
+            return Err(
+                "Bitcoin recipient output does not match the approved address and amount"
+                    .to_string(),
+            );
+        }
+
+        let actual_inputs: Vec<_> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output.to_string())
+            .collect();
+        if actual_inputs != intent.input_outpoints {
+            return Err("Bitcoin transfer input set differs from the approved intent".to_string());
+        }
+
+        let is_mine = |script: &bitcoin::ScriptBuf| {
+            self.vault_wallet.is_mine(script.clone())
+                || self
+                    .payment_wallet
+                    .as_ref()
+                    .is_some_and(|wallet| wallet.is_mine(script.clone()))
+        };
+        for (index, output) in psbt.unsigned_tx.output.iter().enumerate() {
+            if index != recipient_index && !is_mine(&output.script_pubkey) {
+                return Err(format!(
+                    "Bitcoin transfer contains an unapproved external output at index {index}"
+                ));
+            }
+        }
+
+        let fee_sats = Self::exact_psbt_fee_sats(psbt)?;
+        if fee_sats != intent.fee_sats {
+            return Err(format!(
+                "Bitcoin transfer fee mismatch: approved {} sats, transaction pays {fee_sats} sats",
+                intent.fee_sats
+            ));
+        }
+        Ok(())
+    }
+
     /// Create an ord-compatible buyer offer PSBT and envelope.
     pub fn create_offer(
         &mut self,
@@ -3899,6 +4096,32 @@ impl ZincWallet {
             .non_witness_utxo
             .as_ref()
             .and_then(|prev| prev.output.get(vout))
+    }
+
+    fn exact_psbt_fee_sats(psbt: &Psbt) -> Result<u64, String> {
+        let total_input_sats = (0..psbt.inputs.len()).try_fold(0_u64, |total, index| {
+            let value = Self::declared_prevout(psbt, index)
+                .ok_or_else(|| format!("Input #{index} is missing prevout value metadata"))?
+                .value
+                .to_sat();
+            total
+                .checked_add(value)
+                .ok_or_else(|| "Total PSBT input value overflows u64".to_string())
+        })?;
+        let total_output_sats =
+            psbt.unsigned_tx
+                .output
+                .iter()
+                .try_fold(0_u64, |total, output| {
+                    total
+                        .checked_add(output.value.to_sat())
+                        .ok_or_else(|| "Total PSBT output value overflows u64".to_string())
+                })?;
+        total_input_sats
+            .checked_sub(total_output_sats)
+            .ok_or_else(|| {
+                format!("PSBT outputs exceed inputs: {total_output_sats} > {total_input_sats} sats")
+            })
     }
 
     /// Fill missing prevout metadata from the wallet's own UTXO set, and refuse
@@ -4042,6 +4265,170 @@ impl ZincWallet {
         })
     }
 
+    fn analyze_psbt_with_wallet_context(
+        &self,
+        psbt: &Psbt,
+    ) -> Result<crate::ordinals::shield::AnalysisResult, String> {
+        use crate::ordinals::shield::{analyze_psbt_with_context, KnownRunes, ShieldContext};
+        use std::collections::HashMap;
+
+        let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
+            HashMap::with_capacity(self.inscriptions.len());
+        for inscription in &self.inscriptions {
+            known_inscriptions
+                .entry((
+                    inscription.satpoint.outpoint.txid,
+                    inscription.satpoint.outpoint.vout,
+                ))
+                .or_default()
+                .push((inscription.id.clone(), inscription.satpoint.offset));
+        }
+        for inscriptions in known_inscriptions.values_mut() {
+            inscriptions.sort_by_key(|(_, offset)| *offset);
+        }
+
+        let mut known_runes = KnownRunes::new();
+        for (outpoint, held) in &self.outpoint_runes {
+            known_runes.insert((outpoint.txid, outpoint.vout), held.clone());
+        }
+        let mut mint_terms = HashMap::new();
+        for (id, info) in &self.rune_info_cache {
+            if let Some(amount) = info
+                .terms_amount
+                .as_ref()
+                .and_then(|value| value.parse::<u128>().ok())
+            {
+                mint_terms.insert(id.clone(), amount);
+            }
+        }
+
+        let context = ShieldContext {
+            known_inscriptions: &known_inscriptions,
+            known_runes: &known_runes,
+            // SIGHASH_DEFAULT/ALL commits our signature to the whole
+            // transaction even when the caller requests selected inputs.
+            input_scope: None,
+            network: self.vault_wallet.network(),
+            mint_terms: &mint_terms,
+            assets_verified: self.asset_state_is_current(),
+        };
+        let mut analysis =
+            analyze_psbt_with_context(psbt, &context).map_err(|error| error.to_string())?;
+        self.apply_wallet_context_to_analysis(&mut analysis);
+        Ok(analysis)
+    }
+
+    fn authorize_psbt_for_signing(
+        &self,
+        psbt: &Psbt,
+        inputs_to_sign: Option<&[usize]>,
+        allow_validated_rune_default_transfer: bool,
+    ) -> Result<(), String> {
+        let selected = |index: usize| inputs_to_sign.is_none_or(|indices| indices.contains(&index));
+        let mut wallet_outpoints = std::collections::HashSet::new();
+        for utxo in self.vault_wallet.list_unspent() {
+            wallet_outpoints.insert(utxo.outpoint);
+        }
+        if let Some(wallet) = &self.payment_wallet {
+            for utxo in wallet.list_unspent() {
+                wallet_outpoints.insert(utxo.outpoint);
+            }
+        }
+
+        let selected_wallet_outpoints: Vec<_> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .enumerate()
+            .filter(|(index, input)| {
+                selected(*index) && wallet_outpoints.contains(&input.previous_output)
+            })
+            .map(|(_, input)| input.previous_output)
+            .collect();
+
+        if !selected_wallet_outpoints.is_empty() {
+            if !self.asset_state_is_current() {
+                return Err(
+                    "Security Violation: Asset classification is missing or stale for the current wallet state"
+                        .to_string(),
+                );
+            }
+            if let Some(outpoint) = selected_wallet_outpoints
+                .iter()
+                .find(|outpoint| !self.classified_outpoints.contains(outpoint))
+            {
+                return Err(format!(
+                    "Security Violation: Wallet input {outpoint} was not classified by the current Ord snapshot"
+                ));
+            }
+        }
+
+        let analysis = self.analyze_psbt_with_wallet_context(psbt)?;
+        if !selected_wallet_outpoints.is_empty() && !analysis.sat_flow_reliable {
+            return Err(
+                "Security Violation: Exact fee and sat flow are unavailable for this wallet spend"
+                    .to_string(),
+            );
+        }
+        if analysis.sat_flow_reliable && analysis.fee_sats > ABSURD_FEE_SATS {
+            let exceeds_ceiling =
+                if let Some(vsize) = crate::ordinals::shield::estimate_signed_vsize(psbt) {
+                    let absurd_rate_fee = ABSURD_FEE_RATE_SAT_VB.saturating_mul(vsize);
+                    analysis.fee_sats > absurd_rate_fee
+                } else {
+                    analysis.fee_sats > ABSURD_UNESTIMATED_FEE_SATS
+                };
+            if exceeds_ceiling {
+                return Err(format!(
+                    "Security Violation: Refusing absurd mining fee of {} sats (over {} sat/vB)",
+                    analysis.fee_sats, ABSURD_FEE_RATE_SAT_VB
+                ));
+            }
+        }
+        if !analysis.inscriptions_burned.is_empty() {
+            return Err(format!(
+                "Security Violation: Transaction would burn inscription(s): {}",
+                analysis.inscriptions_burned.join(", ")
+            ));
+        }
+
+        let spends_protected_input = psbt.unsigned_tx.input.iter().any(|input| {
+            self.inscribed_utxos.contains(&input.previous_output)
+                || self.outpoint_runes.contains_key(&input.previous_output)
+        });
+        if spends_protected_input && !analysis.sat_flow_reliable {
+            return Err(
+                "Security Violation: Sat flow is incomplete for a protected wallet input"
+                    .to_string(),
+            );
+        }
+
+        if let Some(actions) = &analysis.rune_actions {
+            if actions.is_cenotaph || !actions.burned.is_empty() {
+                return Err(
+                    "Security Violation: Transaction would burn runes or create a cenotaph"
+                        .to_string(),
+                );
+            }
+            if actions.default_transfer_without_runestone && !allow_validated_rune_default_transfer
+            {
+                let default_target_is_mine = analysis
+                    .outputs
+                    .iter()
+                    .find(|output| !output.is_op_return)
+                    .is_some_and(|output| output.is_change);
+                if !default_target_is_mine {
+                    return Err(
+                        "Security Violation: Runes would default-transfer to a non-wallet output"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Sign a PSBT using the wallet's internal keys.
     /// Returns the signed PSBT as base64.
     #[allow(deprecated)]
@@ -4049,6 +4436,16 @@ impl ZincWallet {
         &mut self,
         psbt_base64: &str,
         options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        self.sign_psbt_with_policy(psbt_base64, options, false)
+    }
+
+    #[allow(deprecated)]
+    fn sign_psbt_with_policy(
+        &mut self,
+        psbt_base64: &str,
+        options: Option<SignOptions>,
+        allow_validated_rune_default_transfer: bool,
     ) -> Result<String, String> {
         use base64::Engine;
 
@@ -4063,8 +4460,6 @@ impl ZincWallet {
             .map_err(|e| format!("Invalid base64: {e}"))?;
 
         let mut psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| format!("Invalid PSBT: {e}"))?;
-
-        use std::collections::HashMap;
 
         // ENRICHMENT STEP: fill in missing prevout metadata from our own wallet,
         // and reject any input that describes a UTXO we own differently to how
@@ -4151,29 +4546,11 @@ impl ZincWallet {
             }
         }
 
-        // Ordinal Shield Audit: BEFORE signing!
-        // We must build the known_inscriptions map to check for BURNS (sophisticated check)
-        let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::with_capacity(self.inscriptions.len());
-        for ins in &self.inscriptions {
-            known_inscriptions
-                .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
-                .or_default()
-                .push((ins.id.clone(), ins.satpoint.offset));
-        }
-        // Normalize offsets
-        for items in known_inscriptions.values_mut() {
-            items.sort_by_key(|(_, offset)| *offset);
-        }
-
-        if let Err(e) = crate::ordinals::shield::audit_psbt(
+        self.authorize_psbt_for_signing(
             &psbt,
-            &known_inscriptions,
             inputs_to_sign.as_deref(),
-            self.vault_wallet.network(),
-        ) {
-            return Err(format!("Security Violation: {e}"));
-        }
+            allow_validated_rune_default_transfer,
+        )?;
 
         // Keep a copy if we need to revert signatures for specific inputs
         let original_psbt = if inputs_to_sign.is_some() {
@@ -4270,7 +4647,27 @@ impl ZincWallet {
         let psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| format!("Invalid PSBT: {e}"))?;
         self.validate_rune_transfer_psbt(&psbt, intent)
             .map_err(|e| format!("Security Violation: {e}"))?;
-        self.sign_psbt(psbt_base64, options)
+        self.sign_psbt_with_policy(psbt_base64, options, true)
+    }
+
+    /// Sign an internally constructed Bitcoin transfer only after revalidating
+    /// its exact recipient, amount, input set, change ownership, and fee.
+    pub fn sign_bitcoin_transfer_psbt(
+        &mut self,
+        psbt_base64: &str,
+        intent: &BitcoinTransferIntent,
+        options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| format!("Invalid base64: {error}"))?;
+        let psbt =
+            Psbt::deserialize(&psbt_bytes).map_err(|error| format!("Invalid PSBT: {error}"))?;
+        self.validate_bitcoin_transfer_psbt(&psbt, intent)
+            .map_err(|error| format!("Security Violation: {error}"))?;
+        self.sign_psbt_with_policy(psbt_base64, options, false)
     }
 
     /// Prepare a PSBT for external signing (e.g. on a hardware wallet).
@@ -4282,6 +4679,15 @@ impl ZincWallet {
         &self,
         psbt_base64: &str,
         options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        self.prepare_external_sign_psbt_with_policy(psbt_base64, options, false)
+    }
+
+    fn prepare_external_sign_psbt_with_policy(
+        &self,
+        psbt_base64: &str,
+        options: Option<SignOptions>,
+        allow_validated_rune_default_transfer: bool,
     ) -> Result<String, String> {
         use base64::Engine;
 
@@ -4377,26 +4783,11 @@ impl ZincWallet {
             }
         }
 
-        let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::with_capacity(self.inscriptions.len());
-        for ins in &self.inscriptions {
-            known_inscriptions
-                .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
-                .or_default()
-                .push((ins.id.clone(), ins.satpoint.offset));
-        }
-        for items in known_inscriptions.values_mut() {
-            items.sort_by_key(|(_, offset)| *offset);
-        }
-
-        if let Err(e) = crate::ordinals::shield::audit_psbt(
+        self.authorize_psbt_for_signing(
             &psbt,
-            &known_inscriptions,
             inputs_to_sign.as_deref(),
-            self.vault_wallet.network(),
-        ) {
-            return Err(format!("Security Violation: {e}"));
-        }
+            allow_validated_rune_default_transfer,
+        )?;
 
         let prepared_bytes = psbt.serialize();
         Ok(base64::engine::general_purpose::STANDARD.encode(&prepared_bytes))
@@ -4417,6 +4808,84 @@ impl ZincWallet {
         crate::external_signing::PreparedExternalSigningRequestV2,
         crate::external_signing::PrepareExternalSigningErrorV2,
     > {
+        self.prepare_external_signing_request_with_policy(psbt_base64, options, capabilities, false)
+    }
+
+    /// Validate an exact Rune transfer intent before permitting its intentional
+    /// default-transfer allocation to cross an external signer boundary.
+    pub fn prepare_external_rune_transfer_signing_request(
+        &self,
+        psbt_base64: &str,
+        intent: &RuneTransferIntent,
+        options: Option<SignOptions>,
+        capabilities: &crate::external_signing::ExternalSignerCapabilitiesV2,
+    ) -> Result<
+        crate::external_signing::PreparedExternalSigningRequestV2,
+        crate::external_signing::PrepareExternalSigningErrorV2,
+    > {
+        use crate::external_signing::PrepareExternalSigningErrorV2;
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Invalid base64: {error}"),
+            })?;
+        let psbt = Psbt::deserialize(&psbt_bytes).map_err(|error| {
+            PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Invalid PSBT: {error}"),
+            }
+        })?;
+        self.validate_rune_transfer_psbt(&psbt, intent)
+            .map_err(|error| PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Security Violation: {error}"),
+            })?;
+
+        self.prepare_external_signing_request_with_policy(psbt_base64, options, capabilities, true)
+    }
+
+    /// Validate an exact ordinary Bitcoin transfer before allowing it to cross
+    /// an external signer boundary.
+    pub fn prepare_external_bitcoin_transfer_signing_request(
+        &self,
+        psbt_base64: &str,
+        intent: &BitcoinTransferIntent,
+        options: Option<SignOptions>,
+        capabilities: &crate::external_signing::ExternalSignerCapabilitiesV2,
+    ) -> Result<
+        crate::external_signing::PreparedExternalSigningRequestV2,
+        crate::external_signing::PrepareExternalSigningErrorV2,
+    > {
+        use crate::external_signing::PrepareExternalSigningErrorV2;
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Invalid base64: {error}"),
+            })?;
+        let psbt = Psbt::deserialize(&psbt_bytes).map_err(|error| {
+            PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Invalid PSBT: {error}"),
+            }
+        })?;
+        self.validate_bitcoin_transfer_psbt(&psbt, intent)
+            .map_err(|error| PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Security Violation: {error}"),
+            })?;
+        self.prepare_external_signing_request_with_policy(psbt_base64, options, capabilities, false)
+    }
+
+    fn prepare_external_signing_request_with_policy(
+        &self,
+        psbt_base64: &str,
+        options: Option<SignOptions>,
+        capabilities: &crate::external_signing::ExternalSignerCapabilitiesV2,
+        allow_validated_rune_default_transfer: bool,
+    ) -> Result<
+        crate::external_signing::PreparedExternalSigningRequestV2,
+        crate::external_signing::PrepareExternalSigningErrorV2,
+    > {
         use crate::external_signing::{
             check_external_signer_compatibility_v2, derive_external_signing_plan_v2,
             derive_external_signing_requirements_v2, PrepareExternalSigningErrorV2,
@@ -4426,7 +4895,11 @@ impl ZincWallet {
 
         let required_input_indices = options.as_ref().and_then(|opts| opts.sign_inputs.clone());
         let prepared_psbt_base64 = self
-            .prepare_external_sign_psbt(psbt_base64, options)
+            .prepare_external_sign_psbt_with_policy(
+                psbt_base64,
+                options,
+                allow_validated_rune_default_transfer,
+            )
             .map_err(|message| PrepareExternalSigningErrorV2::PreparationFailed { message })?;
         let prepared_psbt_base64 = self
             .enrich_psbt_key_origins(&prepared_psbt_base64)
@@ -5876,6 +6349,9 @@ impl WalletBuilder {
             rune_info_cache: std::collections::HashMap::new(),
             ordinals_verified: false,
             ordinals_metadata_complete: false,
+            chain_state_generation: 0,
+            ordinals_verified_generation: None,
+            classified_outpoints: std::collections::HashSet::new(),
             kind,
             signing_layout,
             is_syncing: false,
@@ -6018,6 +6494,9 @@ impl WalletBuilder {
             rune_info_cache: std::collections::HashMap::new(),
             ordinals_verified: false,
             ordinals_metadata_complete: false,
+            chain_state_generation: 0,
+            ordinals_verified_generation: None,
+            classified_outpoints: std::collections::HashSet::new(),
             kind: WalletKind::Hardware {
                 fingerprint,
                 taproot_external: taproot_external_desc,

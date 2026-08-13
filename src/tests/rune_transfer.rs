@@ -77,7 +77,7 @@ mod tests {
                 last_active_indices: last_active,
             })
             .unwrap();
-        wallet.ordinals_verified = true;
+        wallet.mark_current_wallet_outpoints_classified_for_test();
         (wallet, address, outpoints)
     }
 

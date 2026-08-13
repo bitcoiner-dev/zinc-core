@@ -126,13 +126,17 @@ fn assert_payment_send_finalizes_correctly(payment_type: PaymentAddressType) {
         .build()
         .expect("dual wallet");
 
-    wallet.apply_verified_ordinals_update(
-        vec![],
-        std::collections::HashSet::new(),
-        vec![],
-        std::collections::HashSet::new(),
-    );
+    wallet
+        .apply_verified_ordinals_update(
+            vec![],
+            std::collections::HashSet::new(),
+            vec![],
+            std::collections::HashSet::new(),
+            wallet.chain_state_generation(),
+        )
+        .unwrap();
     let prevout = fund_payment_wallet(&mut wallet, 100_000, 3);
+    wallet.mark_current_wallet_outpoints_classified_for_test();
 
     let recipient = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([12u8; 64]))
         .with_scheme(AddressScheme::Dual)

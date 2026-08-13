@@ -325,10 +325,18 @@ pub fn apply_asset_verification(analysis: &mut AnalysisResult, assets_verified: 
 /// spend size cannot be estimated (P2WSH, bare/unknown scripts) rather than
 /// reporting a wrong number.
 fn estimate_fee_rate_sat_vb(psbt: &Psbt, fee_sats: u64) -> Option<f64> {
-    let tx = &psbt.unsigned_tx;
     if fee_sats == 0 {
         return Some(0.0);
     }
+    let vsize = estimate_signed_vsize(psbt)?;
+    #[allow(clippy::cast_precision_loss)]
+    Some(fee_sats as f64 / vsize as f64)
+}
+
+/// Estimate signed virtual size without using floating point. Authorization
+/// policy consumes this directly so fee ceilings are integer-exact.
+pub(crate) fn estimate_signed_vsize(psbt: &Psbt) -> Option<u64> {
+    let tx = &psbt.unsigned_tx;
     let base_weight = tx.weight().to_wu();
     let mut witness_weight: u64 = 0;
     let mut any_witness = false;
@@ -374,8 +382,7 @@ fn estimate_fee_rate_sat_vb(psbt: &Psbt, fee_sats: u64) -> Option<f64> {
     if vsize == 0 {
         return None;
     }
-    #[allow(clippy::cast_precision_loss)]
-    Some(fee_sats as f64 / vsize as f64)
+    Some(vsize)
 }
 
 fn normalize_input_scope(

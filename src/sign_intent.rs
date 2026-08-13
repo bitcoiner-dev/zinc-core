@@ -12,7 +12,7 @@ use bdk_wallet::bitcoin::hashes::{sha256, Hash};
 use bdk_wallet::bitcoin::psbt::{Input as PsbtInput, Psbt};
 use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
 use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
-use bdk_wallet::bitcoin::{OutPoint, Script, ScriptBuf};
+use bdk_wallet::bitcoin::{OutPoint, Script};
 use getrandom::getrandom;
 use nostr::key::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
 use nostr::nips::nip44;
@@ -28,12 +28,6 @@ const DOMAIN_PAIRING_TAG_HASH: &str = "zinc-pairing-tag-hash-v1";
 const DOMAIN_PAIRING_COMPLETE_RECEIPT: &str = "zinc-pairing-complete-receipt-v1";
 const DOMAIN_SIGN_INTENT: &str = "zinc-sign-intent-v1";
 const DOMAIN_SIGN_INTENT_RECEIPT: &str = "zinc-sign-intent-receipt-v1";
-
-pub(crate) fn script_from_hex(value: &str) -> Result<ScriptBuf, ZincError> {
-    let bytes = hex::decode(value)
-        .map_err(|e| ZincError::OfferError(format!("invalid expected payout script hex: {e}")))?;
-    Ok(ScriptBuf::from_bytes(bytes))
-}
 
 pub const NOSTR_SIGN_INTENT_APP_TAG_VALUE: &str = "zinc-sign-intent-v1";
 pub const NOSTR_PAIRING_ACK_TYPE_TAG_VALUE: &str = "pairing-ack-v1";
