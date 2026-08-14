@@ -38,6 +38,21 @@ pub struct InscriptionDestination {
     pub offset: u64, // Offset within that output
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// A non-common sat at its current input/output-relative position.
+pub struct RareSatInfo {
+    /// Absolute ordinal sat number.
+    pub number: u64,
+    /// Offset inside the containing input or output.
+    pub offset: u64,
+    /// Ordinal rarity (`uncommon` through `mythic`).
+    pub rarity: String,
+    /// Inscriptions bound to this exact sat, if any.
+    #[serde(default)]
+    pub inscriptions: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Input-side metadata exposed for Shield analysis UI.
 pub struct InputInfo {
@@ -60,6 +75,9 @@ pub struct InputInfo {
     /// Rune amounts known to sit on this input's outpoint (wallet cache).
     #[serde(default)]
     pub runes: Vec<RuneAmount>,
+    /// Non-common sats known on this input.
+    #[serde(default)]
+    pub rare_sats: Vec<RareSatInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +107,9 @@ pub struct OutputInfo {
     /// Always `false` for `OP_RETURN` outputs.
     #[serde(default)]
     pub is_dust: bool,
+    /// Non-common sats mapped into this output by exact sat flow.
+    #[serde(default)]
+    pub rare_sats: Vec<RareSatInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +135,9 @@ pub struct AnalysisResult {
     #[serde(default)]
     /// Output metadata used for analysis explainability.
     pub outputs: Vec<OutputInfo>,
+    /// Non-common sats that would fall into the miner fee.
+    #[serde(default)]
+    pub rare_sats_burned: Vec<RareSatInfo>,
     /// Runestone/cenotaph summary. `None` when the transaction has no
     /// runestone and no analyzed input holds runes (or when rune context was
     /// not provided).
@@ -174,12 +198,17 @@ pub fn analyze_psbt(
 /// `("block:tx" rune id, raw amount in base units)`.
 pub type KnownRunes = HashMap<(Txid, u32), Vec<(String, u128)>>;
 
+/// Per-outpoint rare sats, keyed like `known_inscriptions`.
+pub type KnownRareSats = HashMap<(Txid, u32), Vec<crate::ordinals::client::RareSatLocation>>;
+
 /// Wallet-cached knowledge bundled for offline PSBT analysis.
 pub struct ShieldContext<'a> {
     /// Inscriptions known per spent outpoint.
     pub known_inscriptions: &'a HashMap<(Txid, u32), Vec<(String, u64)>>,
     /// Rune holdings known per spent outpoint.
     pub known_runes: &'a KnownRunes,
+    /// Exact non-common sat positions known per spent outpoint.
+    pub known_rare_sats: &'a KnownRareSats,
     /// Optional input scope for partial-signing flows.
     pub input_scope: Option<&'a [usize]>,
     /// Network used for address rendering.
@@ -210,6 +239,8 @@ pub fn analyze_psbt_with_context(
         analyze_psbt_with_scope(psbt, ctx.known_inscriptions, ctx.input_scope, ctx.network)?;
     apply_asset_verification(&mut analysis, ctx.assets_verified);
     let tx = &psbt.unsigned_tx;
+
+    apply_rare_sat_flow(&mut analysis, ctx.known_rare_sats);
 
     // A suppressed fee is not a zero fee; do not derive a rate from it.
     analysis.fee_rate_sat_vb = if analysis.sat_flow_reliable {
@@ -291,6 +322,103 @@ pub fn analyze_psbt_with_context(
     analysis.rune_actions = Some(flow.actions);
 
     Ok(analysis)
+}
+
+fn apply_rare_sat_flow(analysis: &mut AnalysisResult, known: &KnownRareSats) {
+    let mut input_base = 0u64;
+    let output_ranges = analysis
+        .outputs
+        .iter()
+        .scan(0u64, |base, output| {
+            let start = *base;
+            *base = base.saturating_add(output.value);
+            Some((start, *base))
+        })
+        .collect::<Vec<_>>();
+
+    for input_index in 0..analysis.inputs.len() {
+        let input_txid = analysis.inputs[input_index].txid.clone();
+        let input_vout = analysis.inputs[input_index].vout;
+        let input_value = analysis.inputs[input_index].value;
+        let input_inscriptions = analysis.inputs[input_index].inscriptions.clone();
+        let key = match input_txid.parse::<Txid>() {
+            Ok(txid) => (txid, input_vout),
+            Err(_) => {
+                input_base = input_base.saturating_add(input_value);
+                continue;
+            }
+        };
+        let locations = known.get(&key).cloned().unwrap_or_default();
+        if let Some(info) = analysis.inputs.get_mut(input_index) {
+            info.rare_sats = locations
+                .iter()
+                .map(|location| RareSatInfo {
+                    number: location.number,
+                    offset: location.offset,
+                    rarity: location.rarity.clone(),
+                    inscriptions: Vec::new(),
+                })
+                .collect();
+        }
+
+        for location in locations {
+            let absolute = input_base.saturating_add(location.offset);
+            let mut mapped = RareSatInfo {
+                number: location.number,
+                offset: location.offset,
+                rarity: location.rarity,
+                inscriptions: Vec::new(),
+            };
+            if !analysis.sat_flow_reliable {
+                continue;
+            }
+            if let Some((vout, (start, _))) = output_ranges
+                .iter()
+                .enumerate()
+                .find(|(_, (start, end))| absolute >= *start && absolute < *end)
+            {
+                mapped.offset = absolute - *start;
+                mapped.inscriptions = input_inscriptions
+                    .iter()
+                    .filter(|id| {
+                        analysis
+                            .inscription_destinations
+                            .get(*id)
+                            .is_some_and(|dest| {
+                                dest.vout == Some(vout as u32) && dest.offset == mapped.offset
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                if let Some(output) = analysis.outputs.get_mut(vout) {
+                    output.rare_sats.push(mapped);
+                }
+            } else {
+                analysis.rare_sats_burned.push(mapped);
+            }
+        }
+        input_base = input_base.saturating_add(input_value);
+    }
+
+    let moving = analysis
+        .inputs
+        .iter()
+        .any(|input| !input.rare_sats.is_empty());
+    if !analysis.rare_sats_burned.is_empty() {
+        analysis.warning_level = WarningLevel::Danger;
+        analysis.warnings.push(format!(
+            "{} protected rare sat(s) would be paid as miner fee.",
+            analysis.rare_sats_burned.len()
+        ));
+    } else if moving {
+        if analysis.warning_level == WarningLevel::Safe {
+            analysis.warning_level = WarningLevel::Warn;
+        }
+        analysis.warnings.push(
+            "This transaction moves protected rare sats. Verify their highlighted destination before signing."
+                .to_string(),
+        );
+    }
 }
 
 /// Records whether the inscription/rune caches behind an analysis were
@@ -655,7 +783,8 @@ pub fn analyze_psbt_with_scope(
             address,
             is_mine: false, // Don't know without wallet context
             inscriptions: input_inscriptions_ids,
-            runes: Vec::new(), // Filled by analyze_psbt_with_context
+            runes: Vec::new(),     // Filled by analyze_psbt_with_context
+            rare_sats: Vec::new(), // Filled by analyze_psbt_with_context
         });
 
         // Look for Ordinal envelopes in the witness/tap_scripts
@@ -888,6 +1017,7 @@ pub fn analyze_psbt_with_scope(
             is_op_return,
             is_dust: !is_op_return
                 && output_value < output.script_pubkey.minimal_non_dust().to_sat(),
+            rare_sats: Vec::new(), // Filled by analyze_psbt_with_context
         });
 
         current_output_offset += output_value;
@@ -979,6 +1109,7 @@ pub fn analyze_psbt_with_scope(
         warnings,
         inputs: inputs_info,
         outputs: outputs_info,
+        rare_sats_burned: Vec::new(),
         rune_actions: None,    // Filled by analyze_psbt_with_context
         fee_rate_sat_vb: None, // Filled by analyze_psbt_with_context
         sat_flow_reliable,
