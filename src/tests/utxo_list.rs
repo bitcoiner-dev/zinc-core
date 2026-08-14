@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::builder::{AddressScheme, Seed64, WalletBuilder};
+    use crate::builder::{AddressScheme, CreatePsbtRequest, Seed64, WalletBuilder};
+    use crate::ordinals::client::RareSatSummary;
     use crate::ordinals::types::{Inscription, Satpoint};
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::{Amount, Network, OutPoint, ScriptBuf, Transaction, TxOut};
@@ -63,13 +64,15 @@ mod tests {
             );
         };
 
-        // rune-only protected (no inscription metadata), inscription-bearing, and clean BTC
+        // rune-only protected, inscription-bearing, rare-sat protected, and clean BTC
         let tx_rune = create_dummy_tx(330, script.clone(), 1);
         let tx_insc = create_dummy_tx(10_000, script.clone(), 2);
         let tx_btc = create_dummy_tx(314_000_000, script.clone(), 3);
+        let tx_rare = create_dummy_tx(5_000, script.clone(), 4);
         anchor(&mut graph, &tx_rune, 100);
         anchor(&mut graph, &tx_insc, 101);
         anchor(&mut graph, &tx_btc, 102);
+        anchor(&mut graph, &tx_rare, 103);
 
         let mut last_active = std::collections::BTreeMap::new();
         last_active.insert(KeychainKind::External, 1);
@@ -85,10 +88,19 @@ mod tests {
         let op_rune = OutPoint::new(tx_rune.compute_txid(), 0);
         let op_insc = OutPoint::new(tx_insc.compute_txid(), 0);
         let op_btc = OutPoint::new(tx_btc.compute_txid(), 0);
+        let op_rare = OutPoint::new(tx_rare.compute_txid(), 0);
 
         // Both protected outpoints in the shield set; only op_insc has inscription metadata.
         builder.inscribed_utxos.insert(op_rune);
         builder.inscribed_utxos.insert(op_insc);
+        builder.inscribed_utxos.insert(op_rare);
+        builder.rare_sat_outpoints.insert(
+            op_rare,
+            RareSatSummary {
+                count: 1,
+                highest_rarity: "uncommon".to_string(),
+            },
+        );
         builder.inscriptions.push(Inscription {
             id: "insc-1".to_string(),
             number: 1,
@@ -142,6 +154,25 @@ mod tests {
             "address should resolve from keychain"
         );
         assert_eq!(btc.wallet_role, "taproot");
+
+        let rare = find(op_rare);
+        assert!(rare.is_inscribed, "rare-sat UTXO must be protected");
+        assert!(!rare.has_inscription);
+        assert!(rare.has_rare_sats);
+        assert_eq!(rare.rare_sat_count, 1);
+        assert_eq!(rare.highest_rarity.as_deref(), Some("uncommon"));
+        assert_eq!(rare.cardinal_salvageable_sats, 0);
+
+        builder.ordinals_verified = true;
+        let request = CreatePsbtRequest::from_parts(&addr.to_string(), 1_000_000, 1.0).unwrap();
+        let psbt = builder.create_psbt_tx(&request).unwrap();
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .all(|input| input.previous_output != op_rare),
+            "normal BTC sends must never select a rare-sat outpoint"
+        );
     }
 
     // Regression for the ordinal-safety bug: the ordinals-protection scan must cover USED addresses

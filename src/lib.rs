@@ -2809,7 +2809,7 @@ impl ZincWasmWallet {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collecting UTXO outpoints...");
                         // Inscriptions/runes are UTXO-bound, so we bulk-query exactly our own outpoints
                         // (POST /outputs) — one request instead of per-address + per-output round-trips.
-                        let ops = inner.collect_utxo_outpoints();
+                        let ops = inner.collect_utxo_snapshots();
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collected {} outpoints", ops.len());
                         // A wallet with zero outpoints but a non-empty inscription list is almost
                         // certainly not chain-synced yet (fresh instance, failed/foreign changeset
@@ -2895,17 +2895,26 @@ impl ZincWasmWallet {
             // were invisible to ord there too, and they get classified on a later sync once
             // confirmed and indexed.
             let total_outpoints = outpoints.len();
-            let queryable_outpoints: Vec<String> = outpoints
+            let mut pending_protection =
+                std::collections::HashSet::<bitcoin::OutPoint>::new();
+            let queryable_utxos: Vec<(String, u64)> = outpoints
                 .into_iter()
-                .filter_map(|(op, confirmation_height)| match confirmation_height {
-                    Some(height) if height <= ord_height => Some(op),
-                    _ => None,
-                })
+                .filter_map(
+                    |(op, confirmation_height, value_sats)| match confirmation_height {
+                        Some(height) if height <= ord_height => Some((op, value_sats)),
+                        _ => {
+                            if let Ok(outpoint) = op.parse() {
+                                pending_protection.insert(outpoint);
+                            }
+                            None
+                        }
+                    },
+                )
                 .collect();
-            if queryable_outpoints.len() < total_outpoints {
+            if queryable_utxos.len() < total_outpoints {
                 zinc_log_debug!(target: LOG_TARGET_WASM,
                     "sync_ordinals: skipping {} outpoint(s) not yet indexable by ord (unconfirmed or above ord height {})",
-                    total_outpoints - queryable_outpoints.len(),
+                    total_outpoints - queryable_utxos.len(),
                     ord_height
                 );
             }
@@ -2917,10 +2926,7 @@ impl ZincWasmWallet {
             // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
             // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
-            let resolved = match client
-                .resolve_assets_for_outpoints(&queryable_outpoints)
-                .await
-            {
+            let resolved = match client.resolve_assets_for_utxos(&queryable_utxos).await {
                 Ok(r) => r,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);
@@ -2943,7 +2949,9 @@ impl ZincWasmWallet {
                 }
             };
             let all_inscriptions = resolved.inscriptions;
-            let protected_outpoints = resolved.protected_outpoints;
+            let mut protected_outpoints = resolved.protected_outpoints;
+            protected_outpoints.extend(pending_protection);
+            let rare_sat_outpoints = resolved.rare_sat_outpoints;
             let rune_balances = resolved.rune_balances;
             let outpoint_runes = resolved.outpoint_runes;
             let rune_infos = resolved.rune_infos;
@@ -2960,10 +2968,11 @@ impl ZincWasmWallet {
                         if inner.account_generation() != sync_generation {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
-                        let c = inner.apply_verified_ordinals_update(
+                        let c = inner.apply_verified_ordinals_update_with_rare_sats(
                             all_inscriptions,
                             protected_outpoints,
                             rune_balances,
+                            rare_sat_outpoints,
                         );
                         inner.apply_outpoint_rune_holdings(outpoint_runes, rune_infos);
                         inner.is_syncing = false; // FINISHED

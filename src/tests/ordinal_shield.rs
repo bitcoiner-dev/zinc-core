@@ -354,6 +354,9 @@ fn test_missing_witness_utxo_error() {
                 "Error message should mention missing witness_utxo"
             );
         }
+        crate::ordinals::error::OrdError::RareSatProtectionUnverified { .. } => {
+            panic!("missing PSBT data must remain a request failure")
+        }
     }
 }
 

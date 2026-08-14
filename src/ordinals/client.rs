@@ -1,9 +1,10 @@
 use crate::ordinals::error::OrdError;
 use crate::ordinals::types::{Inscription, RuneBalance, RuneInfo};
 use bitcoin::OutPoint;
+use ordinals::{Epoch, Rarity, Sat};
 use reqwest::Client;
 use serde::{Deserialize, Deserializer};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 /// Lightweight client for ord-compatible REST APIs.
@@ -36,15 +37,31 @@ pub struct AddressAssetSnapshot {
 #[derive(Deserialize)]
 struct OutputResponse {
     #[serde(default)]
+    indexed: Option<bool>,
+    #[serde(default)]
     address: Option<String>,
     #[serde(default)]
     outpoint: Option<String>,
     #[serde(default)]
+    transaction: Option<String>,
+    #[serde(default)]
     value: Option<u64>,
+    #[serde(default)]
+    sat_ranges: Option<Vec<(u64, u64)>>,
     #[serde(default, deserialize_with = "deserialize_string_vec_or_default")]
     inscriptions: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_json_value_or_default")]
     runes: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Non-common sat summary for one wallet output.
+pub struct RareSatSummary {
+    /// Number of non-common sats in the output.
+    pub count: u64,
+    /// Highest Ordinal rarity present (`uncommon` through `mythic`).
+    pub highest_rarity: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +95,8 @@ pub struct ResolvedAssets {
     pub inscriptions: Vec<Inscription>,
     /// Outpoints holding an inscription or rune — the shield's protected (unspendable) set.
     pub protected_outpoints: HashSet<OutPoint>,
+    /// Non-common sat summaries keyed by their protected outpoint.
+    pub rare_sat_outpoints: HashMap<OutPoint, RareSatSummary>,
     /// Aggregated rune balances.
     pub rune_balances: Vec<RuneBalance>,
     /// Per-outpoint rune holdings keyed by rune ID `"block:tx"` (base units).
@@ -148,7 +167,13 @@ enum OffersResponse {
 
 impl OutputResponse {
     fn has_protected_assets(&self) -> bool {
-        !self.inscriptions.is_empty() || value_has_entries(&self.runes)
+        !self.inscriptions.is_empty()
+            || value_has_entries(&self.runes)
+            || self
+                .sat_ranges
+                .as_deref()
+                .and_then(classify_rare_sats)
+                .is_some()
     }
 
     fn into_output_details(self, requested_outpoint: &str) -> Result<OutputDetails, OrdError> {
@@ -178,6 +203,130 @@ impl OutputResponse {
             runes: self.runes,
         })
     }
+}
+
+fn checked_ceil_div(value: u64, divisor: u64) -> Option<u64> {
+    value
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
+}
+
+fn first_multiple_at_or_after(value: u64, period: u64) -> Option<u64> {
+    checked_ceil_div(value, period)?.checked_mul(period)
+}
+
+/// Classify non-common sats without iterating over every sat in an output.
+/// A non-common sat is the first sat of a block, so each epoch can be reduced
+/// to a closed interval of block heights and checked arithmetically.
+fn classify_rare_sats(ranges: &[(u64, u64)]) -> Option<RareSatSummary> {
+    let mut count = 0u64;
+    let mut highest = Rarity::Common;
+
+    for &(range_start, range_end) in ranges {
+        for epoch_number in 0..33u32 {
+            let epoch = Epoch(epoch_number);
+            let epoch_start = epoch.starting_sat().n();
+            let epoch_end = Epoch(epoch_number + 1).starting_sat().n();
+            let start = range_start.max(epoch_start);
+            let end = range_end.min(epoch_end);
+            if start >= end {
+                continue;
+            }
+
+            let subsidy = epoch.subsidy();
+            if subsidy == 0 {
+                continue;
+            }
+            let first_index = checked_ceil_div(start - epoch_start, subsidy)?;
+            let last_index = (end - 1 - epoch_start) / subsidy;
+            if first_index > last_index {
+                continue;
+            }
+            count = count.checked_add(last_index - first_index + 1)?;
+
+            let first_height = u64::from(epoch.starting_height().n()) + first_index;
+            let last_height = u64::from(epoch.starting_height().n()) + last_index;
+            let candidate_rarity = if first_height == 0 {
+                Rarity::Mythic
+            } else if first_multiple_at_or_after(first_height, 1_260_000)? <= last_height {
+                Rarity::Legendary
+            } else if first_multiple_at_or_after(first_height, 210_000)? <= last_height {
+                Rarity::Epic
+            } else if first_multiple_at_or_after(first_height, 2_016)? <= last_height {
+                Rarity::Rare
+            } else {
+                Rarity::Uncommon
+            };
+            if candidate_rarity > highest {
+                highest = candidate_rarity;
+            }
+        }
+    }
+
+    (count > 0).then(|| RareSatSummary {
+        count,
+        highest_rarity: highest.to_string(),
+    })
+}
+
+fn validate_sat_ranges(
+    outpoint: &str,
+    ranges: Option<&[(u64, u64)]>,
+    returned_value: Option<u64>,
+    trusted_value: u64,
+) -> Result<RareSatSummary, OrdError> {
+    let value = returned_value.ok_or_else(|| {
+        let _ = outpoint;
+        OrdError::RareSatProtectionUnverified {
+            reason: "missing-output-value",
+        }
+    })?;
+    if value != trusted_value {
+        return Err(OrdError::RareSatProtectionUnverified {
+            reason: "wallet-value-mismatch",
+        });
+    }
+    let ranges = ranges.ok_or_else(|| OrdError::RareSatProtectionUnverified {
+        reason: "sat-ranges-missing",
+    })?;
+    if trusted_value > 0 && ranges.is_empty() {
+        return Err(OrdError::RareSatProtectionUnverified {
+            reason: "sat-ranges-empty",
+        });
+    }
+
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|range| range.0);
+    let mut total = 0u64;
+    let mut previous_end = None;
+    for &(start, end) in &sorted {
+        if start >= end || end > Sat::SUPPLY {
+            return Err(OrdError::RareSatProtectionUnverified {
+                reason: "sat-range-invalid",
+            });
+        }
+        if previous_end.is_some_and(|previous| start < previous) {
+            return Err(OrdError::RareSatProtectionUnverified {
+                reason: "sat-ranges-overlap",
+            });
+        }
+        total = total
+            .checked_add(end - start)
+            .ok_or(OrdError::RareSatProtectionUnverified {
+                reason: "sat-range-size-overflow",
+            })?;
+        previous_end = Some(end);
+    }
+    if total != trusted_value {
+        return Err(OrdError::RareSatProtectionUnverified {
+            reason: "sat-range-coverage-mismatch",
+        });
+    }
+
+    Ok(classify_rare_sats(&sorted).unwrap_or(RareSatSummary {
+        count: 0,
+        highest_rarity: Rarity::Common.to_string(),
+    }))
 }
 
 fn deserialize_string_vec_or_default<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -664,6 +813,38 @@ impl OrdClient {
         &self,
         outpoints: &[String],
     ) -> Result<ResolvedAssets, OrdError> {
+        self.resolve_assets_for_outpoints_inner(outpoints, None)
+            .await
+    }
+
+    /// Resolve assets and rare-sat protection for wallet-owned UTXOs.
+    ///
+    /// Unlike the legacy outpoint-only API, this compares ord's output value
+    /// and sat ranges with the wallet engine's trusted BDK value. Missing,
+    /// duplicate, unexpected, or malformed results fail closed.
+    pub async fn resolve_assets_for_utxos(
+        &self,
+        utxos: &[(String, u64)],
+    ) -> Result<ResolvedAssets, OrdError> {
+        let mut expected = HashMap::with_capacity(utxos.len());
+        for (outpoint, value) in utxos {
+            if expected.insert(outpoint.clone(), *value).is_some() {
+                return Err(OrdError::RareSatProtectionUnverified {
+                    reason: "duplicate-wallet-outpoint",
+                });
+            }
+        }
+        let outpoints: Vec<String> = utxos.iter().map(|(outpoint, _)| outpoint.clone()).collect();
+        self.resolve_assets_for_outpoints_inner(&outpoints, Some(&expected))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)] // One cohesive bulk-resolution pass.
+    async fn resolve_assets_for_outpoints_inner(
+        &self,
+        outpoints: &[String],
+        expected_values: Option<&HashMap<String, u64>>,
+    ) -> Result<ResolvedAssets, OrdError> {
         if outpoints.is_empty() {
             return Ok(ResolvedAssets::default());
         }
@@ -685,14 +866,61 @@ impl OrdClient {
             .collect();
         for requested in outpoints {
             if !returned.contains(requested.as_str()) {
+                if expected_values.is_some() {
+                    return Err(OrdError::RareSatProtectionUnverified {
+                        reason: "bulk-result-outpoint-missing",
+                    });
+                }
                 return Err(OrdError::RequestFailed(format!(
                     "Bulk outputs response missing {requested}; refusing partial ordinals state"
                 )));
             }
         }
+        if expected_values.is_some() {
+            if entries.len() != outpoints.len() || returned.len() != outpoints.len() {
+                return Err(OrdError::RareSatProtectionUnverified {
+                    reason: "bulk-result-cardinality-mismatch",
+                });
+            }
+            for entry in &entries {
+                let outpoint = entry.outpoint.as_deref().ok_or_else(|| {
+                    OrdError::RareSatProtectionUnverified {
+                        reason: "bulk-result-outpoint-missing",
+                    }
+                })?;
+                let expected_value = expected_values
+                    .and_then(|values| values.get(outpoint))
+                    .copied()
+                    .ok_or_else(|| OrdError::RareSatProtectionUnverified {
+                        reason: "bulk-result-outpoint-unexpected",
+                    })?;
+                if entry.indexed != Some(true) {
+                    return Err(OrdError::RareSatProtectionUnverified {
+                        reason: "output-not-indexed",
+                    });
+                }
+                let parsed = outpoint.parse::<OutPoint>().map_err(|_| {
+                    OrdError::RareSatProtectionUnverified {
+                        reason: "output-outpoint-invalid",
+                    }
+                })?;
+                if entry.transaction.as_deref() != Some(&parsed.txid.to_string()) {
+                    return Err(OrdError::RareSatProtectionUnverified {
+                        reason: "output-transaction-mismatch",
+                    });
+                }
+                validate_sat_ranges(
+                    outpoint,
+                    entry.sat_ranges.as_deref(),
+                    entry.value,
+                    expected_value,
+                )?;
+            }
+        }
 
         // 2. Derive protected set + inscription ids + rune balances from the bulk entries.
         let mut protected_outpoints = HashSet::new();
+        let mut rare_sat_outpoints = HashMap::new();
         let mut inscription_ids: Vec<String> = Vec::new();
         let mut rune_balances: Vec<RuneBalance> = Vec::new();
         // Per-outpoint rune amounts, still keyed by NAME (ord's /outputs shape).
@@ -705,6 +933,25 @@ impl OrdClient {
             if e.has_protected_assets() {
                 if let Some(op) = outpoint {
                     protected_outpoints.insert(op);
+                }
+            }
+            if let (Some(values), Some(op), Some(outpoint_str)) =
+                (expected_values, outpoint, e.outpoint.as_deref())
+            {
+                let expected_value = values.get(outpoint_str).copied().ok_or_else(|| {
+                    OrdError::RareSatProtectionUnverified {
+                        reason: "trusted-wallet-value-missing",
+                    }
+                })?;
+                let summary = validate_sat_ranges(
+                    outpoint_str,
+                    e.sat_ranges.as_deref(),
+                    e.value,
+                    expected_value,
+                )?;
+                if summary.count > 0 {
+                    protected_outpoints.insert(op);
+                    rare_sat_outpoints.insert(op, summary);
                 }
             }
             inscription_ids.extend(e.inscriptions.iter().cloned());
@@ -802,6 +1049,7 @@ impl OrdClient {
         Ok(ResolvedAssets {
             inscriptions,
             protected_outpoints,
+            rare_sat_outpoints,
             rune_balances: merged_balances,
             outpoint_runes,
             rune_infos,
@@ -960,7 +1208,65 @@ impl OrdClient {
 // test build so `wasm-pack test --node` can compile the crate.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::{parse_offers_payload, parse_runes_balances_value, OrdClient, OutputResponse};
+    use super::{
+        classify_rare_sats, parse_offers_payload, parse_runes_balances_value, validate_sat_ranges,
+        OrdClient, OrdError, OutputResponse,
+    };
+
+    #[test]
+    fn classifies_non_common_sats_without_scanning_the_range() {
+        let uncommon = classify_rare_sats(&[(5_000_000_000, 10_000_000_000)])
+            .expect("block-one first sat is uncommon");
+        assert_eq!(uncommon.count, 1);
+        assert_eq!(uncommon.highest_rarity, "uncommon");
+
+        let mixed = classify_rare_sats(&[(0, 10_000_000_001)])
+            .expect("genesis and later block boundaries are protected");
+        assert_eq!(mixed.count, 3);
+        assert_eq!(mixed.highest_rarity, "mythic");
+
+        assert!(classify_rare_sats(&[(1, 5_000_000_000)]).is_none());
+    }
+
+    #[test]
+    fn strict_sat_range_validation_matches_the_wallet_value() {
+        let summary = validate_sat_ranges(
+            "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098:0",
+            Some(&[(5_000_000_000, 10_000_000_000)]),
+            Some(5_000_000_000),
+            5_000_000_000,
+        )
+        .expect("complete ranges");
+        assert_eq!(summary.highest_rarity, "uncommon");
+
+        for (ranges, returned, trusted, expected_reason) in [
+            (None, Some(330), 330, "sat-ranges-missing"),
+            (Some(&[][..]), Some(330), 330, "sat-ranges-empty"),
+            (Some(&[(10, 20)][..]), Some(9), 10, "wallet-value-mismatch"),
+            (
+                Some(&[(10, 19)][..]),
+                Some(10),
+                10,
+                "sat-range-coverage-mismatch",
+            ),
+            (
+                Some(&[(10, 20), (19, 21)][..]),
+                Some(12),
+                12,
+                "sat-ranges-overlap",
+            ),
+        ] {
+            let error = validate_sat_ranges("00:0", ranges, returned, trusted)
+                .expect_err("unsafe response must fail closed");
+            assert_eq!(error.to_string(), "ORD_RARE_SAT_PROTECTION_UNVERIFIED");
+            match error {
+                OrdError::RareSatProtectionUnverified { reason } => {
+                    assert_eq!(reason, expected_reason)
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn output_response_accepts_null_asset_fields() {
