@@ -399,4 +399,72 @@ mod tests {
             .expect_err("unresolvable rune id must fail the sync");
         assert!(err.to_string().contains("API Error (Rune"), "{err}");
     }
+
+    #[tokio::test]
+    async fn trusted_utxo_resolution_protects_non_common_sats() {
+        let mut server = Server::new_async().await;
+        let txid = "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098";
+        let outpoint = format!("{txid}:0");
+        let outputs = server
+            .mock("POST", "/outputs")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"[{{
+                "indexed": true,
+                "transaction": "{txid}",
+                "outpoint": "{outpoint}",
+                "value": 2,
+                "sat_ranges": [[1, 2], [5000000000, 5000000001]],
+                "inscriptions": [],
+                "runes": {{}}
+            }}]"#
+            ))
+            .create_async()
+            .await;
+
+        let client = OrdClient::new(server.url());
+        let resolved = client
+            .resolve_assets_for_utxos(&[(outpoint.clone(), 2)])
+            .await
+            .expect("sat-indexed response should verify");
+        outputs.assert_async().await;
+
+        let parsed = outpoint.parse().unwrap();
+        assert!(resolved.protected_outpoints.contains(&parsed));
+        let summary = resolved
+            .rare_sat_outpoints
+            .get(&parsed)
+            .expect("rare sat summary");
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.highest_rarity, "uncommon");
+        assert_eq!(summary.sats.len(), 1);
+        assert_eq!(summary.sats[0].number, 5_000_000_000);
+        assert_eq!(summary.sats[0].offset, 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_utxo_resolution_fails_closed_without_complete_sat_ranges() {
+        for body in [
+            r#"[{"indexed":true,"transaction":"1111111111111111111111111111111111111111111111111111111111111111","outpoint":"1111111111111111111111111111111111111111111111111111111111111111:0","value":330,"inscriptions":[],"runes":{}}]"#,
+            r#"[{"indexed":true,"transaction":"1111111111111111111111111111111111111111111111111111111111111111","outpoint":"1111111111111111111111111111111111111111111111111111111111111111:0","value":330,"sat_ranges":[],"inscriptions":[],"runes":{}}]"#,
+            r#"[{"indexed":true,"transaction":"1111111111111111111111111111111111111111111111111111111111111111","outpoint":"1111111111111111111111111111111111111111111111111111111111111111:0","value":330,"sat_ranges":[[10,339]],"inscriptions":[],"runes":{}}]"#,
+        ] {
+            let mut server = Server::new_async().await;
+            let mock = server
+                .mock("POST", "/outputs")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+            let client = OrdClient::new(server.url());
+            let outpoint = "1111111111111111111111111111111111111111111111111111111111111111:0";
+            client
+                .resolve_assets_for_utxos(&[(outpoint.to_string(), 330)])
+                .await
+                .expect_err("unverifiable sat ranges must fail closed");
+            mock.assert_async().await;
+        }
+    }
 }

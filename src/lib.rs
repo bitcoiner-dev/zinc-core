@@ -587,7 +587,7 @@ where
     None
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 async fn account_is_active_from_receive_scan<F, Fut>(
     address_scan_depth: u32,
     has_activity_at: F,
@@ -599,6 +599,116 @@ where
     first_active_receive_index_from_scan(address_scan_depth, has_activity_at)
         .await
         .is_some()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountDiscoveryProbeError {
+    Deadline,
+    Backend,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+async fn account_is_active_from_receive_scan_strict<F, Fut>(
+    address_scan_depth: u32,
+    mut has_activity_at: F,
+) -> Result<bool, AccountDiscoveryProbeError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<bool, AccountDiscoveryProbeError>>,
+{
+    let depth = address_scan_depth.max(1);
+    const ADDRESS_SCAN_BATCH_SIZE: u32 = 20;
+
+    let mut batch_start = 0;
+    while batch_start < depth {
+        let batch_end = (batch_start + ADDRESS_SCAN_BATCH_SIZE).min(depth);
+        let mut checks = Vec::with_capacity((batch_end - batch_start) as usize);
+        for address_index in batch_start..batch_end {
+            checks.push(has_activity_at(address_index));
+        }
+
+        let results = futures_util::future::join_all(checks).await;
+        if results.iter().any(|result| matches!(result, Ok(true))) {
+            return Ok(true);
+        }
+        if let Some(error) = results.into_iter().find_map(Result::err) {
+            return Err(error);
+        }
+
+        batch_start = batch_end;
+    }
+
+    Ok(false)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Default)]
+struct AccountDiscoveryTracker {
+    max_active_index: Option<u32>,
+    current_gap: u32,
+    scanned_accounts: u32,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl AccountDiscoveryTracker {
+    fn record_probe(&mut self, account_index: u32, active: bool) -> Option<u32> {
+        self.scanned_accounts = self.scanned_accounts.saturating_add(1);
+        if active {
+            let previous = self.discovered_count();
+            self.max_active_index = Some(
+                self.max_active_index
+                    .map_or(account_index, |current| current.max(account_index)),
+            );
+            self.current_gap = 0;
+            let next = self.discovered_count();
+            return (next > previous).then_some(next);
+        }
+
+        self.current_gap = self.current_gap.saturating_add(1);
+        None
+    }
+
+    fn discovered_count(&self) -> u32 {
+        self.max_active_index
+            .map_or(1, |index| index.saturating_add(1))
+    }
+
+    fn gap_reached(&self, gap_limit: u32) -> bool {
+        self.current_gap >= gap_limit
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_SCHEMA_V1: u8 = 1;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountDiscoveryProgressV1 {
+    version: u8,
+    scanned_account_index: u32,
+    discovered_count: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AccountDiscoveryStopReasonV1 {
+    GapLimit,
+    Deadline,
+    MaxAccounts,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountDiscoveryResponseV1 {
+    version: u8,
+    discovered_count: u32,
+    scanned_accounts: u32,
+    complete: bool,
+    stop_reason: AccountDiscoveryStopReasonV1,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2280,6 +2390,8 @@ impl ZincWasmWallet {
         account_gap_limit: u32,
         address_scan_depth: Option<u32>,
         timeout_ms: Option<u32>,
+        max_accounts: Option<u32>,
+        on_progress: Option<js_sys::Function>,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
 
@@ -2291,41 +2403,54 @@ impl ZincWasmWallet {
         let scheme = state.scheme;
         let derivation_mode = state.derivation_mode;
         let payment_address_type = state.payment_address_type;
-        let account_gap_limit = account_gap_limit.max(1);
+        const MAX_ACCOUNT_GAP_LIMIT: u32 = 100;
+        const MAX_ADDRESS_SCAN_DEPTH: u32 = 200;
+        const MAX_DISCOVERY_ACCOUNTS: u32 = 100;
+        let account_gap_limit = account_gap_limit.clamp(1, MAX_ACCOUNT_GAP_LIMIT);
         let requested_address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
         let address_scan_depth = requested_address_scan_depth;
-        let timeout_ms = timeout_ms.unwrap_or(120_000).max(1);
+        let address_scan_depth = address_scan_depth.min(MAX_ADDRESS_SCAN_DEPTH);
+        const MAX_DISCOVERY_TIMEOUT_MS: u32 = 300_000;
+        let timeout_ms = timeout_ms
+            .unwrap_or(120_000)
+            .clamp(1, MAX_DISCOVERY_TIMEOUT_MS);
+        let max_accounts = max_accounts
+            .unwrap_or(MAX_DISCOVERY_ACCOUNTS)
+            .clamp(1, MAX_DISCOVERY_ACCOUNTS);
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
                 target: LOG_TARGET_WASM,
-                "discover_accounts start ({}, account_gap_limit={}, requested_scan_depth={}, effective_scan_depth={}, timeout_ms={})",
+                "discover_accounts start ({}, account_gap_limit={}, requested_scan_depth={}, effective_scan_depth={}, timeout_ms={}, max_accounts={})",
                 logging::redacted_field("esplora_url", &esplora_url),
                 account_gap_limit,
                 requested_address_scan_depth,
                 address_scan_depth,
-                timeout_ms
+                timeout_ms,
+                max_accounts
             );
 
             let client = reqwest::Client::new();
-            let mut max_active_index: i32 = -1;
-            let mut current_gap = 0;
+            let mut tracker = AccountDiscoveryTracker::default();
             let mut account_index: u32 = 0;
             let start_ms = js_sys::Date::now();
             let deadline_ms = start_ms + f64::from(timeout_ms);
+            let mut stop_reason = AccountDiscoveryStopReasonV1::MaxAccounts;
 
-            loop {
+            while account_index < max_accounts {
                 if js_sys::Date::now() >= deadline_ms {
                     zinc_log_warn!(
                         target: LOG_TARGET_WASM,
-                        "discover_accounts reached timeout budget after {}ms (best_so_far_max_active={})",
+                        "discover_accounts reached timeout budget after {}ms (discovered_count={})",
                         timeout_ms,
-                        max_active_index
+                        tracker.discovered_count()
                     );
+                    stop_reason = AccountDiscoveryStopReasonV1::Deadline;
                     break;
                 }
 
-                if current_gap >= account_gap_limit {
+                if tracker.gap_reached(account_gap_limit) {
+                    stop_reason = AccountDiscoveryStopReasonV1::GapLimit;
                     break;
                 }
 
@@ -2337,7 +2462,6 @@ impl ZincWasmWallet {
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-                let timed_out = std::cell::Cell::new(false);
                 const ADDRESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
 
                 let check_activity = |addr_str: String| {
@@ -2345,16 +2469,25 @@ impl ZincWasmWallet {
                     let url = format!("{}/address/{}", esplora_url, addr_str);
                     async move {
                         let request = async {
-                            if let Ok(resp) = client.get(&url).send().await {
-                                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                    let chain_txs =
-                                        json["chain_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    let mempool_txs =
-                                        json["mempool_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    return chain_txs > 0 || mempool_txs > 0;
-                                }
+                            let response = client
+                                .get(&url)
+                                .send()
+                                .await
+                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
+                            if !response.status().is_success() {
+                                return Err(AccountDiscoveryProbeError::Backend);
                             }
-                            false
+                            let json = response
+                                .json::<serde_json::Value>()
+                                .await
+                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
+                            let chain_txs = json["chain_stats"]["tx_count"]
+                                .as_u64()
+                                .ok_or(AccountDiscoveryProbeError::Backend)?;
+                            let mempool_txs = json["mempool_stats"]["tx_count"]
+                                .as_u64()
+                                .ok_or(AccountDiscoveryProbeError::Backend)?;
+                            Ok(chain_txs > 0 || mempool_txs > 0)
                         };
                         let timeout =
                             gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
@@ -2363,15 +2496,18 @@ impl ZincWasmWallet {
 
                         match futures_util::future::select(request, timeout).await {
                             futures_util::future::Either::Left((value, _)) => value,
-                            futures_util::future::Either::Right((_timed_out, _)) => false,
+                            futures_util::future::Either::Right((_timed_out, _)) => {
+                                Err(AccountDiscoveryProbeError::Backend)
+                            }
                         }
                     }
                 };
 
                 // Scan each account's receive chain deeply enough to catch funds parked
                 // on later derived addresses during recovery.
-                let has_activity =
-                    account_is_active_from_receive_scan(address_scan_depth, |address_index| {
+                let has_activity = account_is_active_from_receive_scan_strict(
+                    address_scan_depth,
+                    |address_index| {
                         let vault_addr = zwallet.peek_taproot_address(address_index).to_string();
 
                         let payment_addr = if scheme == AddressScheme::Dual {
@@ -2384,53 +2520,82 @@ impl ZincWasmWallet {
 
                         async {
                             if js_sys::Date::now() >= deadline_ms {
-                                timed_out.set(true);
-                                return false;
+                                return Err(AccountDiscoveryProbeError::Deadline);
                             }
-                            if check_activity(vault_addr).await {
-                                return true;
+                            if check_activity(vault_addr).await? {
+                                return Ok(true);
                             }
                             if let Some(payment_addr) = payment_addr {
                                 return check_activity(payment_addr).await;
                             }
-                            false
+                            Ok(false)
                         }
-                    })
-                    .await;
+                    },
+                )
+                .await;
 
-                if timed_out.get() {
-                    zinc_log_warn!(
-                        target: LOG_TARGET_WASM,
-                        "discover_accounts stopped mid-account scan due to timeout budget (account_index={})",
-                        account_index
-                    );
-                    break;
+                let has_activity = match has_activity {
+                    Ok(active) => active,
+                    Err(AccountDiscoveryProbeError::Deadline) => {
+                        zinc_log_warn!(
+                            target: LOG_TARGET_WASM,
+                            "discover_accounts stopped at deadline (account_index={})",
+                            account_index
+                        );
+                        stop_reason = AccountDiscoveryStopReasonV1::Deadline;
+                        break;
+                    }
+                    Err(AccountDiscoveryProbeError::Backend) => {
+                        return Err(JsValue::from_str(
+                            "Account discovery backend request failed",
+                        ));
+                    }
+                };
+
+                if let Some(discovered_count) = tracker.record_probe(account_index, has_activity) {
+                    if let Some(callback) = on_progress.as_ref() {
+                        let progress = AccountDiscoveryProgressV1 {
+                            version: ACCOUNT_DISCOVERY_SCHEMA_V1,
+                            scanned_account_index: account_index,
+                            discovered_count,
+                        };
+                        if let Ok(value) = serde_wasm_bindgen::to_value(&progress) {
+                            if callback.call1(&JsValue::UNDEFINED, &value).is_err() {
+                                zinc_log_warn!(
+                                    target: LOG_TARGET_WASM,
+                                    "discover_accounts progress callback failed"
+                                );
+                            }
+                        }
+                    }
                 }
 
-                if has_activity {
-                    max_active_index = account_index as i32;
-                    current_gap = 0;
-                } else {
-                    current_gap += 1;
-                }
-
-                account_index += 1;
+                account_index = account_index
+                    .checked_add(1)
+                    .ok_or_else(|| JsValue::from_str("Account discovery index overflow"))?;
             }
 
-            let discovered_count = (max_active_index + 1) as u32;
-            let final_count = if discovered_count > 0 {
-                discovered_count
-            } else {
-                1
-            }; // Always show at least 1 (also on timeout)
+            if tracker.gap_reached(account_gap_limit) {
+                stop_reason = AccountDiscoveryStopReasonV1::GapLimit;
+            }
+            let complete = matches!(stop_reason, AccountDiscoveryStopReasonV1::GapLimit);
+            let response = AccountDiscoveryResponseV1 {
+                version: ACCOUNT_DISCOVERY_SCHEMA_V1,
+                discovered_count: tracker.discovered_count(),
+                scanned_accounts: tracker.scanned_accounts,
+                complete,
+                stop_reason,
+            };
 
             zinc_log_debug!(target: LOG_TARGET_WASM,
-                "discover_accounts finished. Found max active = {}, returning discovery count {}",
-                max_active_index,
-                final_count
+                "discover_accounts finished. discovered_count={}, scanned_accounts={}, complete={}",
+                response.discovered_count,
+                response.scanned_accounts,
+                response.complete
             );
 
-            Ok(JsValue::from(final_count))
+            serde_wasm_bindgen::to_value(&response)
+                .map_err(|error| JsValue::from(error.to_string()))
         }))
     }
 
@@ -2649,7 +2814,7 @@ impl ZincWasmWallet {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collecting UTXO outpoints...");
                         // Inscriptions/runes are UTXO-bound, so we bulk-query exactly our own outpoints
                         // (POST /outputs) — one request instead of per-address + per-output round-trips.
-                        let ops = inner.collect_utxo_outpoints();
+                        let ops = inner.collect_utxo_snapshots();
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collected {} outpoints", ops.len());
                         // A wallet with zero outpoints but a non-empty inscription list is almost
                         // certainly not chain-synced yet (fresh instance, failed/foreign changeset
@@ -2740,21 +2905,29 @@ impl ZincWasmWallet {
             // were invisible to ord there too, and they get classified on a later sync once
             // confirmed and indexed.
             let total_outpoints = outpoints.len();
-            let queryable_outpoints: Vec<String> = outpoints
+            let mut pending_protection = std::collections::HashSet::<bitcoin::OutPoint>::new();
+            let queryable_utxos: Vec<(String, u64)> = outpoints
                 .into_iter()
-                .filter_map(|(op, confirmation_height)| match confirmation_height {
-                    Some(height) if height <= ord_height => Some(op),
-                    _ => None,
-                })
+                .filter_map(
+                    |(op, confirmation_height, value_sats)| match confirmation_height {
+                        Some(height) if height <= ord_height => Some((op, value_sats)),
+                        _ => {
+                            if let Ok(outpoint) = op.parse() {
+                                pending_protection.insert(outpoint);
+                            }
+                            None
+                        }
+                    },
+                )
                 .collect();
-            let classified_outpoints = queryable_outpoints
+            let classified_outpoints = queryable_utxos
                 .iter()
-                .filter_map(|outpoint| outpoint.parse().ok())
+                .filter_map(|(outpoint, _)| outpoint.parse().ok())
                 .collect();
-            if queryable_outpoints.len() < total_outpoints {
+            if queryable_utxos.len() < total_outpoints {
                 zinc_log_debug!(target: LOG_TARGET_WASM,
                     "sync_ordinals: skipping {} outpoint(s) not yet indexable by ord (unconfirmed or above ord height {})",
-                    total_outpoints - queryable_outpoints.len(),
+                    total_outpoints - queryable_utxos.len(),
                     ord_height
                 );
             }
@@ -2766,10 +2939,7 @@ impl ZincWasmWallet {
             // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
             // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
-            let resolved = match client
-                .resolve_assets_for_outpoints(&queryable_outpoints)
-                .await
-            {
+            let resolved = match client.resolve_assets_for_utxos(&queryable_utxos).await {
                 Ok(r) => r,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);
@@ -2792,7 +2962,9 @@ impl ZincWasmWallet {
                 }
             };
             let all_inscriptions = resolved.inscriptions;
-            let protected_outpoints = resolved.protected_outpoints;
+            let mut protected_outpoints = resolved.protected_outpoints;
+            protected_outpoints.extend(pending_protection);
+            let rare_sat_outpoints = resolved.rare_sat_outpoints;
             let rune_balances = resolved.rune_balances;
             let outpoint_runes = resolved.outpoint_runes;
             let rune_infos = resolved.rune_infos;
@@ -2810,10 +2982,11 @@ impl ZincWasmWallet {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
                         let c = inner
-                            .apply_verified_ordinals_update(
+                            .apply_verified_ordinals_update_with_rare_sats(
                                 all_inscriptions,
                                 protected_outpoints,
                                 rune_balances,
+                                rare_sat_outpoints,
                                 classified_outpoints,
                                 chain_generation,
                             )
@@ -2962,6 +3135,41 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&e.to_string())),
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (planSalvage): {e}"
+            ))),
+        }
+    }
+
+    /// Build an unsigned rare-sat extraction PSBT. The exact sat positions
+    /// come from the last verified ord sync; a clean confirmed UTXO funds fees.
+    #[wasm_bindgen(js_name = planExtractRareSats)]
+    pub fn plan_extract_rare_sats_request(&self, request: JsValue) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PlanExtractRareSatsRequest {
+            outpoint: String,
+            fee_rate_sat_vb: f64,
+            target_postage: u64,
+            protected_address: String,
+            change_address: String,
+        }
+
+        let req: PlanExtractRareSatsRequest = serde_wasm_bindgen::from_value(request)
+            .map_err(|error| JsValue::from_str(&format!("Invalid extraction request: {error}")))?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .plan_extract_rare_sats_base64(
+                    &req.outpoint,
+                    req.fee_rate_sat_vb,
+                    req.target_postage,
+                    &req.protected_address,
+                    &req.change_address,
+                )
+                .map_err(|error| JsValue::from_str(&error.to_string())),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planExtractRareSats): {error}"
             ))),
         }
     }
