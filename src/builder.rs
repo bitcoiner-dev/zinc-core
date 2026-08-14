@@ -412,6 +412,7 @@ pub struct InscriptionTransferIntentDetails {
 pub struct CpfpIntentDetails {
     pub transaction: ExactTransactionTemplate,
     pub requested_txid: String,
+    pub parent_txid: String,
     pub anchor_outpoint: String,
 }
 
@@ -463,6 +464,7 @@ pub struct InscriptionTransferIntentRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CpfpIntentRequest {
     pub requested_txid: String,
+    pub parent_txid: String,
     pub anchor_outpoint: String,
 }
 
@@ -4317,6 +4319,7 @@ impl ZincWallet {
                 ConstructedTransactionIntent::Cpfp(CpfpIntentDetails {
                     transaction,
                     requested_txid: details.requested_txid,
+                    parent_txid: details.parent_txid,
                     anchor_outpoint: details.anchor_outpoint,
                 })
             }
@@ -4430,10 +4433,17 @@ impl ZincWallet {
                     .requested_txid
                     .parse::<bitcoin::Txid>()
                     .map_err(|error| format!("Invalid requested CPFP txid: {error}"))?;
+                let parent = details
+                    .parent_txid
+                    .parse::<bitcoin::Txid>()
+                    .map_err(|error| format!("Invalid CPFP parent txid: {error}"))?;
                 let anchor = details
                     .anchor_outpoint
                     .parse::<bitcoin::OutPoint>()
                     .map_err(|error| format!("Invalid CPFP anchor outpoint: {error}"))?;
+                if anchor.txid != parent {
+                    return Err("CPFP anchor does not belong to its approved parent".to_string());
+                }
                 if !psbt
                     .unsigned_tx
                     .input
