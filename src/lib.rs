@@ -2895,8 +2895,7 @@ impl ZincWasmWallet {
             // were invisible to ord there too, and they get classified on a later sync once
             // confirmed and indexed.
             let total_outpoints = outpoints.len();
-            let mut pending_protection =
-                std::collections::HashSet::<bitcoin::OutPoint>::new();
+            let mut pending_protection = std::collections::HashSet::<bitcoin::OutPoint>::new();
             let queryable_utxos: Vec<(String, u64)> = outpoints
                 .into_iter()
                 .filter_map(
@@ -3092,6 +3091,41 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&e.to_string())),
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (planSalvage): {e}"
+            ))),
+        }
+    }
+
+    /// Build an unsigned rare-sat extraction PSBT. The exact sat positions
+    /// come from the last verified ord sync; a clean confirmed UTXO funds fees.
+    #[wasm_bindgen(js_name = planExtractRareSats)]
+    pub fn plan_extract_rare_sats_request(&self, request: JsValue) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PlanExtractRareSatsRequest {
+            outpoint: String,
+            fee_rate_sat_vb: f64,
+            target_postage: u64,
+            protected_address: String,
+            change_address: String,
+        }
+
+        let req: PlanExtractRareSatsRequest = serde_wasm_bindgen::from_value(request)
+            .map_err(|error| JsValue::from_str(&format!("Invalid extraction request: {error}")))?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .plan_extract_rare_sats_base64(
+                    &req.outpoint,
+                    req.fee_rate_sat_vb,
+                    req.target_postage,
+                    &req.protected_address,
+                    &req.change_address,
+                )
+                .map_err(|error| JsValue::from_str(&error.to_string())),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planExtractRareSats): {error}"
             ))),
         }
     }
