@@ -56,12 +56,26 @@ struct OutputResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Exact non-common sat position within one wallet output.
+pub struct RareSatLocation {
+    /// Absolute ordinal sat number.
+    pub number: u64,
+    /// Zero-based sat offset inside the output.
+    pub offset: u64,
+    /// Ordinal rarity (`uncommon` through `mythic`).
+    pub rarity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// Non-common sat summary for one wallet output.
 pub struct RareSatSummary {
     /// Number of non-common sats in the output.
     pub count: u64,
     /// Highest Ordinal rarity present (`uncommon` through `mythic`).
     pub highest_rarity: String,
+    /// Exact positions used by sat-aware builders and Ordinal Shield.
+    pub sats: Vec<RareSatLocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,6 +235,8 @@ fn first_multiple_at_or_after(value: u64, period: u64) -> Option<u64> {
 fn classify_rare_sats(ranges: &[(u64, u64)]) -> Option<RareSatSummary> {
     let mut count = 0u64;
     let mut highest = Rarity::Common;
+    let mut sats = Vec::new();
+    let mut range_base_offset = 0u64;
 
     for &(range_start, range_end) in ranges {
         for epoch_number in 0..33u32 {
@@ -260,12 +276,25 @@ fn classify_rare_sats(ranges: &[(u64, u64)]) -> Option<RareSatSummary> {
             if candidate_rarity > highest {
                 highest = candidate_rarity;
             }
+
+            for index in first_index..=last_index {
+                let number = epoch_start.checked_add(index.checked_mul(subsidy)?)?;
+                let offset = range_base_offset.checked_add(number.checked_sub(range_start)?)?;
+                let rarity = Sat(number).rarity();
+                sats.push(RareSatLocation {
+                    number,
+                    offset,
+                    rarity: rarity.to_string(),
+                });
+            }
         }
+        range_base_offset = range_base_offset.checked_add(range_end.checked_sub(range_start)?)?;
     }
 
     (count > 0).then(|| RareSatSummary {
         count,
         highest_rarity: highest.to_string(),
+        sats,
     })
 }
 
@@ -323,9 +352,13 @@ fn validate_sat_ranges(
         });
     }
 
-    Ok(classify_rare_sats(&sorted).unwrap_or(RareSatSummary {
+    // `sat_ranges` are ordered by their position in the output's sat stream.
+    // The sorted copy above is only for overlap validation; classification
+    // must retain the source order so every reported offset stays exact.
+    Ok(classify_rare_sats(ranges).unwrap_or(RareSatSummary {
         count: 0,
         highest_rarity: Rarity::Common.to_string(),
+        sats: Vec::new(),
     }))
 }
 

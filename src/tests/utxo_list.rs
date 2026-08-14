@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
     use crate::builder::{AddressScheme, CreatePsbtRequest, Seed64, WalletBuilder};
-    use crate::ordinals::client::RareSatSummary;
+    use crate::ordinals::client::{RareSatLocation, RareSatSummary};
     use crate::ordinals::types::{Inscription, Satpoint};
+    use base64::Engine as _;
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::{Amount, Network, OutPoint, ScriptBuf, Transaction, TxOut};
     use bdk_wallet::chain::ConfirmationBlockTime;
@@ -76,11 +77,18 @@ mod tests {
 
         let mut last_active = std::collections::BTreeMap::new();
         last_active.insert(KeychainKind::External, 1);
+        let mut checkpoint = builder.vault_wallet.latest_checkpoint();
+        for height in 100..=103 {
+            checkpoint = checkpoint.insert(bdk_wallet::chain::BlockId {
+                height,
+                hash: dummy_block_hash,
+            });
+        }
         builder
             .vault_wallet
             .apply_update(bdk_wallet::Update {
                 tx_update: graph.into(),
-                chain: Default::default(),
+                chain: Some(checkpoint),
                 last_active_indices: last_active,
             })
             .unwrap();
@@ -99,6 +107,11 @@ mod tests {
             RareSatSummary {
                 count: 1,
                 highest_rarity: "uncommon".to_string(),
+                sats: vec![RareSatLocation {
+                    number: 5_000_000_000,
+                    offset: 100,
+                    rarity: "uncommon".to_string(),
+                }],
             },
         );
         builder.inscriptions.push(Inscription {
@@ -173,6 +186,79 @@ mod tests {
                 .all(|input| input.previous_output != op_rare),
             "normal BTC sends must never select a rare-sat outpoint"
         );
+
+        // The dedicated extraction path may spend it, keeps a co-located
+        // inscription bound to the same sat, and pays fees from clean BTC.
+        builder.ordinals_metadata_complete = true;
+        builder.inscriptions.push(Inscription {
+            id: "rare-inscription".to_string(),
+            number: 2,
+            satpoint: Satpoint {
+                outpoint: op_rare,
+                offset: 100,
+            },
+            content_type: Some("image/png".to_string()),
+            value: Some(5_000),
+            content_length: None,
+            timestamp: None,
+        });
+        let extraction = builder
+            .plan_extract_rare_sats_tx(
+                &op_rare,
+                bitcoin::FeeRate::from_sat_per_vb(1).unwrap(),
+                0, // boundary clamps to safe minimum postage
+                &addr,
+                &addr,
+            )
+            .expect("rare-sat extraction should build");
+        assert_eq!(extraction.unsigned_tx.input[0].previous_output, op_rare);
+        assert!(
+            extraction.unsigned_tx.input.len() >= 2,
+            "clean BTC must fund fees"
+        );
+
+        let analysis: serde_json::Value = serde_json::from_str(
+            &builder
+                .analyze_psbt(
+                    &base64::engine::general_purpose::STANDARD.encode(extraction.serialize()),
+                )
+                .expect("Shield analysis"),
+        )
+        .unwrap();
+        assert_eq!(analysis["rare_sats_burned"], serde_json::json!([]));
+        assert_eq!(analysis["outputs"][0]["rare_sats"][0]["offset"], 100);
+        assert_eq!(
+            analysis["outputs"][0]["rare_sats"][0]["inscriptions"],
+            serde_json::json!(["rare-inscription"])
+        );
+        assert_eq!(
+            analysis["inscription_destinations"]["rare-inscription"]["vout"],
+            0
+        );
+
+        let extraction_base64 =
+            base64::engine::general_purpose::STANDARD.encode(extraction.serialize());
+        builder
+            .sign_psbt(&extraction_base64, None)
+            .expect("inscription-bound rare sat should sign when both remain protected");
+
+        // Defense in depth: even if an imported/reviewed PSBT is mutated so
+        // the same rare sat falls exactly into the fee tail, signing refuses.
+        builder
+            .inscriptions
+            .retain(|inscription| inscription.id != "rare-inscription");
+        let mut burns_rare_sat = extraction;
+        burns_rare_sat.unsigned_tx.output = vec![TxOut {
+            value: Amount::from_sat(100),
+            script_pubkey: script,
+        }];
+        let error = builder
+            .sign_psbt(
+                &base64::engine::general_purpose::STANDARD.encode(burns_rare_sat.serialize()),
+                None,
+            )
+            .expect_err("a rare sat in the fee tail must never sign");
+        assert!(error.contains("rare sat"), "unexpected refusal: {error}");
     }
 
     // Regression for the ordinal-safety bug: the ordinals-protection scan must cover USED addresses

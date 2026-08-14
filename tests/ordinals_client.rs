@@ -414,8 +414,8 @@ mod tests {
                 "indexed": true,
                 "transaction": "{txid}",
                 "outpoint": "{outpoint}",
-                "value": 5000000000,
-                "sat_ranges": [[5000000000, 10000000000]],
+                "value": 2,
+                "sat_ranges": [[1, 2], [5000000000, 5000000001]],
                 "inscriptions": [],
                 "runes": {{}}
             }}]"#
@@ -425,7 +425,7 @@ mod tests {
 
         let client = OrdClient::new(server.url());
         let resolved = client
-            .resolve_assets_for_utxos(&[(outpoint.clone(), 5_000_000_000)])
+            .resolve_assets_for_utxos(&[(outpoint.clone(), 2)])
             .await
             .expect("sat-indexed response should verify");
         outputs.assert_async().await;
@@ -438,6 +438,9 @@ mod tests {
             .expect("rare sat summary");
         assert_eq!(summary.count, 1);
         assert_eq!(summary.highest_rarity, "uncommon");
+        assert_eq!(summary.sats.len(), 1);
+        assert_eq!(summary.sats[0].number, 5_000_000_000);
+        assert_eq!(summary.sats[0].offset, 1);
     }
 
     #[tokio::test]

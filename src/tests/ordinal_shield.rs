@@ -559,6 +559,7 @@ fn unverified_asset_data_downgrades_a_clean_verdict() {
     let psbt = create_dummy_psbt(&[(10_000, None)], &[9_000]);
     let known_inscriptions = HashMap::new();
     let known_runes = crate::ordinals::shield::KnownRunes::new();
+    let known_rare_sats = crate::ordinals::shield::KnownRareSats::new();
     let mint_terms = HashMap::new();
 
     let verified = analyze_psbt_with_context(
@@ -566,6 +567,7 @@ fn unverified_asset_data_downgrades_a_clean_verdict() {
         &ShieldContext {
             known_inscriptions: &known_inscriptions,
             known_runes: &known_runes,
+            known_rare_sats: &known_rare_sats,
             input_scope: None,
             network: bitcoin::Network::Regtest,
             mint_terms: &mint_terms,
@@ -581,6 +583,7 @@ fn unverified_asset_data_downgrades_a_clean_verdict() {
         &ShieldContext {
             known_inscriptions: &known_inscriptions,
             known_runes: &known_runes,
+            known_rare_sats: &known_rare_sats,
             input_scope: None,
             network: bitcoin::Network::Regtest,
             mint_terms: &mint_terms,
