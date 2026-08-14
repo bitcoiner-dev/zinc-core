@@ -397,6 +397,7 @@ pub enum CoinControlAction {
     Consolidate,
     Salvage,
     Split,
+    ExtractRareSats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -4659,10 +4660,23 @@ impl ZincWallet {
                 })
             }
             ConstructedTransactionIntentRequest::CoinControl(details) => {
+                let selected_outpoints = if details.action == CoinControlAction::ExtractRareSats {
+                    if details.selected_outpoints.len() != 1
+                        || transaction.input_outpoints.first() != details.selected_outpoints.first()
+                    {
+                        return Err(
+                            "Rare-sat extraction intent must select its protected source as the first input"
+                                .to_string(),
+                        );
+                    }
+                    transaction.input_outpoints.clone()
+                } else {
+                    details.selected_outpoints
+                };
                 ConstructedTransactionIntent::CoinControl(CoinControlIntentDetails {
                     transaction,
                     action: details.action,
-                    selected_outpoints: details.selected_outpoints,
+                    selected_outpoints,
                 })
             }
             ConstructedTransactionIntentRequest::SmartSendWithSalvage(details) => {
@@ -4858,6 +4872,37 @@ impl ZincWallet {
                                 );
                             }
                         }
+                    }
+                    CoinControlAction::ExtractRareSats => {
+                        let source = psbt
+                            .unsigned_tx
+                            .input
+                            .first()
+                            .map(|input| input.previous_output)
+                            .ok_or_else(|| {
+                                "Rare-sat extraction transaction has no source input".to_string()
+                            })?;
+                        if !self.rare_sat_outpoints.contains_key(&source) {
+                            return Err(
+                                "Rare-sat extraction source is not classified as rare".to_string()
+                            );
+                        }
+                        if has_runes {
+                            return Err(
+                                "Rare-sat extraction intent cannot spend Rune inputs".to_string()
+                            );
+                        }
+                        if psbt.unsigned_tx.input.iter().skip(1).any(|input| {
+                            self.inscribed_utxos.contains(&input.previous_output)
+                                || self.outpoint_runes.contains_key(&input.previous_output)
+                                || self.rare_sat_outpoints.contains_key(&input.previous_output)
+                        }) {
+                            return Err(
+                                "Rare-sat extraction fee inputs must be verified clean BTC"
+                                    .to_string(),
+                            );
+                        }
+                        self.audit_rare_sat_flow(psbt)?;
                     }
                 }
                 self.require_wallet_owned_outputs(psbt, "Coin-control transaction")?;

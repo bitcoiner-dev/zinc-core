@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::builder::{AddressScheme, CreatePsbtRequest, Seed64, WalletBuilder};
+    use crate::builder::{
+        AddressScheme, CoinControlAction, CoinControlIntentRequest, ConstructedTransactionIntent,
+        ConstructedTransactionIntentRequest, CreatePsbtRequest, Seed64, WalletBuilder,
+    };
     use crate::ordinals::client::{RareSatLocation, RareSatSummary};
     use crate::ordinals::types::{Inscription, Satpoint};
     use base64::Engine as _;
@@ -252,8 +255,25 @@ mod tests {
 
         let extraction_base64 =
             base64::engine::general_purpose::STANDARD.encode(extraction.serialize());
+        let extraction_intent = builder
+            .create_constructed_transaction_intent(
+                &extraction,
+                ConstructedTransactionIntentRequest::CoinControl(CoinControlIntentRequest {
+                    action: CoinControlAction::ExtractRareSats,
+                    selected_outpoints: vec![op_rare.to_string()],
+                }),
+            )
+            .expect("rare-sat extraction should mint a typed first-party intent");
+        let ConstructedTransactionIntent::CoinControl(details) = &extraction_intent else {
+            panic!("rare-sat extraction should use the coin-control intent family");
+        };
+        assert_eq!(details.action, CoinControlAction::ExtractRareSats);
+        assert_eq!(
+            details.selected_outpoints.len(),
+            extraction.unsigned_tx.input.len()
+        );
         builder
-            .sign_psbt(&extraction_base64, None)
+            .sign_constructed_transaction_psbt(&extraction_base64, &extraction_intent, None)
             .expect("inscription-bound rare sat should sign when both remain protected");
 
         // Defense in depth: even if an imported/reviewed PSBT is mutated so
