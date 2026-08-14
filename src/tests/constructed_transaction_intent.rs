@@ -153,6 +153,7 @@ mod tests {
         let requests = vec![
             ConstructedTransactionIntentRequest::Cpfp(CpfpIntentRequest {
                 requested_txid: outpoint.txid.to_string(),
+                parent_txid: outpoint.txid.to_string(),
                 anchor_outpoint: outpoint.to_string(),
             }),
             ConstructedTransactionIntentRequest::Cancel(CancelIntentRequest {
@@ -276,6 +277,7 @@ mod tests {
                 &decode(&psbt_base64),
                 ConstructedTransactionIntentRequest::Cpfp(CpfpIntentRequest {
                     requested_txid: outpoint.txid.to_string(),
+                    parent_txid: outpoint.txid.to_string(),
                     anchor_outpoint: outpoint.to_string(),
                 }),
             )
@@ -335,6 +337,7 @@ mod tests {
                 &psbt,
                 ConstructedTransactionIntentRequest::Cpfp(CpfpIntentRequest {
                     requested_txid: outpoint.txid.to_string(),
+                    parent_txid: outpoint.txid.to_string(),
                     anchor_outpoint: outpoint.to_string(),
                 }),
             )
@@ -342,6 +345,16 @@ mod tests {
         let ConstructedTransactionIntent::Cpfp(mut details) = cpfp else {
             unreachable!();
         };
+        let mut wrong_parent = details.clone();
+        wrong_parent.parent_txid = Txid::from_byte_array([46; 32]).to_string();
+        assert!(wallet
+            .validate_constructed_transaction_psbt(
+                &psbt,
+                &ConstructedTransactionIntent::Cpfp(wrong_parent)
+            )
+            .unwrap_err()
+            .contains("approved parent"));
+
         details.anchor_outpoint = OutPoint::new(outpoint.txid, 9).to_string();
         assert!(wallet
             .validate_constructed_transaction_psbt(
