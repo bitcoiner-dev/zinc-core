@@ -571,6 +571,9 @@ pub struct ZincWallet {
     // Ordinal Shield State (In-Memory Only)
     /// Outpoints currently marked as inscribed/protected.
     pub(crate) inscribed_utxos: std::collections::HashSet<bitcoin::OutPoint>,
+    /// Verified non-common sat summaries keyed by protected outpoint.
+    pub(crate) rare_sat_outpoints:
+        std::collections::HashMap<bitcoin::OutPoint, crate::ordinals::client::RareSatSummary>,
     /// Cached inscription metadata known to the wallet.
     pub(crate) inscriptions: Vec<crate::ordinals::types::Inscription>,
     /// Cached read-only rune balances known to the wallet.
@@ -670,6 +673,18 @@ pub struct UtxoItem {
     pub is_inscribed: bool,
     /// True if at least one known inscription sits in this UTXO.
     pub has_inscription: bool,
+    /// True if the last verified ord sync found a non-common sat in this UTXO.
+    #[serde(default)]
+    pub has_rare_sats: bool,
+    /// Number of non-common sats protected in this UTXO.
+    #[serde(default)]
+    pub rare_sat_count: u64,
+    /// Highest Ordinal rarity present, when `hasRareSats` is true.
+    #[serde(default)]
+    pub highest_rarity: Option<String>,
+    /// Exact non-common sat positions within this output.
+    #[serde(default)]
+    pub rare_sats: Vec<crate::ordinals::client::RareSatLocation>,
     /// Ids of inscriptions located in this UTXO.
     pub inscription_ids: Vec<String>,
     /// Byte offsets of those inscriptions within the UTXO.
@@ -1759,6 +1774,15 @@ impl ZincWallet {
     /// Callers must restrict the ord query to outpoints confirmed at heights ord has indexed:
     /// ord 404s the whole bulk request when ANY requested outpoint is unknown to it.
     pub fn collect_utxo_outpoints(&self) -> Vec<(String, Option<u32>)> {
+        self.collect_utxo_snapshots()
+            .into_iter()
+            .map(|(outpoint, confirmation_height, _)| (outpoint, confirmation_height))
+            .collect()
+    }
+
+    /// Wallet-owned UTXO outpoints paired with confirmation height and the
+    /// trusted BDK value used to validate ord sat-range responses.
+    pub fn collect_utxo_snapshots(&self) -> Vec<(String, Option<u32>, u64)> {
         let mut outpoints = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -1774,7 +1798,7 @@ impl ZincWallet {
                         }
                         bdk_chain::ChainPosition::Unconfirmed { .. } => None,
                     };
-                    outpoints.push((op, confirmation_height));
+                    outpoints.push((op, confirmation_height, u.txout.value.to_sat()));
                 }
             }
         };
@@ -1795,6 +1819,25 @@ impl ZincWallet {
         protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
         rune_balances: Vec<crate::ordinals::types::RuneBalance>,
     ) -> usize {
+        self.apply_verified_ordinals_update_with_rare_sats(
+            inscriptions,
+            protected_outpoints,
+            rune_balances,
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// Atomically apply verified inscriptions, runes, and rare-sat protection.
+    pub fn apply_verified_ordinals_update_with_rare_sats(
+        &mut self,
+        inscriptions: Vec<crate::ordinals::types::Inscription>,
+        protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+        rune_balances: Vec<crate::ordinals::types::RuneBalance>,
+        rare_sat_outpoints: std::collections::HashMap<
+            bitcoin::OutPoint,
+            crate::ordinals::client::RareSatSummary,
+        >,
+    ) -> usize {
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
             "applying ordinals update: {} inscriptions received",
@@ -1809,6 +1852,7 @@ impl ZincWallet {
         }
 
         self.inscribed_utxos = protected_outpoints;
+        self.rare_sat_outpoints = rare_sat_outpoints;
         self.inscriptions = inscriptions;
         self.rune_balances = rune_balances;
         self.ordinals_verified = true;
@@ -1864,6 +1908,7 @@ impl ZincWallet {
         );
 
         self.inscribed_utxos.clear();
+        self.rare_sat_outpoints.clear();
         self.inscriptions = inscriptions;
         self.rune_balances.clear();
         self.outpoint_runes.clear();
@@ -2443,6 +2488,13 @@ impl ZincWallet {
                 }
             }
             let has_inscription = !inscription_ids.is_empty();
+            let rare_sat_summary = self.rare_sat_outpoints.get(&u.outpoint);
+            let has_rare_sats = rare_sat_summary.is_some();
+            let rare_sat_count = rare_sat_summary.map_or(0, |summary| summary.count);
+            let highest_rarity = rare_sat_summary.map(|summary| summary.highest_rarity.clone());
+            let rare_sats = rare_sat_summary
+                .map(|summary| summary.sats.clone())
+                .unwrap_or_default();
             let value_sats = u.txout.value.to_sat();
 
             // Conservative estimate: only inscription-bearing UTXOs expose salvageable cardinal sats,
@@ -2480,6 +2532,10 @@ impl ZincWallet {
                 confirmations,
                 is_inscribed,
                 has_inscription,
+                has_rare_sats,
+                rare_sat_count,
+                highest_rarity,
+                rare_sats,
                 inscription_ids,
                 inscription_offsets,
                 cardinal_salvageable_sats,
@@ -2540,6 +2596,11 @@ impl ZincWallet {
         }
         let mut metas: Vec<SalvageInput> = Vec::new();
         for op in outpoints {
+            if self.rare_sat_outpoints.contains_key(op) {
+                return Err(ZincError::WalletError(
+                    "Rare sats are protected and cannot be used by salvage".to_string(),
+                ));
+            }
             let txo = self
                 .resolve_owned_txout(op)
                 .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
@@ -2877,6 +2938,11 @@ impl ZincWallet {
         let mut inscribed: Vec<SendInput> = Vec::new();
         let mut clean: Vec<SendInput> = Vec::new();
         for op in input_outpoints {
+            if self.rare_sat_outpoints.contains_key(op) {
+                return Err(ZincError::WalletError(
+                    "Rare sats are protected and cannot be used by send-with-salvage".to_string(),
+                ));
+            }
             let txo = self
                 .resolve_owned_txout(op)
                 .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
@@ -3132,6 +3198,253 @@ impl ZincWallet {
         Ok(Self::encode_psbt_base64(&psbt))
     }
 
+    /// Build an unsigned sat-aware extraction PSBT for exactly one rare-sat UTXO.
+    ///
+    /// The selected output is the first input. Its complete sat stream is emitted
+    /// before any fee-funding change, partitioned into cardinal prefix, one
+    /// protected asset output, and cardinal suffix. The protected interval spans
+    /// every rare sat and inscription in the source output, so an inscription
+    /// bound to a rare sat moves with it instead of being rejected or detached.
+    /// Clean wallet UTXOs appended after the protected input pay the fee.
+    pub fn plan_extract_rare_sats_tx(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+        fee_rate: FeeRate,
+        target_postage: u64,
+        protected_address: &Address,
+        change_address: &Address,
+    ) -> Result<Psbt, ZincError> {
+        use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        if !self.ordinals_verified || !self.ordinals_metadata_complete {
+            return Err(ZincError::WalletError(
+                "Ordinals verification failed - safety lock engaged. Please retry sync."
+                    .to_string(),
+            ));
+        }
+        if protected_address.address_type() != Some(bitcoin::AddressType::P2tr) {
+            return Err(ZincError::ConfigError(
+                "Rare sats must be extracted to a Taproot address".to_string(),
+            ));
+        }
+        let selected = self.resolve_owned_txout(outpoint).ok_or_else(|| {
+            ZincError::WalletError(format!("UTXO not found in wallet: {outpoint}"))
+        })?;
+        let rare = self.rare_sat_outpoints.get(outpoint).ok_or_else(|| {
+            ZincError::WalletError(
+                "Selected output does not contain verified rare sats".to_string(),
+            )
+        })?;
+        if rare.sats.is_empty() || rare.sats.len() as u64 != rare.count {
+            return Err(ZincError::WalletError(
+                "Rare-sat positions are incomplete; retry Ordinals sync".to_string(),
+            ));
+        }
+        if self
+            .outpoint_runes
+            .get(outpoint)
+            .is_some_and(|runes| !runes.is_empty())
+        {
+            return Err(ZincError::WalletError(
+                "This output also contains Runes; move the Runes before extracting rare sats"
+                    .to_string(),
+            ));
+        }
+
+        let value = selected.value.to_sat();
+        let mut protected_offsets = rare.sats.iter().map(|sat| sat.offset).collect::<Vec<_>>();
+        protected_offsets.extend(
+            self.inscriptions
+                .iter()
+                .filter(|inscription| inscription.satpoint.outpoint == *outpoint)
+                .map(|inscription| inscription.satpoint.offset),
+        );
+        protected_offsets.sort_unstable();
+        let first = *protected_offsets
+            .first()
+            .ok_or_else(|| ZincError::WalletError("No protected sats found".to_string()))?;
+        let last = *protected_offsets.last().unwrap_or(&first);
+        if last >= value {
+            return Err(ZincError::WalletError(
+                "Protected sat offset exceeds the selected output".to_string(),
+            ));
+        }
+
+        let protected_postage = target_postage.max(546);
+        let dust = protected_postage;
+        let zone_start = if first >= dust { first } else { 0 };
+        let requested_end = last
+            .checked_add(protected_postage)
+            .ok_or_else(|| ZincError::WalletError("Protected postage overflow".to_string()))?;
+        let mut zone_end = requested_end.min(value);
+        if value.saturating_sub(zone_end) < dust {
+            zone_end = value;
+        }
+        let protected_value = zone_end.saturating_sub(zone_start);
+        if protected_value < dust {
+            return Err(ZincError::WalletError(
+                "Selected output is too small to create a protected rare-sat output".to_string(),
+            ));
+        }
+
+        let protected_spk = protected_address.script_pubkey();
+        let change_spk = change_address.script_pubkey();
+        let mut selected_outputs = Vec::new();
+        if zone_start > 0 {
+            selected_outputs.push(TxOut {
+                value: Amount::from_sat(zone_start),
+                script_pubkey: change_spk.clone(),
+            });
+        }
+        selected_outputs.push(TxOut {
+            value: Amount::from_sat(protected_value),
+            script_pubkey: protected_spk,
+        });
+        if zone_end < value {
+            selected_outputs.push(TxOut {
+                value: Amount::from_sat(value - zone_end),
+                script_pubkey: change_spk.clone(),
+            });
+        }
+
+        let mut fee_candidates = Vec::<(bitcoin::OutPoint, TxOut)>::new();
+        let mut collect = |wallet: &Wallet| {
+            for candidate in wallet.list_unspent() {
+                if candidate.outpoint == *outpoint
+                    || self.inscribed_utxos.contains(&candidate.outpoint)
+                    || !matches!(
+                        candidate.chain_position,
+                        bdk_chain::ChainPosition::Confirmed { .. }
+                    )
+                {
+                    continue;
+                }
+                fee_candidates.push((candidate.outpoint, candidate.txout));
+            }
+        };
+        collect(&self.vault_wallet);
+        if let Some(wallet) = &self.payment_wallet {
+            collect(wallet);
+        }
+        fee_candidates.sort_by(|left, right| {
+            left.1
+                .value
+                .cmp(&right.1.value)
+                .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
+        });
+
+        let make_input = |op: bitcoin::OutPoint, txo: &TxOut, dummy: bool| {
+            let mut input = TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            };
+            if dummy {
+                if txo.script_pubkey.is_p2tr() {
+                    input.witness.push(vec![0u8; 64]);
+                } else {
+                    input.witness.push(vec![0u8; 72]);
+                    input.witness.push(vec![0u8; 33]);
+                }
+            }
+            input
+        };
+
+        let mut funding = Vec::<(bitcoin::OutPoint, TxOut)>::new();
+        let (fee, funding_total) = loop {
+            let funding_total = funding
+                .iter()
+                .map(|(_, txo)| txo.value.to_sat())
+                .sum::<u64>();
+            let mut dummy_outputs = selected_outputs.clone();
+            dummy_outputs.push(TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: change_spk.clone(),
+            });
+            let mut dummy_inputs = vec![make_input(*outpoint, &selected, true)];
+            dummy_inputs.extend(funding.iter().map(|(op, txo)| make_input(*op, txo, true)));
+            let dummy = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: dummy_inputs,
+                output: dummy_outputs,
+            };
+            let fee = fee_for_vsize(fee_rate, dummy.vsize() as u64);
+            if funding_total >= fee {
+                break (fee, funding_total);
+            }
+            let next = fee_candidates.get(funding.len()).cloned().ok_or_else(|| {
+                ZincError::WalletError(
+                    "A clean confirmed BTC output is required to pay the extraction fee"
+                        .to_string(),
+                )
+            })?;
+            funding.push(next);
+        };
+
+        let mut outputs = selected_outputs;
+        let funding_change = funding_total.saturating_sub(fee);
+        if funding_change >= dust {
+            outputs.push(TxOut {
+                value: Amount::from_sat(funding_change),
+                script_pubkey: change_spk,
+            });
+        }
+
+        let mut inputs = vec![make_input(*outpoint, &selected, false)];
+        inputs.extend(funding.iter().map(|(op, txo)| make_input(*op, txo, false)));
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs,
+            output: outputs,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|error| {
+            ZincError::WalletError(format!("Failed to build rare-sat extraction PSBT: {error}"))
+        })?;
+        psbt.inputs[0].witness_utxo = Some(selected);
+        for (index, (_, txo)) in funding.into_iter().enumerate() {
+            psbt.inputs[index + 1].witness_utxo = Some(txo);
+        }
+        Ok(psbt)
+    }
+
+    /// Parse an extraction request and return a base64 unsigned PSBT.
+    pub fn plan_extract_rare_sats_base64(
+        &self,
+        outpoint: &str,
+        fee_rate_sat_vb: f64,
+        target_postage: u64,
+        protected_address: &str,
+        change_address: &str,
+    ) -> Result<String, ZincError> {
+        let network = self.vault_wallet.network();
+        let fee_rate = fee_rate_from_sat_per_vb_f64(fee_rate_sat_vb)?;
+        let parse_address = |value: &str, label: &str| -> Result<Address, ZincError> {
+            Address::from_str(value)
+                .map_err(|error| {
+                    ZincError::ConfigError(format!("Invalid {label} address: {error}"))
+                })?
+                .require_network(network)
+                .map_err(|error| {
+                    ZincError::ConfigError(format!("{label} address network mismatch: {error}"))
+                })
+        };
+        let outpoint = bitcoin::OutPoint::from_str(outpoint)
+            .map_err(|error| ZincError::ConfigError(format!("Invalid outpoint: {error}")))?;
+        let protected_address = parse_address(protected_address, "protected")?;
+        let change_address = parse_address(change_address, "change")?;
+        let psbt = self.plan_extract_rare_sats_tx(
+            &outpoint,
+            fee_rate,
+            target_postage,
+            &protected_address,
+            &change_address,
+        )?;
+        Ok(Self::encode_psbt_base64(&psbt))
+    }
+
     /// Construct an ord-compatible Rune transfer and prove its allocation
     /// before returning it. Input and output selection mirrors ord's wallet:
     /// Rune UTXOs are accumulated in outpoint order, inscription-bearing
@@ -3190,6 +3503,7 @@ impl ZincWallet {
         let canonical_id = rune_id.to_string();
         let mut rune_inputs: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
         let mut input_rune_balances: BTreeMap<RuneId, u128> = BTreeMap::new();
+        let mut rare_sat_rune_value_blocked = false;
 
         let mut rune_candidates: Vec<_> = self.outpoint_runes.iter().collect();
         rune_candidates.sort_by_key(|(outpoint, _)| **outpoint);
@@ -3200,6 +3514,10 @@ impl ZincWallet {
                 .try_fold(0_u128, |total, (_, value)| total.checked_add(*value))
                 .ok_or_else(|| ZincError::WalletError("Rune balance overflow".to_string()))?;
             if target_on_output == 0 {
+                continue;
+            }
+            if self.rare_sat_outpoints.contains_key(outpoint) {
+                rare_sat_rune_value_blocked = true;
                 continue;
             }
             if inscription_outpoints.contains(outpoint) {
@@ -3237,6 +3555,11 @@ impl ZincWallet {
             .copied()
             .unwrap_or_default();
         if selected_target < amount {
+            if rare_sat_rune_value_blocked {
+                return Err(ZincError::WalletError(
+                    "Rare sats are protected and cannot be used by Rune transfer".to_string(),
+                ));
+            }
             return Err(ZincError::WalletError(format!(
                 "Insufficient Rune balance for {canonical_id}: have {selected_target}, need {amount}"
             )));
@@ -3779,6 +4102,51 @@ impl ZincWallet {
         Ok(())
     }
 
+    /// Defense-in-depth for every signing boundary: a known rare sat may move
+    /// only into a real output, never into the miner-fee tail.
+    fn audit_rare_sat_flow(&self, psbt: &Psbt) -> Result<(), String> {
+        let total_output = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .try_fold(0u64, |total, output| {
+                total.checked_add(output.value.to_sat())
+            })
+            .ok_or_else(|| "Security Violation: output values overflow".to_string())?;
+        let mut input_base = 0u64;
+        for (index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+            let value = Self::declared_prevout(psbt, index)
+                .ok_or_else(|| {
+                    format!("Security Violation: Input #{index} has no verifiable value")
+                })?
+                .value
+                .to_sat();
+            if let Some(summary) = self.rare_sat_outpoints.get(&txin.previous_output) {
+                for sat in &summary.sats {
+                    if sat.offset >= value {
+                        return Err(
+                            "Security Violation: cached rare-sat offset exceeds its input"
+                                .to_string(),
+                        );
+                    }
+                    let absolute = input_base.checked_add(sat.offset).ok_or_else(|| {
+                        "Security Violation: rare-sat offset overflow".to_string()
+                    })?;
+                    if absolute >= total_output {
+                        return Err(
+                            "Security Violation: transaction would pay a protected rare sat to miner fees"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            input_base = input_base
+                .checked_add(value)
+                .ok_or_else(|| "Security Violation: input values overflow".to_string())?;
+        }
+        Ok(())
+    }
+
     /// Refuse to sign a non-taproot input whose declared amount cannot be
     /// proven from the full previous transaction.
     ///
@@ -3976,6 +4344,7 @@ impl ZincWallet {
         ) {
             return Err(format!("Security Violation: {e}"));
         }
+        self.audit_rare_sat_flow(&psbt)?;
 
         // Keep a copy if we need to revert signatures for specific inputs
         let original_psbt = if inputs_to_sign.is_some() {
@@ -4199,6 +4568,7 @@ impl ZincWallet {
         ) {
             return Err(format!("Security Violation: {e}"));
         }
+        self.audit_rare_sat_flow(&psbt)?;
 
         let prepared_bytes = psbt.serialize();
         Ok(base64::engine::general_purpose::STANDARD.encode(&prepared_bytes))
@@ -4669,7 +5039,7 @@ impl ZincWallet {
     /// descriptor ownership) and return the analysis as JSON.
     pub fn analyze_psbt(&self, psbt_base64: &str) -> Result<String, String> {
         // Use explicit path to avoid re-export issues if any
-        use crate::ordinals::shield::{analyze_psbt_with_context, ShieldContext};
+        use crate::ordinals::shield::{analyze_psbt_with_context, KnownRareSats, ShieldContext};
         use base64::Engine;
         use std::collections::HashMap;
 
@@ -4748,6 +5118,12 @@ impl ZincWallet {
             items.sort_by_key(|(_, offset)| *offset);
         }
 
+        let known_rare_sats: KnownRareSats = self
+            .rare_sat_outpoints
+            .iter()
+            .map(|(outpoint, summary)| ((outpoint.txid, outpoint.vout), summary.sats.clone()))
+            .collect();
+
         // Rune context, entirely from the verified sync caches (no network).
         let mut known_runes: crate::ordinals::shield::KnownRunes = HashMap::new();
         for (outpoint, held) in &self.outpoint_runes {
@@ -4767,6 +5143,7 @@ impl ZincWallet {
         let ctx = ShieldContext {
             known_inscriptions: &known_inscriptions,
             known_runes: &known_runes,
+            known_rare_sats: &known_rare_sats,
             input_scope: None,
             network: self.vault_wallet.network(),
             mint_terms: &mint_terms,
@@ -5644,6 +6021,7 @@ impl WalletBuilder {
             mode: self.mode,
             scan_policy: self.scan_policy,
             inscribed_utxos: std::collections::HashSet::default(),
+            rare_sat_outpoints: std::collections::HashMap::new(),
             inscriptions: Vec::new(),
             rune_balances: Vec::new(),
             outpoint_runes: std::collections::HashMap::new(),
@@ -5786,6 +6164,7 @@ impl WalletBuilder {
             mode: ProfileMode::Watch,
             scan_policy: self.scan_policy,
             inscribed_utxos: std::collections::HashSet::default(),
+            rare_sat_outpoints: std::collections::HashMap::new(),
             inscriptions: Vec::new(),
             rune_balances: Vec::new(),
             outpoint_runes: std::collections::HashMap::new(),
