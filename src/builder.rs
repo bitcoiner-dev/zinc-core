@@ -529,6 +529,9 @@ pub struct ZincWallet {
     // Ordinal Shield State (In-Memory Only)
     /// Outpoints currently marked as inscribed/protected.
     pub(crate) inscribed_utxos: std::collections::HashSet<bitcoin::OutPoint>,
+    /// Verified non-common sat summaries keyed by protected outpoint.
+    pub(crate) rare_sat_outpoints:
+        std::collections::HashMap<bitcoin::OutPoint, crate::ordinals::client::RareSatSummary>,
     /// Cached inscription metadata known to the wallet.
     pub(crate) inscriptions: Vec<crate::ordinals::types::Inscription>,
     /// Cached read-only rune balances known to the wallet.
@@ -625,6 +628,15 @@ pub struct UtxoItem {
     pub is_inscribed: bool,
     /// True if at least one known inscription sits in this UTXO.
     pub has_inscription: bool,
+    /// True if the last verified ord sync found a non-common sat in this UTXO.
+    #[serde(default)]
+    pub has_rare_sats: bool,
+    /// Number of non-common sats protected in this UTXO.
+    #[serde(default)]
+    pub rare_sat_count: u64,
+    /// Highest Ordinal rarity present, when `hasRareSats` is true.
+    #[serde(default)]
+    pub highest_rarity: Option<String>,
     /// Ids of inscriptions located in this UTXO.
     pub inscription_ids: Vec<String>,
     /// Byte offsets of those inscriptions within the UTXO.
@@ -1610,6 +1622,15 @@ impl ZincWallet {
     /// Callers must restrict the ord query to outpoints confirmed at heights ord has indexed:
     /// ord 404s the whole bulk request when ANY requested outpoint is unknown to it.
     pub fn collect_utxo_outpoints(&self) -> Vec<(String, Option<u32>)> {
+        self.collect_utxo_snapshots()
+            .into_iter()
+            .map(|(outpoint, confirmation_height, _)| (outpoint, confirmation_height))
+            .collect()
+    }
+
+    /// Wallet-owned UTXO outpoints paired with confirmation height and the
+    /// trusted BDK value used to validate ord sat-range responses.
+    pub fn collect_utxo_snapshots(&self) -> Vec<(String, Option<u32>, u64)> {
         let mut outpoints = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -1625,7 +1646,7 @@ impl ZincWallet {
                         }
                         bdk_chain::ChainPosition::Unconfirmed { .. } => None,
                     };
-                    outpoints.push((op, confirmation_height));
+                    outpoints.push((op, confirmation_height, u.txout.value.to_sat()));
                 }
             }
         };
@@ -1646,6 +1667,25 @@ impl ZincWallet {
         protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
         rune_balances: Vec<crate::ordinals::types::RuneBalance>,
     ) -> usize {
+        self.apply_verified_ordinals_update_with_rare_sats(
+            inscriptions,
+            protected_outpoints,
+            rune_balances,
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// Atomically apply verified inscriptions, runes, and rare-sat protection.
+    pub fn apply_verified_ordinals_update_with_rare_sats(
+        &mut self,
+        inscriptions: Vec<crate::ordinals::types::Inscription>,
+        protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+        rune_balances: Vec<crate::ordinals::types::RuneBalance>,
+        rare_sat_outpoints: std::collections::HashMap<
+            bitcoin::OutPoint,
+            crate::ordinals::client::RareSatSummary,
+        >,
+    ) -> usize {
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
             "applying ordinals update: {} inscriptions received",
@@ -1660,6 +1700,7 @@ impl ZincWallet {
         }
 
         self.inscribed_utxos = protected_outpoints;
+        self.rare_sat_outpoints = rare_sat_outpoints;
         self.inscriptions = inscriptions;
         self.rune_balances = rune_balances;
         self.ordinals_verified = true;
@@ -1715,6 +1756,7 @@ impl ZincWallet {
         );
 
         self.inscribed_utxos.clear();
+        self.rare_sat_outpoints.clear();
         self.inscriptions = inscriptions;
         self.rune_balances.clear();
         self.outpoint_runes.clear();
@@ -2294,6 +2336,10 @@ impl ZincWallet {
                 }
             }
             let has_inscription = !inscription_ids.is_empty();
+            let rare_sat_summary = self.rare_sat_outpoints.get(&u.outpoint);
+            let has_rare_sats = rare_sat_summary.is_some();
+            let rare_sat_count = rare_sat_summary.map_or(0, |summary| summary.count);
+            let highest_rarity = rare_sat_summary.map(|summary| summary.highest_rarity.clone());
             let value_sats = u.txout.value.to_sat();
 
             // Conservative estimate: only inscription-bearing UTXOs expose salvageable cardinal sats,
@@ -2331,6 +2377,9 @@ impl ZincWallet {
                 confirmations,
                 is_inscribed,
                 has_inscription,
+                has_rare_sats,
+                rare_sat_count,
+                highest_rarity,
                 inscription_ids,
                 inscription_offsets,
                 cardinal_salvageable_sats,
@@ -2391,6 +2440,11 @@ impl ZincWallet {
         }
         let mut metas: Vec<SalvageInput> = Vec::new();
         for op in outpoints {
+            if self.rare_sat_outpoints.contains_key(op) {
+                return Err(ZincError::WalletError(
+                    "Rare sats are protected and cannot be used by salvage".to_string(),
+                ));
+            }
             let txo = self
                 .resolve_owned_txout(op)
                 .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
@@ -2728,6 +2782,11 @@ impl ZincWallet {
         let mut inscribed: Vec<SendInput> = Vec::new();
         let mut clean: Vec<SendInput> = Vec::new();
         for op in input_outpoints {
+            if self.rare_sat_outpoints.contains_key(op) {
+                return Err(ZincError::WalletError(
+                    "Rare sats are protected and cannot be used by send-with-salvage".to_string(),
+                ));
+            }
             let txo = self
                 .resolve_owned_txout(op)
                 .ok_or_else(|| ZincError::WalletError(format!("UTXO not found in wallet: {op}")))?;
@@ -3041,6 +3100,7 @@ impl ZincWallet {
         let canonical_id = rune_id.to_string();
         let mut rune_inputs: Vec<(bitcoin::OutPoint, TxOut)> = Vec::new();
         let mut input_rune_balances: BTreeMap<RuneId, u128> = BTreeMap::new();
+        let mut rare_sat_rune_value_blocked = false;
 
         let mut rune_candidates: Vec<_> = self.outpoint_runes.iter().collect();
         rune_candidates.sort_by_key(|(outpoint, _)| **outpoint);
@@ -3051,6 +3111,10 @@ impl ZincWallet {
                 .try_fold(0_u128, |total, (_, value)| total.checked_add(*value))
                 .ok_or_else(|| ZincError::WalletError("Rune balance overflow".to_string()))?;
             if target_on_output == 0 {
+                continue;
+            }
+            if self.rare_sat_outpoints.contains_key(outpoint) {
+                rare_sat_rune_value_blocked = true;
                 continue;
             }
             if inscription_outpoints.contains(outpoint) {
@@ -3088,6 +3152,11 @@ impl ZincWallet {
             .copied()
             .unwrap_or_default();
         if selected_target < amount {
+            if rare_sat_rune_value_blocked {
+                return Err(ZincError::WalletError(
+                    "Rare sats are protected and cannot be used by Rune transfer".to_string(),
+                ));
+            }
             return Err(ZincError::WalletError(format!(
                 "Insufficient Rune balance for {canonical_id}: have {selected_target}, need {amount}"
             )));
@@ -5465,6 +5534,7 @@ impl WalletBuilder {
             mode: self.mode,
             scan_policy: self.scan_policy,
             inscribed_utxos: std::collections::HashSet::default(),
+            rare_sat_outpoints: std::collections::HashMap::new(),
             inscriptions: Vec::new(),
             rune_balances: Vec::new(),
             outpoint_runes: std::collections::HashMap::new(),
@@ -5608,6 +5678,7 @@ impl WalletBuilder {
             mode: ProfileMode::Watch,
             scan_policy: self.scan_policy,
             inscribed_utxos: std::collections::HashSet::default(),
+            rare_sat_outpoints: std::collections::HashMap::new(),
             inscriptions: Vec::new(),
             rune_balances: Vec::new(),
             outpoint_runes: std::collections::HashMap::new(),
