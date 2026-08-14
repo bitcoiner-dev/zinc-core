@@ -372,6 +372,134 @@ pub struct BitcoinTransferResult {
     pub intent: BitcoinTransferIntent,
 }
 
+/// Exact Bitcoin transaction facts retained by every first-party constructed
+/// intent. The txid binds version, locktime, sequences, inputs, and outputs;
+/// the expanded fields support precise mismatch errors and review rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactTransactionTemplate {
+    pub unsigned_txid: String,
+    pub input_outpoints: Vec<String>,
+    pub outputs: Vec<ExactTransactionOutput>,
+    pub fee_sats: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactTransactionOutput {
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CoinControlAction {
+    Consolidate,
+    Salvage,
+    Split,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InscriptionTransferIntentDetails {
+    pub transaction: ExactTransactionTemplate,
+    pub inscription_ids: Vec<String>,
+    pub recipient: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CpfpIntentDetails {
+    pub transaction: ExactTransactionTemplate,
+    pub requested_txid: String,
+    pub anchor_outpoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelIntentDetails {
+    pub transaction: ExactTransactionTemplate,
+    pub original_txid: String,
+    pub conflict_outpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoinControlIntentDetails {
+    pub transaction: ExactTransactionTemplate,
+    pub action: CoinControlAction,
+    pub selected_outpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartSendWithSalvageIntentDetails {
+    pub transaction: ExactTransactionTemplate,
+    pub recipient: String,
+    pub amount_sats: u64,
+    pub selected_outpoints: Vec<String>,
+}
+
+/// Operation-specific authorization carried from a first-party builder to the
+/// final software or hardware signing boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "camelCase")]
+pub enum ConstructedTransactionIntent {
+    InscriptionTransfer(InscriptionTransferIntentDetails),
+    Cpfp(CpfpIntentDetails),
+    Cancel(CancelIntentDetails),
+    CoinControl(CoinControlIntentDetails),
+    SmartSendWithSalvage(SmartSendWithSalvageIntentDetails),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InscriptionTransferIntentRequest {
+    pub inscription_ids: Vec<String>,
+    pub recipient: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CpfpIntentRequest {
+    pub requested_txid: String,
+    pub anchor_outpoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelIntentRequest {
+    pub original_txid: String,
+    pub conflict_outpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoinControlIntentRequest {
+    pub action: CoinControlAction,
+    pub selected_outpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartSendWithSalvageIntentRequest {
+    pub recipient: String,
+    pub amount_sats: u64,
+    pub selected_outpoints: Vec<String>,
+}
+
+/// Transport request used to mint an intent only after the operation-specific
+/// facts have been checked against the constructed PSBT.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "camelCase")]
+pub enum ConstructedTransactionIntentRequest {
+    InscriptionTransfer(InscriptionTransferIntentRequest),
+    Cpfp(CpfpIntentRequest),
+    Cancel(CancelIntentRequest),
+    CoinControl(CoinControlIntentRequest),
+    SmartSendWithSalvage(SmartSendWithSalvageIntentRequest),
+}
+
 impl TryFrom<CreatePsbtTransportRequest> for CreatePsbtRequest {
     type Error = ZincError;
 
@@ -4065,6 +4193,409 @@ impl ZincWallet {
         Ok(())
     }
 
+    fn exact_transaction_template(psbt: &Psbt) -> Result<ExactTransactionTemplate, String> {
+        Ok(ExactTransactionTemplate {
+            unsigned_txid: psbt.unsigned_tx.compute_txid().to_string(),
+            input_outpoints: psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .map(|input| input.previous_output.to_string())
+                .collect(),
+            outputs: psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .map(|output| ExactTransactionOutput {
+                    value_sats: output.value.to_sat(),
+                    script_pubkey_hex: output.script_pubkey.to_hex_string(),
+                })
+                .collect(),
+            fee_sats: Self::exact_psbt_fee_sats(psbt)?,
+        })
+    }
+
+    fn validate_exact_transaction_template(
+        psbt: &Psbt,
+        expected: &ExactTransactionTemplate,
+    ) -> Result<(), String> {
+        let actual = Self::exact_transaction_template(psbt)?;
+        if actual.unsigned_txid != expected.unsigned_txid {
+            return Err(
+                "Constructed transaction bytes differ from the approved intent".to_string(),
+            );
+        }
+        if actual.input_outpoints != expected.input_outpoints {
+            return Err(
+                "Constructed transaction input ordering differs from the approved intent"
+                    .to_string(),
+            );
+        }
+        if actual.outputs != expected.outputs {
+            return Err(
+                "Constructed transaction outputs differ from the approved intent".to_string(),
+            );
+        }
+        if actual.fee_sats != expected.fee_sats {
+            return Err(format!(
+                "Constructed transaction fee mismatch: approved {} sats, transaction pays {} sats",
+                expected.fee_sats, actual.fee_sats
+            ));
+        }
+        Ok(())
+    }
+
+    fn owns_output_script(&self, script: &bitcoin::ScriptBuf) -> bool {
+        self.vault_wallet.is_mine(script.clone())
+            || self
+                .payment_wallet
+                .as_ref()
+                .is_some_and(|wallet| wallet.is_mine(script.clone()))
+    }
+
+    fn require_wallet_owned_outputs(&self, psbt: &Psbt, operation: &str) -> Result<(), String> {
+        for (index, output) in psbt.unsigned_tx.output.iter().enumerate() {
+            if !self.owns_output_script(&output.script_pubkey) {
+                return Err(format!(
+                    "{operation} contains a non-wallet output at index {index}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn input_outpoint_set(psbt: &Psbt) -> std::collections::HashSet<bitcoin::OutPoint> {
+        psbt.unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect()
+    }
+
+    fn inscription_ids_in_inputs(
+        &self,
+        psbt: &Psbt,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let inputs = Self::input_outpoint_set(psbt);
+        let ids: std::collections::BTreeSet<_> = self
+            .inscriptions
+            .iter()
+            .filter(|inscription| inputs.contains(&inscription.satpoint.outpoint))
+            .map(|inscription| inscription.id.clone())
+            .collect();
+        if inputs
+            .iter()
+            .any(|outpoint| self.inscribed_utxos.contains(outpoint))
+            && ids.is_empty()
+        {
+            return Err(
+                "Inscription metadata is incomplete for a protected transaction input".to_string(),
+            );
+        }
+        Ok(ids)
+    }
+
+    /// Mint an operation-specific intent after checking the first-party request
+    /// against the exact transaction returned by its builder.
+    pub fn create_constructed_transaction_intent(
+        &self,
+        psbt: &Psbt,
+        request: ConstructedTransactionIntentRequest,
+    ) -> Result<ConstructedTransactionIntent, String> {
+        let transaction = Self::exact_transaction_template(psbt)?;
+        let intent = match request {
+            ConstructedTransactionIntentRequest::InscriptionTransfer(details) => {
+                ConstructedTransactionIntent::InscriptionTransfer(
+                    InscriptionTransferIntentDetails {
+                        transaction,
+                        inscription_ids: details.inscription_ids,
+                        recipient: details.recipient,
+                    },
+                )
+            }
+            ConstructedTransactionIntentRequest::Cpfp(details) => {
+                ConstructedTransactionIntent::Cpfp(CpfpIntentDetails {
+                    transaction,
+                    requested_txid: details.requested_txid,
+                    anchor_outpoint: details.anchor_outpoint,
+                })
+            }
+            ConstructedTransactionIntentRequest::Cancel(details) => {
+                ConstructedTransactionIntent::Cancel(CancelIntentDetails {
+                    transaction,
+                    original_txid: details.original_txid,
+                    conflict_outpoints: details.conflict_outpoints,
+                })
+            }
+            ConstructedTransactionIntentRequest::CoinControl(details) => {
+                ConstructedTransactionIntent::CoinControl(CoinControlIntentDetails {
+                    transaction,
+                    action: details.action,
+                    selected_outpoints: details.selected_outpoints,
+                })
+            }
+            ConstructedTransactionIntentRequest::SmartSendWithSalvage(details) => {
+                ConstructedTransactionIntent::SmartSendWithSalvage(
+                    SmartSendWithSalvageIntentDetails {
+                        transaction,
+                        recipient: details.recipient,
+                        amount_sats: details.amount_sats,
+                        selected_outpoints: details.selected_outpoints,
+                    },
+                )
+            }
+        };
+        self.validate_constructed_transaction_psbt(psbt, &intent)?;
+        Ok(intent)
+    }
+
+    /// Revalidate an exact first-party construction at the final signing boundary.
+    pub fn validate_constructed_transaction_psbt(
+        &self,
+        psbt: &Psbt,
+        intent: &ConstructedTransactionIntent,
+    ) -> Result<(), String> {
+        if !self.asset_state_is_current() {
+            return Err(
+                "Asset classification is missing or stale for the current wallet state".to_string(),
+            );
+        }
+
+        let transaction = match intent {
+            ConstructedTransactionIntent::InscriptionTransfer(details) => &details.transaction,
+            ConstructedTransactionIntent::Cpfp(details) => &details.transaction,
+            ConstructedTransactionIntent::Cancel(details) => &details.transaction,
+            ConstructedTransactionIntent::CoinControl(details) => &details.transaction,
+            ConstructedTransactionIntent::SmartSendWithSalvage(details) => &details.transaction,
+        };
+        Self::validate_exact_transaction_template(psbt, transaction)?;
+
+        match intent {
+            ConstructedTransactionIntent::InscriptionTransfer(details) => {
+                let recipient = Address::from_str(&details.recipient)
+                    .map_err(|error| format!("Invalid inscription recipient: {error}"))?
+                    .require_network(self.vault_wallet.network())
+                    .map_err(|error| format!("Inscription recipient network mismatch: {error}"))?;
+                let requested: std::collections::BTreeSet<_> =
+                    details.inscription_ids.iter().cloned().collect();
+                if requested.is_empty() || requested.len() != details.inscription_ids.len() {
+                    return Err(
+                        "Inscription transfer intent must contain unique inscription IDs"
+                            .to_string(),
+                    );
+                }
+                let actual = self.inscription_ids_in_inputs(psbt)?;
+                if actual != requested {
+                    return Err(
+                        "Inscription inputs differ from the selected inscription intent"
+                            .to_string(),
+                    );
+                }
+                let analysis = self.analyze_psbt_with_wallet_context(psbt)?;
+                for inscription_id in &requested {
+                    let destination = analysis
+                        .inscription_destinations
+                        .get(inscription_id)
+                        .ok_or_else(|| {
+                            format!("Selected inscription {inscription_id} has no destination")
+                        })?;
+                    let vout = destination.vout.ok_or_else(|| {
+                        format!("Selected inscription {inscription_id} would be burned")
+                    })?;
+                    let output = psbt
+                        .unsigned_tx
+                        .output
+                        .get(usize::try_from(vout).map_err(|_| {
+                            "Inscription destination output index is invalid".to_string()
+                        })?)
+                        .ok_or_else(|| "Inscription destination output is missing".to_string())?;
+                    if output.script_pubkey != recipient.script_pubkey() {
+                        return Err(format!(
+                            "Selected inscription {inscription_id} does not land at the approved recipient"
+                        ));
+                    }
+                }
+                for (index, output) in psbt.unsigned_tx.output.iter().enumerate() {
+                    if output.script_pubkey != recipient.script_pubkey()
+                        && !self.owns_output_script(&output.script_pubkey)
+                    {
+                        return Err(format!(
+                            "Inscription transfer contains an unapproved external output at index {index}"
+                        ));
+                    }
+                }
+            }
+            ConstructedTransactionIntent::Cpfp(details) => {
+                details
+                    .requested_txid
+                    .parse::<bitcoin::Txid>()
+                    .map_err(|error| format!("Invalid requested CPFP txid: {error}"))?;
+                let anchor = details
+                    .anchor_outpoint
+                    .parse::<bitcoin::OutPoint>()
+                    .map_err(|error| format!("Invalid CPFP anchor outpoint: {error}"))?;
+                if !psbt
+                    .unsigned_tx
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output == anchor)
+                {
+                    return Err("CPFP transaction does not spend its approved anchor".to_string());
+                }
+                self.require_wallet_owned_outputs(psbt, "CPFP transaction")?;
+            }
+            ConstructedTransactionIntent::Cancel(details) => {
+                details
+                    .original_txid
+                    .parse::<bitcoin::Txid>()
+                    .map_err(|error| format!("Invalid cancellation txid: {error}"))?;
+                let conflicts = details
+                    .conflict_outpoints
+                    .iter()
+                    .map(|outpoint| {
+                        outpoint
+                            .parse::<bitcoin::OutPoint>()
+                            .map_err(|error| format!("Invalid cancellation conflict: {error}"))
+                    })
+                    .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+                if conflicts.is_empty() || conflicts.len() != details.conflict_outpoints.len() {
+                    return Err(
+                        "Cancellation intent must contain unique conflicting inputs".to_string()
+                    );
+                }
+                let actual = Self::input_outpoint_set(psbt);
+                if !conflicts.iter().all(|outpoint| actual.contains(outpoint)) {
+                    return Err(
+                        "Cancellation transaction no longer conflicts with every approved original input"
+                            .to_string(),
+                    );
+                }
+                self.require_wallet_owned_outputs(psbt, "Cancellation transaction")?;
+            }
+            ConstructedTransactionIntent::CoinControl(details) => {
+                if transaction.input_outpoints != details.selected_outpoints {
+                    return Err(
+                        "Coin-control inputs differ from the explicitly selected coins".to_string(),
+                    );
+                }
+                let inputs = Self::input_outpoint_set(psbt);
+                let has_inscription = inputs
+                    .iter()
+                    .any(|outpoint| self.inscribed_utxos.contains(outpoint));
+                let has_runes = inputs
+                    .iter()
+                    .any(|outpoint| self.outpoint_runes.contains_key(outpoint));
+                match details.action {
+                    CoinControlAction::Consolidate | CoinControlAction::Split => {
+                        if has_inscription || has_runes {
+                            return Err(
+                                "Consolidate/split intent cannot spend a protected asset input"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    CoinControlAction::Salvage => {
+                        if !has_inscription || has_runes {
+                            return Err(
+                                "Salvage intent requires inscription inputs and forbids Rune inputs"
+                                    .to_string(),
+                            );
+                        }
+                        let analysis = self.analyze_psbt_with_wallet_context(psbt)?;
+                        for destination in analysis.inscription_destinations.values() {
+                            let vout = destination.vout.ok_or_else(|| {
+                                "Salvage intent would burn an inscription".to_string()
+                            })?;
+                            let output =
+                                psbt.unsigned_tx
+                                    .output
+                                    .get(usize::try_from(vout).map_err(|_| {
+                                        "Salvage output index is invalid".to_string()
+                                    })?)
+                                    .ok_or_else(|| "Salvage output is missing".to_string())?;
+                            if !self.owns_output_script(&output.script_pubkey) {
+                                return Err(
+                                    "Salvage intent would move an inscription outside the wallet"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                self.require_wallet_owned_outputs(psbt, "Coin-control transaction")?;
+            }
+            ConstructedTransactionIntent::SmartSendWithSalvage(details) => {
+                if transaction.input_outpoints != details.selected_outpoints {
+                    return Err(
+                        "Smart-send inputs differ from the constructed salvage plan".to_string()
+                    );
+                }
+                let recipient = Address::from_str(&details.recipient)
+                    .map_err(|error| format!("Invalid smart-send recipient: {error}"))?
+                    .require_network(self.vault_wallet.network())
+                    .map_err(|error| format!("Smart-send recipient network mismatch: {error}"))?;
+                let recipient_outputs: Vec<_> = psbt
+                    .unsigned_tx
+                    .output
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, output)| output.script_pubkey == recipient.script_pubkey())
+                    .collect();
+                if recipient_outputs.len() != 1
+                    || recipient_outputs[0].1.value.to_sat() != details.amount_sats
+                {
+                    return Err(
+                        "Smart-send recipient output differs from the requested payment"
+                            .to_string(),
+                    );
+                }
+                for (index, output) in psbt.unsigned_tx.output.iter().enumerate() {
+                    if output.script_pubkey != recipient.script_pubkey()
+                        && !self.owns_output_script(&output.script_pubkey)
+                    {
+                        return Err(format!(
+                            "Smart-send contains an unapproved external output at index {index}"
+                        ));
+                    }
+                }
+                let inputs = Self::input_outpoint_set(psbt);
+                if inputs
+                    .iter()
+                    .any(|outpoint| self.outpoint_runes.contains_key(outpoint))
+                {
+                    return Err("Smart-send salvage cannot spend Rune inputs".to_string());
+                }
+                let analysis = self.analyze_psbt_with_wallet_context(psbt)?;
+                for inscription_id in self.inscription_ids_in_inputs(psbt)? {
+                    let destination = analysis
+                        .inscription_destinations
+                        .get(&inscription_id)
+                        .ok_or_else(|| {
+                            format!("Salvaged inscription {inscription_id} has no destination")
+                        })?;
+                    let vout = destination.vout.ok_or_else(|| {
+                        format!("Smart-send would burn inscription {inscription_id}")
+                    })?;
+                    let output = psbt
+                        .unsigned_tx
+                        .output
+                        .get(
+                            usize::try_from(vout).map_err(|_| {
+                                "Smart-send inscription output is invalid".to_string()
+                            })?,
+                        )
+                        .ok_or_else(|| "Smart-send inscription output is missing".to_string())?;
+                    if !self.owns_output_script(&output.script_pubkey) {
+                        return Err(format!(
+                            "Smart-send would move inscription {inscription_id} outside the wallet"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create an ord-compatible buyer offer PSBT and envelope.
     pub fn create_offer(
         &mut self,
@@ -4670,6 +5201,26 @@ impl ZincWallet {
         self.sign_psbt_with_policy(psbt_base64, options, false)
     }
 
+    /// Sign a first-party constructed transaction only after its exact template
+    /// and operation-specific invariants have been revalidated.
+    pub fn sign_constructed_transaction_psbt(
+        &mut self,
+        psbt_base64: &str,
+        intent: &ConstructedTransactionIntent,
+        options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| format!("Invalid base64: {error}"))?;
+        let psbt =
+            Psbt::deserialize(&psbt_bytes).map_err(|error| format!("Invalid PSBT: {error}"))?;
+        self.validate_constructed_transaction_psbt(&psbt, intent)
+            .map_err(|error| format!("Security Violation: {error}"))?;
+        self.sign_psbt_with_policy(psbt_base64, options, false)
+    }
+
     /// Prepare a PSBT for external signing (e.g. on a hardware wallet).
     ///
     /// Performs the pre-sign checks and enrichment that `sign_psbt` does
@@ -4870,6 +5421,38 @@ impl ZincWallet {
             }
         })?;
         self.validate_bitcoin_transfer_psbt(&psbt, intent)
+            .map_err(|error| PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Security Violation: {error}"),
+            })?;
+        self.prepare_external_signing_request_with_policy(psbt_base64, options, capabilities, false)
+    }
+
+    /// Validate an exact first-party construction before allowing it to cross
+    /// an external signer boundary.
+    pub fn prepare_external_constructed_transaction_signing_request(
+        &self,
+        psbt_base64: &str,
+        intent: &ConstructedTransactionIntent,
+        options: Option<SignOptions>,
+        capabilities: &crate::external_signing::ExternalSignerCapabilitiesV2,
+    ) -> Result<
+        crate::external_signing::PreparedExternalSigningRequestV2,
+        crate::external_signing::PrepareExternalSigningErrorV2,
+    > {
+        use crate::external_signing::PrepareExternalSigningErrorV2;
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Invalid base64: {error}"),
+            })?;
+        let psbt = Psbt::deserialize(&psbt_bytes).map_err(|error| {
+            PrepareExternalSigningErrorV2::PreparationFailed {
+                message: format!("Invalid PSBT: {error}"),
+            }
+        })?;
+        self.validate_constructed_transaction_psbt(&psbt, intent)
             .map_err(|error| PrepareExternalSigningErrorV2::PreparationFailed {
                 message: format!("Security Violation: {error}"),
             })?;
