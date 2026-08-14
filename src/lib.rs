@@ -65,11 +65,16 @@ pub mod sign_intent;
 
 // Re-exports for convenience
 pub use builder::{
-    Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CreatePsbtRequest,
-    CreatePsbtTransportRequest, CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan,
-    DiscoveryContext, PaymentAddressType, ProfileMode, RuneTransferIntent, RuneTransferResult,
-    ScanPolicy, Seed64, SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, WalletKind,
-    ZincBalance, ZincPersistence, ZincSyncRequest, ZincWallet,
+    Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
+    CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
+    ConstructedTransactionIntent, ConstructedTransactionIntentRequest, CpfpIntentDetails,
+    CpfpIntentRequest, CreatePsbtRequest, CreatePsbtTransportRequest, CreateRuneTransferRequest,
+    DerivationMode, DiscoveryAccountPlan, DiscoveryContext, ExactTransactionOutput,
+    ExactTransactionTemplate, InscriptionTransferIntentDetails, InscriptionTransferIntentRequest,
+    PaymentAddressType, ProfileMode, RuneTransferIntent, RuneTransferResult, ScanPolicy, Seed64,
+    SignOptions, SmartSendWithSalvageIntentDetails, SmartSendWithSalvageIntentRequest,
+    SyncRequestType, SyncSleeper, WalletBuilder, WalletKind, ZincBalance, ZincPersistence,
+    ZincSyncRequest, ZincWallet,
 };
 pub use error::{ZincError, ZincResult};
 pub use external_signing::{
@@ -3139,6 +3144,107 @@ impl ZincWasmWallet {
             })?
             .validate_bitcoin_transfer_psbt(&psbt, &intent)
             .map_err(|error| JsValue::from_str(&format!("Security Violation: {error}")))
+    }
+
+    /// Create an exact operation-specific intent for a PSBT returned by a
+    /// first-party Zinc/Singularity builder.
+    #[wasm_bindgen(js_name = createConstructedTransactionIntent)]
+    pub fn create_constructed_transaction_intent(
+        &self,
+        psbt_base64: &str,
+        request: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        use base64::Engine;
+
+        self.check_vitality()?;
+        let request: crate::builder::ConstructedTransactionIntentRequest =
+            serde_wasm_bindgen::from_value(request).map_err(|error| {
+                JsValue::from_str(&format!("Invalid constructed transaction request: {error}"))
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| JsValue::from_str(&format!("Invalid base64: {error}")))?;
+        let psbt = bitcoin::Psbt::deserialize(&bytes)
+            .map_err(|error| JsValue::from_str(&format!("Invalid PSBT: {error}")))?;
+        let intent = self
+            .inner
+            .try_borrow()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (createConstructedTransactionIntent): {error}"
+                ))
+            })?
+            .create_constructed_transaction_intent(&psbt, request)
+            .map_err(|error| JsValue::from_str(&format!("Security Violation: {error}")))?;
+        serde_wasm_bindgen::to_value(&intent).map_err(|error| {
+            JsValue::from_str(&format!(
+                "Failed to serialize constructed transaction intent: {error}"
+            ))
+        })
+    }
+
+    /// Validate a first-party constructed transaction without signing. Browser
+    /// hardware flows use this immediately before device preparation.
+    #[wasm_bindgen(js_name = validateConstructedTransactionPsbt)]
+    pub fn validate_constructed_transaction_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+    ) -> Result<(), JsValue> {
+        use base64::Engine;
+
+        self.check_vitality()?;
+        let intent: crate::builder::ConstructedTransactionIntent =
+            serde_wasm_bindgen::from_value(intent).map_err(|error| {
+                JsValue::from_str(&format!("Invalid constructed transaction intent: {error}"))
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| JsValue::from_str(&format!("Invalid base64: {error}")))?;
+        let psbt = bitcoin::Psbt::deserialize(&bytes)
+            .map_err(|error| JsValue::from_str(&format!("Invalid PSBT: {error}")))?;
+        self.inner
+            .try_borrow()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (validateConstructedTransactionPsbt): {error}"
+                ))
+            })?
+            .validate_constructed_transaction_psbt(&psbt, &intent)
+            .map_err(|error| JsValue::from_str(&format!("Security Violation: {error}")))
+    }
+
+    /// Sign a first-party constructed transaction only after revalidating its
+    /// exact template and operation-specific intent.
+    #[wasm_bindgen(js_name = signConstructedTransactionPsbt)]
+    pub fn sign_constructed_transaction_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+        options: JsValue,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let intent: crate::builder::ConstructedTransactionIntent =
+            serde_wasm_bindgen::from_value(intent).map_err(|error| {
+                JsValue::from_str(&format!("Invalid constructed transaction intent: {error}"))
+            })?;
+        let sign_options: Option<crate::builder::SignOptions> =
+            if options.is_null() || options.is_undefined() {
+                None
+            } else {
+                Some(
+                    serde_wasm_bindgen::from_value(options)
+                        .map_err(|error| JsValue::from_str(&format!("Invalid options: {error}")))?,
+                )
+            };
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .sign_constructed_transaction_psbt(psbt_base64, &intent, sign_options)
+                .map_err(JsValue::from),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (signConstructedTransactionPsbt): {error}"
+            ))),
+        }
     }
 
     /// Sign a Rune transfer only after revalidating its exact engine-issued
