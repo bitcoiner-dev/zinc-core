@@ -13,9 +13,9 @@ mod tests {
     use bdk_wallet::chain::{BlockId, ConfirmationBlockTime, TxGraph};
     use bdk_wallet::KeychainKind;
 
-    fn dummy_tx(value: u64, script_pubkey: ScriptBuf, uid: u8) -> Transaction {
+    fn dummy_tx(value: u64, script_pubkey: ScriptBuf, uid: u16) -> Transaction {
         let mut hash_bytes = [0u8; 32];
-        hash_bytes[31] = uid;
+        hash_bytes[30..].copy_from_slice(&uid.to_be_bytes());
         Transaction {
             version: bdk_wallet::bitcoin::transaction::Version::TWO,
             lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
@@ -273,5 +273,89 @@ mod tests {
         assert_eq!(txs[0].inscriptions.len(), 1);
         assert_eq!(txs[0].inscriptions[0].id, "insc-xyz");
         assert_eq!(txs[0].inscriptions[0].number, 7);
+    }
+
+    #[test]
+    fn transaction_pages_cover_large_history_without_overlap() {
+        let mut w = unified();
+        let address = w
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
+        let script_pubkey = address.script_pubkey();
+        let transactions = (0..250u16)
+            .map(|uid| {
+                dummy_tx(
+                    10_000 + u64::from(uid),
+                    script_pubkey.clone(),
+                    uid.saturating_add(1),
+                )
+            })
+            .collect::<Vec<_>>();
+        let funded = transactions
+            .iter()
+            .enumerate()
+            .map(|(index, tx)| (tx, Some(100 + u32::try_from(index).unwrap())))
+            .collect::<Vec<_>>();
+        fund(&mut w.vault_wallet, &funded, 0);
+
+        let first = w.get_transaction_page(100, None).unwrap();
+        assert_eq!(first.items.len(), 100);
+        assert!(first.has_more);
+        assert!(first.next_cursor.is_some());
+
+        let second = w
+            .get_transaction_page(100, first.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(second.items.len(), 100);
+        assert!(second.has_more);
+
+        let third = w
+            .get_transaction_page(100, second.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(third.items.len(), 50);
+        assert!(!third.has_more);
+        assert!(third.next_cursor.is_none());
+
+        let all_txids = first
+            .items
+            .iter()
+            .chain(&second.items)
+            .chain(&third.items)
+            .map(|item| item.txid.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            all_txids.len(),
+            250,
+            "pages must neither overlap nor omit rows"
+        );
+    }
+
+    #[test]
+    fn transaction_page_caps_requests_and_rejects_invalid_cursors() {
+        let mut w = unified();
+        let address = w
+            .vault_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
+        let script_pubkey = address.script_pubkey();
+        let transactions = (0..125u16)
+            .map(|uid| dummy_tx(10_000, script_pubkey.clone(), uid.saturating_add(1)))
+            .collect::<Vec<_>>();
+        let funded = transactions
+            .iter()
+            .enumerate()
+            .map(|(index, tx)| (tx, Some(100 + u32::try_from(index).unwrap())))
+            .collect::<Vec<_>>();
+        fund(&mut w.vault_wallet, &funded, 0);
+
+        let capped = w.get_transaction_page(usize::MAX, None).unwrap();
+        assert_eq!(capped.items.len(), 100);
+        assert!(capped.has_more);
+        assert_eq!(
+            w.get_transaction_page(20, Some("not-a-valid-cursor"))
+                .unwrap_err(),
+            "Invalid transaction cursor"
+        );
     }
 }

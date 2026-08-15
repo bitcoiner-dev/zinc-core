@@ -87,7 +87,7 @@ pub use external_signing::{
     ExternalSigningPlanV2, ExternalSigningRequirementsV2, PrepareExternalSigningErrorV2,
     PreparedExternalSigningRequestV2, RequirementsDerivationError, EXTERNAL_SIGNING_SCHEMA_V2,
 };
-pub use history::TxItem;
+pub use history::{TransactionPage, TxItem, MAX_TRANSACTION_PAGE_SIZE};
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use layout::{derive_layout_addresses, BranchSpec, LayoutAddresses, LayoutSpec, ScriptKind};
 pub use listing::{
@@ -2117,6 +2117,28 @@ impl ZincWasmWallet {
             }
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (get_transactions): {e}"
+            ))),
+        }
+    }
+
+    /// Return one bounded transaction-history page and an opaque continuation cursor.
+    pub fn get_transaction_page(
+        &self,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let page = inner
+                    .get_transaction_page(limit, cursor.as_deref())
+                    .map_err(|error| JsValue::from_str(&error))?;
+                serde_wasm_bindgen::to_value(&page).map_err(|error| {
+                    JsValue::from(format!("Failed to serialize transaction page: {error}"))
+                })
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (get_transaction_page): {error}"
             ))),
         }
     }
