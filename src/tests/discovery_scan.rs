@@ -100,6 +100,32 @@ mod tests {
     }
 
     #[test]
+    fn strict_receive_scan_reports_the_first_active_address_index() {
+        let result = run_async(crate::first_active_receive_index_from_scan_strict(
+            40,
+            |index| async move { Ok(index == 27) },
+        ));
+
+        assert_eq!(result, Ok(Some(27)));
+    }
+
+    #[test]
+    fn strict_receive_index_scan_never_collapses_backend_failure_to_empty() {
+        let result = run_async(crate::first_active_receive_index_from_scan_strict(
+            20,
+            |index| async move {
+                if index == 7 {
+                    Err(crate::AccountDiscoveryProbeError::Backend)
+                } else {
+                    Ok(false)
+                }
+            },
+        ));
+
+        assert_eq!(result, Err(crate::AccountDiscoveryProbeError::Backend));
+    }
+
+    #[test]
     fn discovery_tracker_publishes_only_monotonic_active_frontiers() {
         let mut tracker = crate::AccountDiscoveryTracker::default();
 
