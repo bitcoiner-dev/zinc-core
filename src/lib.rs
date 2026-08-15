@@ -563,7 +563,7 @@ async fn fetch_addr_stats(
     }
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 async fn first_active_receive_index_from_scan<F, Fut>(
     address_scan_depth: u32,
     mut has_activity_at: F,
@@ -618,8 +618,22 @@ enum AccountDiscoveryProbeError {
 #[cfg(any(target_arch = "wasm32", test))]
 async fn account_is_active_from_receive_scan_strict<F, Fut>(
     address_scan_depth: u32,
-    mut has_activity_at: F,
+    has_activity_at: F,
 ) -> Result<bool, AccountDiscoveryProbeError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<bool, AccountDiscoveryProbeError>>,
+{
+    first_active_receive_index_from_scan_strict(address_scan_depth, has_activity_at)
+        .await
+        .map(|index| index.is_some())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+async fn first_active_receive_index_from_scan_strict<F, Fut>(
+    address_scan_depth: u32,
+    mut has_activity_at: F,
+) -> Result<Option<u32>, AccountDiscoveryProbeError>
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<bool, AccountDiscoveryProbeError>>,
@@ -636,8 +650,8 @@ where
         }
 
         let results = futures_util::future::join_all(checks).await;
-        if results.iter().any(|result| matches!(result, Ok(true))) {
-            return Ok(true);
+        if let Some(offset) = results.iter().position(|result| matches!(result, Ok(true))) {
+            return Ok(Some(batch_start + offset as u32));
         }
         if let Some(error) = results.into_iter().find_map(Result::err) {
             return Err(error);
@@ -646,7 +660,7 @@ where
         batch_start = batch_end;
     }
 
-    Ok(false)
+    Ok(None)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -735,9 +749,22 @@ struct ImportPathAccountHit {
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ImportPathDiscoveryStopReasonV1 {
+    GapLimit,
+    Deadline,
+    MaxAccounts,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportPathDiscoveryResponse {
+    version: u8,
     active_accounts: Vec<ImportPathAccountHit>,
+    scanned_accounts: u32,
+    complete: bool,
+    stop_reason: ImportPathDiscoveryStopReasonV1,
 }
 
 /// Initialize WASM module (call once on load).
@@ -2653,9 +2680,15 @@ impl ZincWasmWallet {
         let scheme = state.scheme;
         let derivation_mode = state.derivation_mode;
         let payment_address_type = state.payment_address_type;
-        let account_gap_limit = account_gap_limit.max(1);
-        let address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
-        let timeout_ms = timeout_ms.unwrap_or(45_000).max(1);
+        const MAX_IMPORT_ACCOUNT_GAP_LIMIT: u32 = 100;
+        const MAX_IMPORT_ADDRESS_SCAN_DEPTH: u32 = 200;
+        const MAX_IMPORT_ACCOUNTS: u32 = 100;
+        const MAX_IMPORT_TIMEOUT_MS: u32 = 300_000;
+        let account_gap_limit = account_gap_limit.clamp(1, MAX_IMPORT_ACCOUNT_GAP_LIMIT);
+        let address_scan_depth = address_scan_depth
+            .unwrap_or(20)
+            .clamp(1, MAX_IMPORT_ADDRESS_SCAN_DEPTH);
+        let timeout_ms = timeout_ms.unwrap_or(45_000).clamp(1, MAX_IMPORT_TIMEOUT_MS);
         let branch_label = branch_str.to_string();
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
@@ -2673,10 +2706,12 @@ impl ZincWasmWallet {
             let mut active_accounts = Vec::new();
             let mut current_gap = 0;
             let mut account_index: u32 = 0;
+            let mut scanned_accounts: u32 = 0;
             let start_ms = js_sys::Date::now();
             let deadline_ms = start_ms + f64::from(timeout_ms);
+            let mut stop_reason = ImportPathDiscoveryStopReasonV1::MaxAccounts;
 
-            loop {
+            while account_index < MAX_IMPORT_ACCOUNTS {
                 if js_sys::Date::now() >= deadline_ms {
                     zinc_log_warn!(
                         target: LOG_TARGET_WASM,
@@ -2684,10 +2719,12 @@ impl ZincWasmWallet {
                         timeout_ms,
                         active_accounts.len()
                     );
+                    stop_reason = ImportPathDiscoveryStopReasonV1::Deadline;
                     break;
                 }
 
                 if current_gap >= account_gap_limit {
+                    stop_reason = ImportPathDiscoveryStopReasonV1::GapLimit;
                     break;
                 }
 
@@ -2699,7 +2736,6 @@ impl ZincWasmWallet {
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-                let timed_out = std::cell::Cell::new(false);
                 const ADDRESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
 
                 let check_activity = |addr_str: String| {
@@ -2707,16 +2743,25 @@ impl ZincWasmWallet {
                     let url = format!("{}/address/{}", esplora_url, addr_str);
                     async move {
                         let request = async {
-                            if let Ok(resp) = client.get(&url).send().await {
-                                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                    let chain_txs =
-                                        json["chain_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    let mempool_txs =
-                                        json["mempool_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    return chain_txs > 0 || mempool_txs > 0;
-                                }
+                            let response = client
+                                .get(&url)
+                                .send()
+                                .await
+                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
+                            if !response.status().is_success() {
+                                return Err(AccountDiscoveryProbeError::Backend);
                             }
-                            false
+                            let json = response
+                                .json::<serde_json::Value>()
+                                .await
+                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
+                            let chain_txs = json["chain_stats"]["tx_count"]
+                                .as_u64()
+                                .ok_or(AccountDiscoveryProbeError::Backend)?;
+                            let mempool_txs = json["mempool_stats"]["tx_count"]
+                                .as_u64()
+                                .ok_or(AccountDiscoveryProbeError::Backend)?;
+                            Ok(chain_txs > 0 || mempool_txs > 0)
                         };
                         let timeout =
                             gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
@@ -2725,13 +2770,16 @@ impl ZincWasmWallet {
 
                         match futures_util::future::select(request, timeout).await {
                             futures_util::future::Either::Left((value, _)) => value,
-                            futures_util::future::Either::Right((_timed_out, _)) => false,
+                            futures_util::future::Either::Right((_timed_out, _)) => {
+                                Err(AccountDiscoveryProbeError::Backend)
+                            }
                         }
                     }
                 };
 
-                let first_active_address_index =
-                    first_active_receive_index_from_scan(address_scan_depth, |address_index| {
+                let first_active_address_index = first_active_receive_index_from_scan_strict(
+                    address_scan_depth,
+                    |address_index| {
                         let branch_address = match branch {
                             ImportDiscoveryBranch::Taproot => {
                                 Some(zwallet.peek_taproot_address(address_index).to_string())
@@ -2749,25 +2797,32 @@ impl ZincWasmWallet {
 
                         async {
                             if js_sys::Date::now() >= deadline_ms {
-                                timed_out.set(true);
-                                return false;
+                                return Err(AccountDiscoveryProbeError::Deadline);
                             }
                             if let Some(address) = branch_address {
                                 return check_activity(address).await;
                             }
-                            false
+                            Ok(false)
                         }
-                    })
-                    .await;
+                    },
+                )
+                .await;
 
-                if timed_out.get() {
-                    zinc_log_warn!(
-                        target: LOG_TARGET_WASM,
-                        "discover_import_path stopped mid-account scan due to timeout budget (account_index={})",
-                        account_index
-                    );
-                    break;
-                }
+                let first_active_address_index = match first_active_address_index {
+                    Ok(index) => index,
+                    Err(AccountDiscoveryProbeError::Deadline) => {
+                        zinc_log_warn!(
+                            target: LOG_TARGET_WASM,
+                            "discover_import_path stopped at deadline (account_index={})",
+                            account_index
+                        );
+                        stop_reason = ImportPathDiscoveryStopReasonV1::Deadline;
+                        break;
+                    }
+                    Err(AccountDiscoveryProbeError::Backend) => {
+                        return Err(JsValue::from_str("Import discovery backend request failed"));
+                    }
+                };
 
                 if let Some(first_active_address_index) = first_active_address_index {
                     active_accounts.push(ImportPathAccountHit {
@@ -2779,11 +2834,24 @@ impl ZincWasmWallet {
                     current_gap += 1;
                 }
 
-                account_index += 1;
+                scanned_accounts = scanned_accounts.saturating_add(1);
+                account_index = account_index
+                    .checked_add(1)
+                    .ok_or_else(|| JsValue::from_str("Import discovery index overflow"))?;
             }
 
-            serde_wasm_bindgen::to_value(&ImportPathDiscoveryResponse { active_accounts })
-                .map_err(|e| JsValue::from(e.to_string()))
+            if current_gap >= account_gap_limit {
+                stop_reason = ImportPathDiscoveryStopReasonV1::GapLimit;
+            }
+            let complete = matches!(stop_reason, ImportPathDiscoveryStopReasonV1::GapLimit);
+            serde_wasm_bindgen::to_value(&ImportPathDiscoveryResponse {
+                version: ACCOUNT_DISCOVERY_SCHEMA_V1,
+                active_accounts,
+                scanned_accounts,
+                complete,
+                stop_reason,
+            })
+            .map_err(|e| JsValue::from(e.to_string()))
         }))
     }
 
