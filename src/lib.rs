@@ -2263,11 +2263,27 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Retire an in-flight sync generation after the shell cancels or times out.
+    /// The network future may still resolve, but its apply step will fail stale.
+    #[wasm_bindgen(js_name = retireSyncGeneration)]
+    pub fn retire_sync_generation(&self) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                inner.retire_inflight_sync();
+                Ok(())
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (retire_sync_generation): {error}"
+            ))),
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = sync)]
     pub fn sync(&self, esplora_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        use crate::builder::{SyncRequestType, SyncSleeper};
+        use crate::builder::{configured_esplora_client, SyncRequestType};
         use bdk_esplora::EsploraAsyncExt;
 
         let inner_rc = self.inner.clone();
@@ -2306,9 +2322,7 @@ impl ZincWasmWallet {
                 }
             };
 
-            let client = match esplora_client::Builder::new(&esplora_url)
-                .build_async_with_sleeper::<SyncSleeper>()
-            {
+            let client = match configured_esplora_client(&esplora_url) {
                 Ok(c) => c,
                 Err(e) => {
                     zinc_log_error!(target: LOG_TARGET_WASM, "failed to create esplora client");
@@ -4109,7 +4123,7 @@ impl ZincWasmWallet {
         esplora_url: String,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        use crate::builder::SyncSleeper;
+        use crate::builder::configured_esplora_client;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             // Decode PSBT - no borrow needed
@@ -4127,14 +4141,12 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Failed to extract tx: {e}")))?;
 
             // Broadcast via Esplora (no RefCell borrow needed)
-            let client = esplora_client::Builder::new(&esplora_url)
-                .build_async_with_sleeper::<SyncSleeper>()
-                .map_err(|e| {
-                    backend_failure_to_js(&BackendFailureV1::from_esplora(
-                        &e,
-                        BackendOperationV1::Connect,
-                    ))
-                })?;
+            let client = configured_esplora_client(&esplora_url).map_err(|e| {
+                backend_failure_to_js(&BackendFailureV1::from_esplora(
+                    &e,
+                    BackendOperationV1::Connect,
+                ))
+            })?;
 
             crate::builder::broadcast_esplora_transaction(&client, &tx)
                 .await
