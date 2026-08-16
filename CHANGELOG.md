@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
   error; reconciliation never issues a second broadcast.
 - Disable hidden Esplora HTTP retries, apply an explicit request timeout, and
   expose generation retirement so hosts can safely discard late WASM scans.
+- Return versioned base-chain/Ord sync receipts for host-owned dependency health.
 
 ## [0.12.0] - 2026-08-08
 
