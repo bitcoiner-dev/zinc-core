@@ -2,10 +2,14 @@ use crate::backend_error::{BackendDependencyV1, BackendFailureV1, BackendOperati
 use crate::ordinals::error::OrdError;
 use crate::ordinals::types::{Inscription, RuneBalance, RuneInfo};
 use bitcoin::OutPoint;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use ordinals::{Epoch, Rarity, Sat};
 use reqwest::Client;
 use serde::{Deserialize, Deserializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+const OUTPUTS_BATCH: usize = 100;
+const OUTPUTS_MAX_CONCURRENCY: usize = 4;
 
 async fn send_ord_request(
     request: reqwest::RequestBuilder,
@@ -882,14 +886,22 @@ impl OrdClient {
         }
 
         // 1. Bulk outputs, batched + concurrent.
-        const OUTPUTS_BATCH: usize = 100;
-        let chunk_futures = outpoints
+        // Own each small request batch so the bounded stream's future remains
+        // `Send` for native Tauri commands (borrowed slice futures are not
+        // higher-ranked over every input lifetime).
+        let batches: Vec<Vec<String>> = outpoints
             .chunks(OUTPUTS_BATCH)
-            .map(|chunk| self.get_outputs_bulk(chunk));
-        let mut entries: Vec<OutputResponse> = Vec::new();
-        for result in futures_util::future::join_all(chunk_futures).await {
-            entries.extend(result?);
-        }
+            .map(<[String]>::to_vec)
+            .collect();
+        let chunks: Vec<Vec<OutputResponse>> = stream::iter(
+            batches
+                .into_iter()
+                .map(|batch| async move { self.get_outputs_bulk(&batch).await }),
+        )
+        .buffer_unordered(OUTPUTS_MAX_CONCURRENCY)
+        .try_collect()
+        .await?;
+        let entries: Vec<OutputResponse> = chunks.into_iter().flatten().collect();
 
         // Coverage check (fail closed): every requested outpoint must be present in the response.
         let returned: HashSet<&str> = entries
@@ -1189,9 +1201,73 @@ impl OrdClient {
 mod tests {
     use super::{
         classify_rare_sats, parse_offers_payload, parse_runes_balances_value, validate_sat_ranges,
-        OrdClient, OrdError, OutputResponse,
+        OrdClient, OrdError, OutputResponse, OUTPUTS_MAX_CONCURRENCY,
     };
     use crate::backend_error::{BackendFailureCategoryV1, BackendOperationV1};
+    use futures_util::{StreamExt, TryStreamExt};
+
+    async fn try_collect_bounded<I, F, Fut, T, E>(
+        items: I,
+        max_concurrency: usize,
+        fetch: F,
+    ) -> Result<Vec<T>, E>
+    where
+        I: IntoIterator,
+        F: FnMut(I::Item) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        futures_util::stream::iter(items)
+            .map(fetch)
+            .buffer_unordered(max_concurrency.max(1))
+            .try_collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn outputs_scheduler_never_exceeds_its_request_bound() {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            try_collect_bounded(0_u8..10, OUTPUTS_MAX_CONCURRENCY, move |item| {
+                let started_tx = started_tx.clone();
+                async move {
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                    started_tx.send(release_tx).expect("observer remains alive");
+                    release_rx.await.expect("request released");
+                    Ok::<u8, ()>(item)
+                }
+            })
+            .await
+        });
+
+        let mut active = Vec::new();
+        for _ in 0..OUTPUTS_MAX_CONCURRENCY {
+            active.push(started_rx.recv().await.expect("initial request starts"));
+        }
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        for _ in OUTPUTS_MAX_CONCURRENCY..10 {
+            active
+                .pop()
+                .expect("active request")
+                .send(())
+                .expect("release succeeds");
+            active.push(started_rx.recv().await.expect("one replacement starts"));
+            assert!(active.len() <= OUTPUTS_MAX_CONCURRENCY);
+        }
+        for release in active {
+            release.send(()).expect("release succeeds");
+        }
+
+        let mut values = collector
+            .await
+            .expect("collector task joins")
+            .expect("requests succeed");
+        values.sort_unstable();
+        assert_eq!(values, (0_u8..10).collect::<Vec<_>>());
+    }
 
     #[tokio::test]
     async fn address_404_is_characterized_as_an_empty_asset_snapshot() {

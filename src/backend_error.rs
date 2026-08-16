@@ -1,5 +1,6 @@
 //! Stable, data-only failures for blockchain backend operations.
 
+use crate::backend_receipt::BackendScanOutcomeV1;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -96,6 +97,9 @@ pub struct BackendFailureV1 {
     /// Validated and bounded retry delay supplied by the upstream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// Scan boundary retained when a sync attempt stops before apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_outcome: Option<BackendScanOutcomeV1>,
 }
 
 impl BackendFailureV1 {
@@ -113,6 +117,7 @@ impl BackendFailureV1 {
             upstream_status: None,
             upstream_code: None,
             retry_after_ms: None,
+            scan_outcome: None,
         }
     }
 
@@ -135,6 +140,26 @@ impl BackendFailureV1 {
     pub fn with_upstream_code(mut self, code: impl AsRef<str>) -> Self {
         self.upstream_code = sanitize_upstream_code(code.as_ref());
         self
+    }
+
+    /// Attach safe scan progress without including a partial wallet update.
+    #[must_use]
+    pub fn with_scan_outcome(mut self, outcome: BackendScanOutcomeV1) -> Self {
+        self.scan_outcome = Some(outcome);
+        self
+    }
+
+    /// Whether a scan stopped for a condition the host may retry.
+    #[must_use]
+    pub fn is_scan_retryable(&self) -> bool {
+        matches!(
+            self.category,
+            BackendFailureCategoryV1::Offline
+                | BackendFailureCategoryV1::Timeout
+                | BackendFailureCategoryV1::RateLimited
+                | BackendFailureCategoryV1::Unavailable
+                | BackendFailureCategoryV1::Unknown
+        )
     }
 
     /// Map an Esplora client error without retaining its response body.

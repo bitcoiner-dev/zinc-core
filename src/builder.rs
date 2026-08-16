@@ -2530,9 +2530,29 @@ impl ZincWallet {
         vault_update: impl Into<bdk_wallet::Update>,
         payment_update: Option<impl Into<bdk_wallet::Update>>,
     ) -> Result<Vec<String>, String> {
-        // Chain data and asset classifications are one snapshot. Invalidate
-        // before applying either update so even a partial apply followed by an
-        // error cannot leave an older Ord result marked current.
+        let vault_update = vault_update.into();
+        let payment_update = payment_update.map(Into::into);
+
+        // `Wallet::apply_update` can only fail while connecting its chain update;
+        // preflight both chains on clones before mutating either wallet. This makes
+        // the two-keychain apply boundary atomic without cloning signer state.
+        let preflight = |wallet: &Wallet, update: &bdk_wallet::Update| -> Result<(), String> {
+            if let Some(chain_update) = update.chain.clone() {
+                wallet
+                    .local_chain()
+                    .clone()
+                    .apply_update(chain_update)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+        preflight(&self.vault_wallet, &vault_update)?;
+        if let (Some(wallet), Some(update)) = (&self.payment_wallet, &payment_update) {
+            preflight(wallet, update)?;
+        }
+
+        // Chain data and asset classifications are one snapshot. Invalidate only
+        // after every fallible chain connection has passed preflight.
         self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
         self.chain_observed_at_unix = None;
         self.invalidate_asset_state();

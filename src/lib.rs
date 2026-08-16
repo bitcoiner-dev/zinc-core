@@ -76,7 +76,10 @@ pub use backend_error::{
     BackendDependencyV1, BackendFailureCategoryV1, BackendFailureV1, BackendOperationV1,
     MAX_RETRY_AFTER_MS,
 };
-pub use backend_receipt::{BackendCapabilityV1, BackendSyncReceiptV1, SyncCompletenessV1};
+pub use backend_receipt::{
+    BackendCapabilityV1, BackendScanOutcomeV1, BackendSyncReceiptV1, ScanCheckpointV1,
+    ScanOutcomeStatusV1, SyncCompletenessV1,
+};
 pub use builder::{
     Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
     CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
@@ -163,10 +166,38 @@ fn backend_failure_to_js(failure: &BackendFailureV1) -> JsValue {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn backend_scan_failure_to_js(
+    failure: BackendFailureV1,
+    last_complete_tip: Option<u32>,
+    operation_generation: u64,
+    completed_keychains: u8,
+    total_keychains: u8,
+) -> JsValue {
+    let retryable = failure.is_scan_retryable();
+    backend_failure_to_js(&failure.with_scan_outcome(BackendScanOutcomeV1::incomplete(
+        retryable,
+        last_complete_tip,
+        operation_generation,
+        completed_keychains,
+        total_keychains,
+    )))
+}
+
+#[cfg(target_arch = "wasm32")]
 fn ord_failure_to_js(error: ordinals::OrdError) -> JsValue {
     match error {
         ordinals::OrdError::Backend(failure) => backend_failure_to_js(&failure),
         other => JsValue::from_str(&other.to_string()),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ord_scan_failure_to_js(error: ordinals::OrdError, operation_generation: u64) -> JsValue {
+    match error {
+        ordinals::OrdError::Backend(failure) => {
+            backend_scan_failure_to_js(failure, None, operation_generation, 0, 1)
+        }
+        other => ord_failure_to_js(other),
     }
 }
 
@@ -2299,7 +2330,7 @@ impl ZincWasmWallet {
             );
 
             // 1. Prepare Request (lock briefly)
-            let (sync_req, sync_generation) = {
+            let (sync_req, sync_generation, last_complete_tip, total_keychains) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if !inner.try_begin_sync(js_sys::Date::now()) {
@@ -2310,9 +2341,13 @@ impl ZincWasmWallet {
                         // Consume any pending full-rescan request: full scan once, then incremental.
                         let force_full = inner.force_next_full;
                         inner.force_next_full = false;
+                        let request = inner.prepare_requests(force_full);
+                        let total_keychains = 1 + u8::from(request.payment.is_some());
                         (
-                            inner.prepare_requests(force_full),
+                            request,
                             inner.account_generation(),
+                            (inner.chain_tip_height() > 0).then(|| inner.chain_tip_height()),
+                            total_keychains,
                         )
                     }
                     Err(e) => {
@@ -2342,15 +2377,20 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(backend_failure_to_js(&BackendFailureV1::from_esplora(
-                        &e,
-                        BackendOperationV1::Connect,
-                    )));
+                    return Err(backend_scan_failure_to_js(
+                        BackendFailureV1::from_esplora(&e, BackendOperationV1::Connect),
+                        last_complete_tip,
+                        sync_generation,
+                        0,
+                        total_keychains,
+                    ));
                 }
             };
 
             // 2. Fetch (NO LOCK HELD)
-            let vault_update_res: Result<bdk_wallet::Update, JsValue> = match sync_req.taproot {
+            let vault_update_res: Result<bdk_wallet::Update, BackendFailureV1> = match sync_req
+                .taproot
+            {
                 SyncRequestType::Full(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot full scan");
                     client
@@ -2359,20 +2399,14 @@ impl ZincWasmWallet {
                         .map(|u| u.into())
                         .map_err(|e| {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Vault full scan failed: {:?}", e);
-                            backend_failure_to_js(&BackendFailureV1::from_esplora(
-                                &e,
-                                BackendOperationV1::Sync,
-                            ))
+                            BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                         })
                 }
                 SyncRequestType::Incremental(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot incremental sync");
                     client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "Vault sync failed: {:?}", e);
-                        backend_failure_to_js(&BackendFailureV1::from_esplora(
-                            &e,
-                            BackendOperationV1::Sync,
-                        ))
+                        BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                     })
                 }
             };
@@ -2388,14 +2422,20 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(e);
+                    return Err(backend_scan_failure_to_js(
+                        e,
+                        last_complete_tip,
+                        sync_generation,
+                        0,
+                        total_keychains,
+                    ));
                 }
             };
 
             let payment_update: Option<bdk_wallet::Update> = if let Some(req_type) =
                 sync_req.payment
             {
-                let update_res: Result<bdk_wallet::Update, JsValue> = match req_type {
+                let update_res: Result<bdk_wallet::Update, BackendFailureV1> = match req_type {
                     SyncRequestType::Full(req) => {
                         zinc_log_info!(target: LOG_TARGET_WASM, "starting payment full scan");
                         client
@@ -2404,10 +2444,7 @@ impl ZincWasmWallet {
                                 .map(|u| u.into())
                                 .map_err(|e| {
                                     zinc_log_debug!(target: LOG_TARGET_WASM, "Payment full scan failed: {:?}", e);
-                                    backend_failure_to_js(&BackendFailureV1::from_esplora(
-                                        &e,
-                                        BackendOperationV1::Sync,
-                                    ))
+                                    BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                                 })
                     }
                     SyncRequestType::Incremental(req) => {
@@ -2417,10 +2454,7 @@ impl ZincWasmWallet {
                         );
                         client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                                 zinc_log_debug!(target: LOG_TARGET_WASM, "Payment sync failed: {:?}", e);
-                                backend_failure_to_js(&BackendFailureV1::from_esplora(
-                                    &e,
-                                    BackendOperationV1::Sync,
-                                ))
+                                BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                             })
                     }
                 };
@@ -2439,7 +2473,13 @@ impl ZincWasmWallet {
                         ) {
                             return Err(stale);
                         }
-                        return Err(e);
+                        return Err(backend_scan_failure_to_js(
+                            e,
+                            last_complete_tip,
+                            sync_generation,
+                            1,
+                            total_keychains,
+                        ));
                     }
                 }
             } else {
@@ -2494,7 +2534,8 @@ impl ZincWasmWallet {
                 esplora_url,
                 observed_tip,
                 sync_generation,
-            );
+            )
+            .with_total_keychains(total_keychains);
             serde_wasm_bindgen::to_value(&receipt).map_err(|e| JsValue::from(e.to_string()))
         }))
     }
@@ -3021,7 +3062,7 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(ord_failure_to_js(e));
+                    return Err(ord_scan_failure_to_js(e, sync_generation));
                 }
             };
 
@@ -3047,10 +3088,18 @@ impl ZincWasmWallet {
                         );
                     }
                 }
-                return Err(JsValue::from_str(&format!(
-                    "Ord Indexer is lagging! Ord: {}, Wallet: {}. Safety lock engaged.",
-                    ord_height, wallet_height
-                )));
+                return Err(backend_scan_failure_to_js(
+                    BackendFailureV1::new(
+                        BackendDependencyV1::Ord,
+                        BackendOperationV1::BlockHeight,
+                        BackendFailureCategoryV1::Unavailable,
+                    )
+                    .with_upstream_code("index_lag"),
+                    None,
+                    sync_generation,
+                    0,
+                    1,
+                ));
             }
 
             // 2b. Restrict the bulk query to outpoints ord is guaranteed to have indexed:
@@ -3116,7 +3165,7 @@ impl ZincWasmWallet {
                             );
                         }
                     }
-                    return Err(ord_failure_to_js(e));
+                    return Err(ord_scan_failure_to_js(e, sync_generation));
                 }
             };
             let all_inscriptions = resolved.inscriptions;
