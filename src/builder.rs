@@ -966,6 +966,21 @@ impl esplora_client::Sleeper for TokioSleeper {
 #[cfg(not(target_arch = "wasm32"))]
 pub type SyncSleeper = TokioSleeper;
 
+/// Zinc owns operation-level retries and provider failover. Keep the Esplora
+/// client itself single-attempt so one logical attempt cannot silently expand
+/// into the crate default of seven HTTP requests.
+const ESPLORA_INTERNAL_MAX_RETRIES: usize = 0;
+const ESPLORA_REQUEST_TIMEOUT_SECS: u64 = 20;
+
+pub(crate) fn configured_esplora_client(
+    esplora_url: &str,
+) -> Result<esplora_client::AsyncClient<SyncSleeper>, esplora_client::Error> {
+    esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
+        .max_retries(ESPLORA_INTERNAL_MAX_RETRIES)
+        .timeout(ESPLORA_REQUEST_TIMEOUT_SECS)
+        .build_async_with_sleeper::<SyncSleeper>()
+}
+
 /// Return the current UNIX epoch seconds for the active target.
 pub fn now_unix() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -2458,8 +2473,7 @@ impl ZincWallet {
 
     /// Check whether the configured Esplora endpoint is reachable.
     pub async fn check_connection(esplora_url: &str) -> bool {
-        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
-            .build_async_with_sleeper::<SyncSleeper>();
+        let client = configured_esplora_client(esplora_url);
 
         match client {
             Ok(c) => c.get_height().await.is_ok(),
@@ -2499,6 +2513,15 @@ impl ZincWallet {
     /// incremental). Use for an explicit "rescan" to discover funds beyond the revealed frontier.
     pub fn request_full_rescan(&mut self) {
         self.force_next_full = true;
+    }
+
+    /// Retire every in-flight read generation without changing wallet identity
+    /// or descriptors. Legacy WASM fetches cannot always be physically aborted;
+    /// their apply step observes this generation change and fails stale instead.
+    pub fn retire_inflight_sync(&mut self) {
+        self.account_generation = self.account_generation.wrapping_add(1);
+        self.is_syncing = false;
+        self.sync_latch_started_at_ms = 0.0;
     }
 
     /// Apply taproot/payment updates and return merged event strings.
@@ -2605,14 +2628,12 @@ impl ZincWallet {
 
     /// Run a full sync against Esplora for taproot and optional payment wallets.
     pub async fn sync(&mut self, esplora_url: &str) -> Result<Vec<String>, String> {
-        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
-            .build_async_with_sleeper::<SyncSleeper>()
-            .map_err(|error| {
-                serialize_backend_failure(&BackendFailureV1::from_esplora(
-                    &error,
-                    BackendOperationV1::Connect,
-                ))
-            })?;
+        let client = configured_esplora_client(esplora_url).map_err(|error| {
+            serialize_backend_failure(&BackendFailureV1::from_esplora(
+                &error,
+                BackendOperationV1::Connect,
+            ))
+        })?;
 
         let now = wasm_now_secs();
         let vault_req = Self::flexible_full_scan_request(&self.vault_wallet, self.scan_policy, now);
@@ -7218,14 +7239,12 @@ impl ZincWallet {
             .map_err(|e| format!("Failed to extract tx: {e}"))?;
 
         // Broadcast via Esplora
-        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
-            .build_async_with_sleeper::<SyncSleeper>()
-            .map_err(|error| {
-                serialize_backend_failure(&BackendFailureV1::from_esplora(
-                    &error,
-                    BackendOperationV1::Connect,
-                ))
-            })?;
+        let client = configured_esplora_client(esplora_url).map_err(|error| {
+            serialize_backend_failure(&BackendFailureV1::from_esplora(
+                &error,
+                BackendOperationV1::Connect,
+            ))
+        })?;
 
         broadcast_esplora_transaction(&client, &tx)
             .await
@@ -8413,6 +8432,41 @@ mod tests {
 
         assert!(!wallet.is_syncing());
         assert_eq!(wallet.account_generation(), generation_before + 1);
+    }
+
+    #[test]
+    fn retiring_inflight_sync_invalidates_late_apply_and_releases_latch() {
+        use bdk_wallet::bitcoin::bip32::Xpriv;
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
+        let mut wallet = WalletBuilder::new(Network::Signet)
+            .kind(WalletKind::Seed { master_xprv })
+            .build()
+            .unwrap();
+
+        assert!(wallet.try_begin_sync(1_000.0));
+        let generation_before = wallet.account_generation();
+        wallet.retire_inflight_sync();
+
+        assert_eq!(wallet.account_generation(), generation_before + 1);
+        assert!(!wallet.is_syncing());
+        assert!(wallet.try_begin_sync(1_001.0));
+    }
+
+    #[tokio::test]
+    async fn configured_esplora_client_never_hides_http_retries() {
+        let mut server = mockito::Server::new_async().await;
+        let tip = server
+            .mock("GET", "/blocks/tip/height")
+            .with_status(503)
+            .with_body("not ready")
+            .expect(1)
+            .create_async()
+            .await;
+
+        assert!(!ZincWallet::check_connection(&server.url()).await);
+        tip.assert_async().await;
     }
 
     #[tokio::test]

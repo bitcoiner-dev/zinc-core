@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 - Treat an exact duplicate transaction broadcast as success and reconcile an
   ambiguous Esplora result by its locally computed txid before returning an
   error; reconciliation never issues a second broadcast.
+- Disable hidden Esplora HTTP retries, apply an explicit request timeout, and
+  expose generation retirement so hosts can safely discard late WASM scans.
 
 ## [0.12.0] - 2026-08-08
 
