@@ -37,6 +37,7 @@ mod logging;
 
 // Core modules
 pub mod backend_error;
+pub mod backend_receipt;
 pub mod builder;
 pub mod crypto;
 pub mod error;
@@ -75,6 +76,7 @@ pub use backend_error::{
     BackendDependencyV1, BackendFailureCategoryV1, BackendFailureV1, BackendOperationV1,
     MAX_RETRY_AFTER_MS,
 };
+pub use backend_receipt::{BackendCapabilityV1, BackendSyncReceiptV1, SyncCompletenessV1};
 pub use builder::{
     Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
     CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
@@ -2287,6 +2289,7 @@ impl ZincWasmWallet {
         use bdk_esplora::EsploraAsyncExt;
 
         let inner_rc = self.inner.clone();
+        let network = self.state_snapshot().network;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
@@ -2445,7 +2448,7 @@ impl ZincWasmWallet {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync: chain client returned");
 
             // 3. Apply (lock briefly)
-            let events = {
+            let (events, observed_tip) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.account_generation() != sync_generation {
@@ -2466,7 +2469,8 @@ impl ZincWasmWallet {
                             })?;
                         inner.is_syncing = false;
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: updates applied");
-                        res
+                        let observed_tip = inner.chain_tip_height();
+                        (res, observed_tip)
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "FAILED TO BORROW MUT INNER: {:?}", e);
@@ -2483,7 +2487,15 @@ impl ZincWasmWallet {
             };
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync: finished. events: {:?}", events);
 
-            serde_wasm_bindgen::to_value(&events).map_err(|e| JsValue::from(e.to_string()))
+            let receipt = BackendSyncReceiptV1::complete(
+                network,
+                BackendDependencyV1::Esplora,
+                BackendCapabilityV1::BaseChain,
+                esplora_url,
+                observed_tip,
+                sync_generation,
+            );
+            serde_wasm_bindgen::to_value(&receipt).map_err(|e| JsValue::from(e.to_string()))
         }))
     }
 
@@ -2943,6 +2955,7 @@ impl ZincWasmWallet {
     pub fn sync_ordinals(&self, ord_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         let inner_rc = self.inner.clone();
+        let network = self.state_snapshot().network;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
@@ -3012,7 +3025,7 @@ impl ZincWasmWallet {
                 }
             };
 
-            if ord_height < wallet_height.saturating_sub(1) {
+            if ord_height < wallet_height.saturating_sub(2) {
                 // We need to set verified=false safely
                 zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: Ord lagging, setting verified=false");
                 match inner_rc.try_borrow_mut() {
@@ -3120,7 +3133,7 @@ impl ZincWasmWallet {
 
             // 3. Apply Update (Borrow Mut)
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: applying update (borrow mut)");
-            let count = {
+            {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.account_generation() != sync_generation {
@@ -3151,7 +3164,15 @@ impl ZincWasmWallet {
                 }
             };
 
-            Ok(JsValue::from(count as u32))
+            let receipt = BackendSyncReceiptV1::complete(
+                network,
+                BackendDependencyV1::Ord,
+                BackendCapabilityV1::Ord,
+                ord_url,
+                ord_height,
+                sync_generation,
+            );
+            serde_wasm_bindgen::to_value(&receipt).map_err(|error| JsValue::from(error.to_string()))
         }))
     }
     // ========================================================================
