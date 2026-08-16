@@ -29,20 +29,20 @@ impl FromStr for Satpoint {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() < 3 {
-            return Err(OrdError::RequestFailed(format!(
+            return Err(OrdError::InvalidData(format!(
                 "Invalid satpoint format: {s}"
             )));
         }
 
         let txid = parts[0]
             .parse::<Txid>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid txid in satpoint: {e}")))?;
+            .map_err(|e| OrdError::InvalidData(format!("Invalid txid in satpoint: {e}")))?;
         let vout = parts[1]
             .parse::<u32>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid vout in satpoint: {e}")))?;
+            .map_err(|e| OrdError::InvalidData(format!("Invalid vout in satpoint: {e}")))?;
         let offset = parts[2]
             .parse::<u64>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid offset in satpoint: {e}")))?;
+            .map_err(|e| OrdError::InvalidData(format!("Invalid offset in satpoint: {e}")))?;
 
         Ok(Satpoint {
             outpoint: OutPoint { txid, vout },

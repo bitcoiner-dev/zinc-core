@@ -36,6 +36,7 @@ pub const MAX_DISCOVERY_ACCOUNTS: u32 = 100;
 mod logging;
 
 // Core modules
+pub mod backend_error;
 pub mod builder;
 pub mod crypto;
 pub mod error;
@@ -70,6 +71,10 @@ pub mod ordinals;
 pub mod sign_intent;
 
 // Re-exports for convenience
+pub use backend_error::{
+    BackendDependencyV1, BackendFailureCategoryV1, BackendFailureV1, BackendOperationV1,
+    MAX_RETRY_AFTER_MS,
+};
 pub use builder::{
     Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
     CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
@@ -148,6 +153,20 @@ pub use sign_intent::{
 // Re-export bitcoin types we use
 pub use bdk_wallet::bitcoin::Network;
 use bdk_wallet::KeychainKind;
+
+#[cfg(target_arch = "wasm32")]
+fn backend_failure_to_js(failure: &BackendFailureV1) -> JsValue {
+    serde_wasm_bindgen::to_value(failure)
+        .unwrap_or_else(|_| JsValue::from_str("ZINC_BACKEND_FAILURE_V1"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ord_failure_to_js(error: ordinals::OrdError) -> JsValue {
+    match error {
+        ordinals::OrdError::Backend(failure) => backend_failure_to_js(&failure),
+        other => JsValue::from_str(&other.to_string()),
+    }
+}
 
 // ============================================================================
 // Core Logic (Pure Rust)
@@ -2306,7 +2325,10 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(JsValue::from(format!("{:?}", e)));
+                    return Err(backend_failure_to_js(&BackendFailureV1::from_esplora(
+                        &e,
+                        BackendOperationV1::Connect,
+                    )));
                 }
             };
 
@@ -2320,14 +2342,20 @@ impl ZincWasmWallet {
                         .map(|u| u.into())
                         .map_err(|e| {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Vault full scan failed: {:?}", e);
-                            JsValue::from(e.to_string())
+                            backend_failure_to_js(&BackendFailureV1::from_esplora(
+                                &e,
+                                BackendOperationV1::Sync,
+                            ))
                         })
                 }
                 SyncRequestType::Incremental(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot incremental sync");
                     client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "Vault sync failed: {:?}", e);
-                        JsValue::from(e.to_string())
+                        backend_failure_to_js(&BackendFailureV1::from_esplora(
+                            &e,
+                            BackendOperationV1::Sync,
+                        ))
                     })
                 }
             };
@@ -2359,7 +2387,10 @@ impl ZincWasmWallet {
                                 .map(|u| u.into())
                                 .map_err(|e| {
                                     zinc_log_debug!(target: LOG_TARGET_WASM, "Payment full scan failed: {:?}", e);
-                                    JsValue::from(e.to_string())
+                                    backend_failure_to_js(&BackendFailureV1::from_esplora(
+                                        &e,
+                                        BackendOperationV1::Sync,
+                                    ))
                                 })
                     }
                     SyncRequestType::Incremental(req) => {
@@ -2369,7 +2400,10 @@ impl ZincWasmWallet {
                         );
                         client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                                 zinc_log_debug!(target: LOG_TARGET_WASM, "Payment sync failed: {:?}", e);
-                                JsValue::from(e.to_string())
+                                backend_failure_to_js(&BackendFailureV1::from_esplora(
+                                    &e,
+                                    BackendOperationV1::Sync,
+                                ))
                             })
                     }
                 };
@@ -2960,7 +2994,7 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(JsValue::from_str(&e.to_string()));
+                    return Err(ord_failure_to_js(e));
                 }
             };
 
@@ -3055,7 +3089,7 @@ impl ZincWasmWallet {
                             );
                         }
                     }
-                    return Err(JsValue::from_str(&e.to_string()));
+                    return Err(ord_failure_to_js(e));
                 }
             };
             let all_inscriptions = resolved.inscriptions;
@@ -4095,14 +4129,17 @@ impl ZincWasmWallet {
             // Broadcast via Esplora (no RefCell borrow needed)
             let client = esplora_client::Builder::new(&esplora_url)
                 .build_async_with_sleeper::<SyncSleeper>()
-                .map_err(|e| JsValue::from_str(&format!("Failed to create client: {e:?}")))?;
+                .map_err(|e| {
+                    backend_failure_to_js(&BackendFailureV1::from_esplora(
+                        &e,
+                        BackendOperationV1::Connect,
+                    ))
+                })?;
 
-            client
-                .broadcast(&tx)
+            crate::builder::broadcast_esplora_transaction(&client, &tx)
                 .await
-                .map_err(|e| JsValue::from_str(&format!("Broadcast failed: {e}")))?;
-
-            Ok(JsValue::from(tx.compute_txid().to_string()))
+                .map(|txid| JsValue::from(txid.to_string()))
+                .map_err(|failure| backend_failure_to_js(&failure))
         }))
     }
 }

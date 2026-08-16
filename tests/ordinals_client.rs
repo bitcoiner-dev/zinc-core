@@ -2,7 +2,22 @@
 #[cfg(not(target_arch = "wasm32"))] // mockito only works on native
 mod tests {
     use mockito::Server;
-    use zinc_core::ordinals::OrdClient;
+    use zinc_core::{
+        ordinals::{OrdClient, OrdError},
+        BackendFailureCategoryV1, BackendOperationV1,
+    };
+
+    fn assert_backend_failure(
+        error: OrdError,
+        operation: BackendOperationV1,
+        category: BackendFailureCategoryV1,
+    ) {
+        let OrdError::Backend(failure) = error else {
+            panic!("expected a typed backend failure, got {error:?}");
+        };
+        assert_eq!(failure.operation, operation);
+        assert_eq!(failure.category, category);
+    }
 
     #[tokio::test]
     async fn test_get_inscriptions() {
@@ -106,7 +121,11 @@ mod tests {
             .get_address_asset_snapshot(ADDR)
             .await
             .expect_err("500 must error");
-        assert!(err.to_string().contains("API Error (Address)"), "{err}");
+        assert_backend_failure(
+            err,
+            BackendOperationV1::AddressAssets,
+            BackendFailureCategoryV1::Unavailable,
+        );
     }
 
     #[tokio::test]
@@ -125,9 +144,10 @@ mod tests {
             .get_address_asset_snapshot(ADDR)
             .await
             .expect_err("malformed json must error");
-        assert!(
-            err.to_string().contains("Failed to parse Address JSON"),
-            "{err}"
+        assert_backend_failure(
+            err,
+            BackendOperationV1::AddressAssets,
+            BackendFailureCategoryV1::InvalidResponse,
         );
     }
 
@@ -145,7 +165,11 @@ mod tests {
             .get_inscription_details("abc123i0")
             .await
             .expect_err("404 details must error");
-        assert!(err.to_string().contains("API Error (Details"), "{err}");
+        assert_backend_failure(
+            err,
+            BackendOperationV1::InscriptionDetails,
+            BackendFailureCategoryV1::ProtocolRejected,
+        );
     }
 
     #[tokio::test]
@@ -186,7 +210,11 @@ mod tests {
             .get_inscription_content("abc123i0")
             .await
             .expect_err("500 content must error");
-        assert!(err.to_string().contains("API Error (Content"), "{err}");
+        assert_backend_failure(
+            err,
+            BackendOperationV1::InscriptionContent,
+            BackendFailureCategoryV1::Unavailable,
+        );
     }
 
     #[tokio::test]
@@ -219,7 +247,11 @@ mod tests {
             .get_indexing_height()
             .await
             .expect_err("non-numeric height must error");
-        assert!(err.to_string().contains("Invalid blockheight"), "{err}");
+        assert_backend_failure(
+            err,
+            BackendOperationV1::BlockHeight,
+            BackendFailureCategoryV1::InvalidResponse,
+        );
     }
 
     #[tokio::test]
@@ -230,7 +262,7 @@ mod tests {
             .submit_offer_psbt("   ")
             .await
             .expect_err("empty payload must error");
-        assert!(err.to_string().contains("cannot be empty"), "{err}");
+        assert!(matches!(err, OrdError::InvalidRequest));
     }
 
     #[tokio::test]
@@ -312,7 +344,11 @@ mod tests {
             .get_rune_info("NAMELESS")
             .await
             .expect_err("id-less rune info must fail");
-        assert!(err.to_string().contains("missing the rune id"), "{err}");
+        assert_backend_failure(
+            err,
+            BackendOperationV1::RuneInfo,
+            BackendFailureCategoryV1::InvalidResponse,
+        );
     }
 
     #[tokio::test]
@@ -397,7 +433,11 @@ mod tests {
             .resolve_assets_for_outpoints(&[outpoint.to_string()])
             .await
             .expect_err("unresolvable rune id must fail the sync");
-        assert!(err.to_string().contains("API Error (Rune"), "{err}");
+        assert_backend_failure(
+            err,
+            BackendOperationV1::RuneInfo,
+            BackendFailureCategoryV1::ProtocolRejected,
+        );
     }
 
     #[tokio::test]

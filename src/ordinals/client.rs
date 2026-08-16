@@ -1,3 +1,4 @@
+use crate::backend_error::{BackendDependencyV1, BackendFailureV1, BackendOperationV1};
 use crate::ordinals::error::OrdError;
 use crate::ordinals::types::{Inscription, RuneBalance, RuneInfo};
 use bitcoin::OutPoint;
@@ -5,6 +6,55 @@ use ordinals::{Epoch, Rarity, Sat};
 use reqwest::Client;
 use serde::{Deserialize, Deserializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+async fn send_ord_request(
+    request: reqwest::RequestBuilder,
+    operation: BackendOperationV1,
+) -> Result<reqwest::Response, OrdError> {
+    request.send().await.map_err(|error| {
+        BackendFailureV1::from_reqwest(&error, BackendDependencyV1::Ord, operation).into()
+    })
+}
+
+fn ensure_ord_success(
+    response: &reqwest::Response,
+    operation: BackendOperationV1,
+) -> Result<(), OrdError> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok());
+    Err(BackendFailureV1::from_http_status(
+        BackendDependencyV1::Ord,
+        operation,
+        response.status().as_u16(),
+        retry_after,
+    )
+    .into())
+}
+
+async fn parse_ord_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: BackendOperationV1,
+) -> Result<T, OrdError> {
+    response
+        .json::<T>()
+        .await
+        .map_err(|_| OrdError::invalid_response(operation))
+}
+
+async fn parse_ord_text(
+    response: reqwest::Response,
+    operation: BackendOperationV1,
+) -> Result<String, OrdError> {
+    response
+        .text()
+        .await
+        .map_err(|_| OrdError::invalid_response(operation))
+}
 
 #[derive(Clone, Debug)]
 /// Lightweight client for ord-compatible REST APIs.
@@ -194,16 +244,10 @@ impl OutputResponse {
         let address = self
             .address
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                OrdError::RequestFailed(format!(
-                    "Output {requested_outpoint} is missing required address field"
-                ))
-            })?;
-        let value = self.value.ok_or_else(|| {
-            OrdError::RequestFailed(format!(
-                "Output {requested_outpoint} is missing required value field"
-            ))
-        })?;
+            .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
+        let value = self
+            .value
+            .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
         let outpoint = self
             .outpoint
             .filter(|value| !value.trim().is_empty())
@@ -315,7 +359,7 @@ fn validate_sat_ranges(
             reason: "wallet-value-mismatch",
         });
     }
-    let ranges = ranges.ok_or_else(|| OrdError::RareSatProtectionUnverified {
+    let ranges = ranges.ok_or(OrdError::RareSatProtectionUnverified {
         reason: "sat-ranges-missing",
     })?;
     if trusted_value > 0 && ranges.is_empty() {
@@ -389,7 +433,7 @@ fn value_has_entries(value: &serde_json::Value) -> bool {
 
 fn parse_offers_payload(body: &str) -> Result<Vec<String>, OrdError> {
     let parsed: OffersResponse = serde_json::from_str(body)
-        .map_err(|e| OrdError::RequestFailed(format!("Failed to parse offers JSON: {e}")))?;
+        .map_err(|_| OrdError::invalid_response(BackendOperationV1::Offers))?;
 
     Ok(match parsed {
         OffersResponse::Wrapped { offers } | OffersResponse::Bare(offers) => offers,
@@ -601,13 +645,13 @@ impl OrdClient {
     ) -> Result<AddressAssetSnapshot, OrdError> {
         let url = format!("{}/address/{}", self.base_url, address);
 
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
+        let response = send_ord_request(
+            self.http_client
+                .get(&url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::AddressAssets,
+        )
+        .await?;
 
         if !response.status().is_success() {
             // 404 is fine, just empty
@@ -618,16 +662,11 @@ impl OrdClient {
                     rune_balances: Vec::new(),
                 });
             }
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Address): {}",
-                response.status()
-            )));
+            ensure_ord_success(&response, BackendOperationV1::AddressAssets)?;
         }
 
-        let data: AddressResponse = response
-            .json()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Failed to parse Address JSON: {e}")))?;
+        let data: AddressResponse =
+            parse_ord_json(response, BackendOperationV1::AddressAssets).await?;
 
         Ok(AddressAssetSnapshot {
             inscription_ids: data.inscriptions,
@@ -639,43 +678,26 @@ impl OrdClient {
     /// Fetch full inscription details for a single inscription id.
     pub async fn get_inscription_details(&self, id: &str) -> Result<Inscription, OrdError> {
         let details_url = format!("{}/inscription/{}", self.base_url, id);
-        let details_resp = self
-            .http_client
-            .get(&details_url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                OrdError::RequestFailed(format!("Failed to fetch details for {id}: {e}"))
-            })?;
-
-        if !details_resp.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Details {}): {}",
-                id,
-                details_resp.status()
-            )));
-        }
-
-        details_resp.json().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to parse Details JSON for {id}: {e}"))
-        })
+        let details_resp = send_ord_request(
+            self.http_client
+                .get(&details_url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::InscriptionDetails,
+        )
+        .await?;
+        ensure_ord_success(&details_resp, BackendOperationV1::InscriptionDetails)?;
+        parse_ord_json(details_resp, BackendOperationV1::InscriptionDetails).await
     }
 
     /// Fetch raw inscription content bytes for one inscription id.
     pub async fn get_inscription_content(&self, id: &str) -> Result<InscriptionContent, OrdError> {
         let url = format!("{}/content/{}", self.base_url, id);
-        let response = self.http_client.get(&url).send().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to fetch content for {id}: {e}"))
-        })?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Content {}): {}",
-                id,
-                response.status()
-            )));
-        }
+        let response = send_ord_request(
+            self.http_client.get(&url),
+            BackendOperationV1::InscriptionContent,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::InscriptionContent)?;
 
         let content_type = response
             .headers()
@@ -683,9 +705,10 @@ impl OrdClient {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let bytes = response.bytes().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to read content body for {id}: {e}"))
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| OrdError::invalid_response(BackendOperationV1::InscriptionContent))?;
 
         Ok(InscriptionContent {
             content_type,
@@ -752,35 +775,21 @@ impl OrdClient {
     /// ID-less metadata cannot be joined to runestone edicts.
     pub async fn get_rune_info(&self, id_or_name: &str) -> Result<RuneInfo, OrdError> {
         let url = format!("{}/rune/{}", self.base_url, id_or_name);
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Rune info request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Rune {id_or_name}): {}",
-                response.status()
-            )));
-        }
-
-        let parsed = response.json::<RuneInfoResponse>().await.map_err(|e| {
-            OrdError::RequestFailed(format!(
-                "Failed to parse rune info JSON for {id_or_name}: {e}"
-            ))
-        })?;
+        let response = send_ord_request(
+            self.http_client
+                .get(&url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::RuneInfo,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::RuneInfo)?;
+        let parsed: RuneInfoResponse =
+            parse_ord_json(response, BackendOperationV1::RuneInfo).await?;
 
         let id = parsed
             .id
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                OrdError::RequestFailed(format!(
-                    "Rune info for {id_or_name} is missing the rune id"
-                ))
-            })?;
+            .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::RuneInfo))?;
         let entry = parsed.entry;
         let spaced_rune = entry
             .as_ref()
@@ -812,26 +821,16 @@ impl OrdClient {
             return Ok(Vec::new());
         }
         let url = format!("{}/outputs", self.base_url);
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Accept", "application/json")
-            .json(outpoints)
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Bulk outputs request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Outputs bulk): {}",
-                response.status()
-            )));
-        }
-
-        response
-            .json::<Vec<OutputResponse>>()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Failed to parse Outputs bulk JSON: {e}")))
+        let response = send_ord_request(
+            self.http_client
+                .post(&url)
+                .header("Accept", "application/json")
+                .json(outpoints),
+            BackendOperationV1::Outputs,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::Outputs)?;
+        parse_ord_json(response, BackendOperationV1::Outputs).await
     }
 
     /// Resolve all ordinal assets for the given wallet outpoints in as few requests as possible:
@@ -904,9 +903,7 @@ impl OrdClient {
                         reason: "bulk-result-outpoint-missing",
                     });
                 }
-                return Err(OrdError::RequestFailed(format!(
-                    "Bulk outputs response missing {requested}; refusing partial ordinals state"
-                )));
+                return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
             }
         }
         if expected_values.is_some() {
@@ -916,15 +913,17 @@ impl OrdClient {
                 });
             }
             for entry in &entries {
-                let outpoint = entry.outpoint.as_deref().ok_or_else(|| {
-                    OrdError::RareSatProtectionUnverified {
-                        reason: "bulk-result-outpoint-missing",
-                    }
-                })?;
+                let outpoint =
+                    entry
+                        .outpoint
+                        .as_deref()
+                        .ok_or(OrdError::RareSatProtectionUnverified {
+                            reason: "bulk-result-outpoint-missing",
+                        })?;
                 let expected_value = expected_values
                     .and_then(|values| values.get(outpoint))
                     .copied()
-                    .ok_or_else(|| OrdError::RareSatProtectionUnverified {
+                    .ok_or(OrdError::RareSatProtectionUnverified {
                         reason: "bulk-result-outpoint-unexpected",
                     })?;
                 if entry.indexed != Some(true) {
@@ -971,11 +970,11 @@ impl OrdClient {
             if let (Some(values), Some(op), Some(outpoint_str)) =
                 (expected_values, outpoint, e.outpoint.as_deref())
             {
-                let expected_value = values.get(outpoint_str).copied().ok_or_else(|| {
+                let expected_value = values.get(outpoint_str).copied().ok_or(
                     OrdError::RareSatProtectionUnverified {
                         reason: "trusted-wallet-value-missing",
-                    }
-                })?;
+                    },
+                )?;
                 let summary = validate_sat_ranges(
                     outpoint_str,
                     e.sat_ranges.as_deref(),
@@ -993,10 +992,7 @@ impl OrdClient {
                 let mut held: Vec<(String, u128)> = Vec::new();
                 for balance in &entry_balances {
                     let Ok(amount) = balance.amount.parse::<u128>() else {
-                        return Err(OrdError::RequestFailed(format!(
-                            "Unparseable rune amount '{}' for {} on {op}; refusing partial rune state",
-                            balance.amount, balance.rune
-                        )));
+                        return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
                     };
                     held.push((balance.rune.clone(), amount));
                 }
@@ -1050,9 +1046,7 @@ impl OrdClient {
                         .map(|(_, id)| id.clone())
                 });
                 let Some(id) = id else {
-                    return Err(OrdError::RequestFailed(format!(
-                        "Could not resolve rune id for '{name}' on {op}; refusing partial rune state"
-                    )));
+                    return Err(OrdError::invalid_response(BackendOperationV1::RuneInfo));
                 };
                 resolved.push((id, amount));
             }
@@ -1113,9 +1107,10 @@ impl OrdClient {
                 continue;
             }
 
-            let outpoint = outpoint_str.as_str().parse::<OutPoint>().map_err(|e| {
-                OrdError::RequestFailed(format!("Invalid outpoint {outpoint_str}: {e}"))
-            })?;
+            let outpoint = outpoint_str
+                .as_str()
+                .parse::<OutPoint>()
+                .map_err(|_| OrdError::invalid_response(BackendOperationV1::Outputs))?;
             protected.insert(outpoint);
         }
 
@@ -1132,53 +1127,28 @@ impl OrdClient {
     /// Query ord server indexing height via `/blockheight`.
     pub async fn get_indexing_height(&self) -> Result<u32, OrdError> {
         let url = format!("{}/blockheight", self.base_url);
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "Status API Error: {}",
-                response.status()
-            )));
-        }
-
-        let text = response
-            .text()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
+        let response =
+            send_ord_request(self.http_client.get(&url), BackendOperationV1::BlockHeight).await?;
+        ensure_ord_success(&response, BackendOperationV1::BlockHeight)?;
+        let text = parse_ord_text(response, BackendOperationV1::BlockHeight).await?;
         text.trim()
             .parse::<u32>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid blockheight: {e}")))
+            .map_err(|_| OrdError::invalid_response(BackendOperationV1::BlockHeight))
     }
 
     /// Submit an offer PSBT to an ord-compatible `/offer` endpoint.
     pub async fn submit_offer_psbt(&self, psbt_base64: &str) -> Result<(), OrdError> {
         if psbt_base64.trim().is_empty() {
-            return Err(OrdError::RequestFailed(
-                "Offer PSBT payload cannot be empty".to_string(),
-            ));
+            return Err(OrdError::InvalidRequest);
         }
 
         let url = format!("{}/offer", self.base_url);
-        let response = self
-            .http_client
-            .post(&url)
-            .body(psbt_base64.to_string())
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(OrdError::RequestFailed(format!(
-                "Offer submission failed: {status} {text}"
-            )));
-        }
+        let response = send_ord_request(
+            self.http_client.post(&url).body(psbt_base64.to_string()),
+            BackendOperationV1::Offers,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::Offers)?;
 
         Ok(())
     }
@@ -1186,54 +1156,30 @@ impl OrdClient {
     /// Fetch submitted offer PSBTs from an ord-compatible `/offers` endpoint.
     pub async fn get_offer_psbts(&self) -> Result<Vec<String>, OrdError> {
         let url = format!("{}/offers", self.base_url);
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "Offers API Error: {}",
-                response.status()
-            )));
-        }
-
-        let text = response
-            .text()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Failed to read offers body: {e}")))?;
+        let response = send_ord_request(
+            self.http_client
+                .get(&url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::Offers,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::Offers)?;
+        let text = parse_ord_text(response, BackendOperationV1::Offers).await?;
 
         parse_offers_payload(&text)
     }
 
     async fn get_output_response(&self, outpoint: &str) -> Result<OutputResponse, OrdError> {
         let details_url = format!("{}/output/{}", self.base_url, outpoint);
-        let details_resp = self
-            .http_client
-            .get(&details_url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                OrdError::RequestFailed(format!(
-                    "Failed to fetch output details for {outpoint}: {e}"
-                ))
-            })?;
-
-        if !details_resp.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Output {}): {}",
-                outpoint,
-                details_resp.status()
-            )));
-        }
-
-        details_resp.json().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to parse Output JSON for {outpoint}: {e}"))
-        })
+        let details_resp = send_ord_request(
+            self.http_client
+                .get(&details_url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::Outputs,
+        )
+        .await?;
+        ensure_ord_success(&details_resp, BackendOperationV1::Outputs)?;
+        parse_ord_json(details_resp, BackendOperationV1::Outputs).await
     }
 }
 
@@ -1245,6 +1191,7 @@ mod tests {
         classify_rare_sats, parse_offers_payload, parse_runes_balances_value, validate_sat_ranges,
         OrdClient, OrdError, OutputResponse,
     };
+    use crate::backend_error::{BackendFailureCategoryV1, BackendOperationV1};
 
     #[tokio::test]
     async fn address_404_is_characterized_as_an_empty_asset_snapshot() {
@@ -1268,7 +1215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ord_rate_limit_is_one_request_and_loses_response_headers() {
+    async fn ord_rate_limit_preserves_status_and_bounded_retry_after() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/blockheight")
@@ -1283,9 +1230,13 @@ mod tests {
             .await
             .expect_err("429 must fail");
 
-        // The current public type collapses both the status and Retry-After
-        // header into an opaque string. Phase 1 replaces this coarse category.
-        assert!(matches!(error, OrdError::RequestFailed(_)));
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::RateLimited);
+        assert_eq!(failure.operation, BackendOperationV1::BlockHeight);
+        assert_eq!(failure.upstream_status, Some(429));
+        assert_eq!(failure.retry_after_ms, Some(90_000));
         mock.assert_async().await;
     }
 
@@ -1304,12 +1255,16 @@ mod tests {
             .await
             .expect_err("503 must fail");
 
-        assert!(matches!(error, OrdError::RequestFailed(_)));
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::Unavailable);
+        assert_eq!(failure.upstream_status, Some(503));
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn malformed_blockheight_is_a_string_only_request_failure() {
+    async fn malformed_blockheight_is_typed_invalid_response() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/blockheight")
@@ -1324,12 +1279,15 @@ mod tests {
             .await
             .expect_err("invalid height must fail");
 
-        assert!(matches!(error, OrdError::RequestFailed(_)));
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn malformed_address_json_is_a_string_only_request_failure() {
+    async fn malformed_address_json_is_typed_invalid_response() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/address/bc1ptest")
@@ -1344,7 +1302,10 @@ mod tests {
             .await
             .expect_err("malformed JSON must fail");
 
-        assert!(matches!(error, OrdError::RequestFailed(_)));
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
         mock.assert_async().await;
     }
 
@@ -1365,12 +1326,15 @@ mod tests {
             .await
             .expect_err("missing requested output must fail closed");
 
-        assert!(matches!(error, OrdError::RequestFailed(_)));
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn ord_transport_failure_is_string_only() {
+    async fn ord_transport_failure_is_typed_offline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral listener");
         let address = listener.local_addr().expect("listener address");
         drop(listener);
@@ -1381,7 +1345,10 @@ mod tests {
             .await
             .expect_err("closed server must fail");
 
-        assert!(matches!(error, OrdError::RequestFailed(_)));
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::Offline);
     }
 
     #[test]
@@ -1432,7 +1399,7 @@ mod tests {
             assert_eq!(error.to_string(), "ORD_RARE_SAT_PROTECTION_UNVERIFIED");
             match error {
                 OrdError::RareSatProtectionUnverified { reason } => {
-                    assert_eq!(reason, expected_reason)
+                    assert_eq!(reason, expected_reason);
                 }
                 other => panic!("unexpected error: {other:?}"),
             }
@@ -1475,7 +1442,11 @@ mod tests {
     #[test]
     fn offers_payload_rejects_non_string_entries() {
         let err = parse_offers_payload(r#"{"offers":["ok", 1]}"#).expect_err("must fail");
-        assert!(err.to_string().contains("Failed to parse offers JSON"));
+        let OrdError::Backend(failure) = err else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
+        assert_eq!(failure.operation, BackendOperationV1::Offers);
     }
 
     #[test]
@@ -1517,7 +1488,11 @@ mod tests {
                 "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0",
             )
             .expect_err("must fail");
-        assert!(err.to_string().contains("missing required address field"));
+        let OrdError::Backend(failure) = err else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
+        assert_eq!(failure.operation, BackendOperationV1::Outputs);
     }
 
     #[test]
