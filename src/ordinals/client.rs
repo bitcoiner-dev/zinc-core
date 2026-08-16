@@ -1246,6 +1246,144 @@ mod tests {
         OrdClient, OrdError, OutputResponse,
     };
 
+    #[tokio::test]
+    async fn address_404_is_characterized_as_an_empty_asset_snapshot() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/address/bc1ptest")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let snapshot = OrdClient::new(server.url())
+            .get_address_asset_snapshot("bc1ptest")
+            .await
+            .expect("address 404 is currently treated as empty");
+
+        assert!(snapshot.inscription_ids.is_empty());
+        assert!(snapshot.outputs.is_empty());
+        assert!(snapshot.rune_balances.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ord_rate_limit_is_one_request_and_loses_response_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blockheight")
+            .with_status(429)
+            .with_header("retry-after", "90")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_indexing_height()
+            .await
+            .expect_err("429 must fail");
+
+        // The current public type collapses both the status and Retry-After
+        // header into an opaque string. Phase 1 replaces this coarse category.
+        assert!(matches!(error, OrdError::RequestFailed(_)));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ord_service_unavailable_is_not_retried_by_the_client() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blockheight")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_indexing_height()
+            .await
+            .expect_err("503 must fail");
+
+        assert!(matches!(error, OrdError::RequestFailed(_)));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_blockheight_is_a_string_only_request_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blockheight")
+            .with_status(200)
+            .with_body("not-a-height")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_indexing_height()
+            .await
+            .expect_err("invalid height must fail");
+
+        assert!(matches!(error, OrdError::RequestFailed(_)));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_address_json_is_a_string_only_request_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/address/bc1ptest")
+            .with_status(200)
+            .with_body("not-json")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_address_asset_snapshot("bc1ptest")
+            .await
+            .expect_err("malformed JSON must fail");
+
+        assert!(matches!(error, OrdError::RequestFailed(_)));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_bulk_outputs_fail_closed() {
+        let outpoint = "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0";
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/outputs")
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .resolve_assets_for_outpoints(&[outpoint.to_string()])
+            .await
+            .expect_err("missing requested output must fail closed");
+
+        assert!(matches!(error, OrdError::RequestFailed(_)));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ord_transport_failure_is_string_only() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        drop(listener);
+        let base_url = format!("http://{address}");
+
+        let error = OrdClient::new(base_url)
+            .get_indexing_height()
+            .await
+            .expect_err("closed server must fail");
+
+        assert!(matches!(error, OrdError::RequestFailed(_)));
+    }
+
     #[test]
     fn classifies_non_common_sats_without_scanning_the_range() {
         let uncommon = classify_rare_sats(&[(5_000_000_000, 10_000_000_000)])
