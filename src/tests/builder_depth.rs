@@ -102,6 +102,45 @@ mod tests {
     }
 
     #[test]
+    fn apply_sync_preflights_both_keychains_before_mutating_either() {
+        let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([1u8; 64]))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .expect("dual wallet");
+        wallet.mark_current_wallet_outpoints_classified_for_test();
+        let generation_before = wallet.chain_state_generation;
+        let vault_tip_before = wallet.vault_wallet.latest_checkpoint().height();
+
+        let vault_update = bdk_wallet::Update {
+            chain: Some(wallet.vault_wallet.latest_checkpoint().insert(BlockId {
+                height: 1,
+                hash: BlockHash::all_zeros(),
+            })),
+            ..Default::default()
+        };
+        let disconnected_payment_update = bdk_wallet::Update {
+            chain: Some(bdk_wallet::chain::CheckPoint::new(BlockId {
+                height: 99,
+                hash: BlockHash::all_zeros(),
+            })),
+            ..Default::default()
+        };
+
+        let error = wallet
+            .apply_sync(vault_update, Some(disconnected_payment_update))
+            .expect_err("disconnected payment update must fail preflight");
+
+        assert!(!error.is_empty());
+        assert_eq!(
+            wallet.vault_wallet.latest_checkpoint().height(),
+            vault_tip_before
+        );
+        assert_eq!(wallet.chain_state_generation, generation_before);
+        assert!(wallet.ordinals_verified);
+        assert!(wallet.ordinals_metadata_complete);
+    }
+
+    #[test]
     fn reset_sync_state_restores_primary_reveal() {
         let mut w = unified();
         w.reset_sync_state().expect("reset succeeds");
