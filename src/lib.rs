@@ -67,14 +67,15 @@ pub mod sign_intent;
 pub use builder::{
     Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
     CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
-    ConstructedTransactionIntent, ConstructedTransactionIntentRequest, CpfpIntentDetails,
-    CpfpIntentRequest, CreatePsbtRequest, CreatePsbtTransportRequest, CreateRuneTransferRequest,
-    DerivationMode, DiscoveryAccountPlan, DiscoveryContext, ExactTransactionOutput,
-    ExactTransactionTemplate, InscriptionTransferIntentDetails, InscriptionTransferIntentRequest,
-    PaymentAddressType, ProfileMode, RuneTransferIntent, RuneTransferResult, ScanPolicy, Seed64,
-    SignOptions, SmartSendWithSalvageIntentDetails, SmartSendWithSalvageIntentRequest,
-    SyncRequestType, SyncSleeper, WalletBuilder, WalletKind, ZincBalance, ZincPersistence,
-    ZincSyncRequest, ZincWallet,
+    CompanionPublicAccountExport, ConstructedTransactionIntent,
+    ConstructedTransactionIntentRequest, CpfpIntentDetails, CpfpIntentRequest, CreatePsbtRequest,
+    CreatePsbtTransportRequest, CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan,
+    DiscoveryContext, ExactTransactionOutput, ExactTransactionTemplate,
+    InscriptionTransferIntentDetails, InscriptionTransferIntentRequest, PaymentAddressType,
+    ProfileMode, RuneTransferIntent, RuneTransferResult, ScanPolicy, Seed64, SignOptions,
+    SmartSendWithSalvageIntentDetails, SmartSendWithSalvageIntentRequest, SyncRequestType,
+    SyncSleeper, WalletBuilder, WalletKind, ZincBalance, ZincPersistence, ZincSyncRequest,
+    ZincWallet,
 };
 pub use error::{ZincError, ZincResult};
 pub use external_signing::{
