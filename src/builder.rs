@@ -1772,6 +1772,12 @@ impl ZincWallet {
         self.account_index
     }
 
+    /// Return the Bitcoin network bound to this wallet instance.
+    #[must_use]
+    pub fn network(&self) -> Network {
+        self.vault_wallet.network()
+    }
+
     /// Return whether a sync operation is currently in progress.
     #[must_use]
     pub fn is_syncing(&self) -> bool {
