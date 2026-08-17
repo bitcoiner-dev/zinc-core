@@ -26,6 +26,12 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use wasm_bindgen::prelude::*;
 
+/// Maximum logical accounts a first-party host may discover in one bounded scan.
+///
+/// Companion public export is compile-time coupled to this ceiling so account
+/// discovery and Mobile selection cannot silently diverge.
+pub const MAX_DISCOVERY_ACCOUNTS: u32 = 100;
+
 #[macro_use]
 mod logging;
 
@@ -2428,7 +2434,6 @@ impl ZincWasmWallet {
         let payment_address_type = state.payment_address_type;
         const MAX_ACCOUNT_GAP_LIMIT: u32 = 100;
         const MAX_ADDRESS_SCAN_DEPTH: u32 = 200;
-        const MAX_DISCOVERY_ACCOUNTS: u32 = 100;
         let account_gap_limit = account_gap_limit.clamp(1, MAX_ACCOUNT_GAP_LIMIT);
         let requested_address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
         let address_scan_depth = requested_address_scan_depth;
