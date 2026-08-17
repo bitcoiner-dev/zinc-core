@@ -634,10 +634,10 @@ pub struct CompanionPublicAccountExport {
     taproot_external_descriptor: String,
     /// Checksummed BIP-86 internal descriptor.
     taproot_internal_descriptor: String,
-    /// Checksummed BIP-84 external descriptor for dual wallets.
-    payment_external_descriptor: Option<String>,
-    /// Checksummed BIP-84 internal descriptor for dual wallets.
-    payment_internal_descriptor: Option<String>,
+    /// Mandatory checksummed BIP-84 external descriptor.
+    payment_external_descriptor: String,
+    /// Mandatory checksummed BIP-84 internal descriptor.
+    payment_internal_descriptor: String,
     /// Full addresses independently derived from the four descriptors, in slot order.
     verification_addresses: Vec<String>,
 }
@@ -667,16 +667,16 @@ impl CompanionPublicAccountExport {
         &self.taproot_internal_descriptor
     }
 
-    /// Checksummed BIP-84 external descriptor for dual wallets.
+    /// Mandatory checksummed BIP-84 external descriptor.
     #[must_use]
-    pub fn payment_external_descriptor(&self) -> Option<&str> {
-        self.payment_external_descriptor.as_deref()
+    pub fn payment_external_descriptor(&self) -> &str {
+        &self.payment_external_descriptor
     }
 
-    /// Checksummed BIP-84 internal descriptor for dual wallets.
+    /// Mandatory checksummed BIP-84 internal descriptor.
     #[must_use]
-    pub fn payment_internal_descriptor(&self) -> Option<&str> {
-        self.payment_internal_descriptor.as_deref()
+    pub fn payment_internal_descriptor(&self) -> &str {
+        &self.payment_internal_descriptor
     }
 
     /// Full addresses independently derived from descriptors, in slot order.
@@ -1402,9 +1402,8 @@ impl ZincWallet {
         if layout.payment.is_some_and(|branch| {
             branch.purpose != 84 || branch.script != crate::layout::ScriptKind::Wpkh
         }) {
-            return Err("Companion export supports only optional BIP-84 payments".to_string());
+            return Err("Companion export supports only BIP-84 payments".to_string());
         }
-
         let network = self.vault_wallet.network();
         let coin_type = u32::from(network != Network::Bitcoin);
         let (derivation_account, fixed_index) = layout.account_and_index(logical_account);
@@ -1450,13 +1449,11 @@ impl ZincWallet {
         };
         let taproot_external = descriptor(86, crate::layout::ScriptKind::Tr, 0)?;
         let taproot_internal = descriptor(86, crate::layout::ScriptKind::Tr, 1)?;
-        let (payment_external, payment_internal) = match layout.payment {
-            Some(branch) => (
-                Some(descriptor(branch.purpose, branch.script, 0)?),
-                Some(descriptor(branch.purpose, branch.script, 1)?),
-            ),
-            None => (None, None),
-        };
+        // Companion v1 always exports the BIP-84 payment pair alongside BIP-86,
+        // even when the source profile currently presents a unified Taproot UI.
+        // The descriptors are recomputed from the seed, never accepted from the layout.
+        let payment_external = descriptor(84, crate::layout::ScriptKind::Wpkh, 0)?;
+        let payment_internal = descriptor(84, crate::layout::ScriptKind::Wpkh, 1)?;
         let verify = |text: &str| -> Result<String, String> {
             let descriptor = Descriptor::<DescriptorPublicKey>::from_str(text)
                 .map_err(|_| "Companion descriptor failed to parse".to_string())?;
@@ -1469,12 +1466,12 @@ impl ZincWallet {
                 .map_err(|_| "Companion descriptor address failed".to_string())
                 .map(|address| address.to_string())
         };
-        let mut verification_addresses =
-            vec![verify(&taproot_external)?, verify(&taproot_internal)?];
-        if let (Some(external), Some(internal)) = (&payment_external, &payment_internal) {
-            verification_addresses.push(verify(external)?);
-            verification_addresses.push(verify(internal)?);
-        }
+        let verification_addresses = vec![
+            verify(&taproot_external)?,
+            verify(&taproot_internal)?,
+            verify(&payment_external)?,
+            verify(&payment_internal)?,
+        ];
         let secp = bitcoin::secp256k1::Secp256k1::new();
         Ok(CompanionPublicAccountExport {
             account_index: logical_account,

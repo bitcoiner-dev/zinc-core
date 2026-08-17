@@ -28,11 +28,11 @@ fn account_mode_recomputes_only_approved_public_material() {
         .contains("[73c5da0a/86'/1'/2']"));
     assert!(exported.taproot_external_descriptor().contains("/0/*"));
     assert!(exported.taproot_internal_descriptor().contains("/1/*"));
+    assert!(exported.payment_external_descriptor().starts_with("wpkh("));
     assert!(exported
         .payment_external_descriptor()
-        .is_some_and(|descriptor| descriptor.starts_with("wpkh(")
-            && descriptor.contains("[73c5da0a/84'/1'/2']")
-            && descriptor.contains("/0/*")));
+        .contains("[73c5da0a/84'/1'/2']"));
+    assert!(exported.payment_external_descriptor().contains("/0/*"));
     assert_eq!(exported.verification_addresses().len(), 4);
     assert!(exported
         .verification_addresses()
@@ -41,7 +41,7 @@ fn account_mode_recomputes_only_approved_public_material() {
 }
 
 #[test]
-fn index_mode_fixes_the_mobile_selected_logical_index() {
+fn index_mode_fixes_both_formats_at_the_mobile_selected_logical_index() {
     let wallet = WalletBuilder::from_mnemonic(bitcoin::Network::Regtest, &mnemonic())
         .with_scheme(AddressScheme::Unified)
         .with_derivation_mode(DerivationMode::Index)
@@ -57,8 +57,12 @@ fn index_mode_fixes_the_mobile_selected_logical_index() {
         .contains("[73c5da0a/86'/1'/0']"));
     assert!(exported.taproot_external_descriptor().contains("/0/5"));
     assert!(!exported.taproot_external_descriptor().contains('*'));
-    assert!(exported.payment_external_descriptor().is_none());
-    assert_eq!(exported.verification_addresses().len(), 2);
+    assert!(exported
+        .payment_external_descriptor()
+        .contains("[73c5da0a/84'/1'/0']"));
+    assert!(exported.payment_external_descriptor().contains("/0/5"));
+    assert!(!exported.payment_external_descriptor().contains('*'));
+    assert_eq!(exported.verification_addresses().len(), 4);
 }
 
 #[test]
