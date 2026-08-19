@@ -73,7 +73,8 @@ pub mod sign_intent;
 pub use builder::{
     Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
     CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
-    CompanionPublicAccountExport, ConstructedTransactionIntent,
+    CompanionPublicAccountExport, CompanionRoutineChangeFact, CompanionRoutineDescriptorSlot,
+    CompanionRoutineInputFact, CompanionRoutineWalletSnapshot, ConstructedTransactionIntent,
     ConstructedTransactionIntentRequest, CpfpIntentDetails, CpfpIntentRequest, CreatePsbtRequest,
     CreatePsbtTransportRequest, CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan,
     DiscoveryContext, ExactTransactionOutput, ExactTransactionTemplate,
@@ -81,7 +82,7 @@ pub use builder::{
     ProfileMode, RuneTransferIntent, RuneTransferResult, ScanPolicy, Seed64, SignOptions,
     SmartSendWithSalvageIntentDetails, SmartSendWithSalvageIntentRequest, SyncRequestType,
     SyncSleeper, WalletBuilder, WalletKind, ZincBalance, ZincPersistence, ZincSyncRequest,
-    ZincWallet,
+    ZincWallet, ABSURD_FEE_RATE_SAT_VB, ABSURD_FEE_SATS, MAX_COMPANION_ROUTINE_FACT_AGE_SECONDS,
 };
 pub use error::{ZincError, ZincResult};
 pub use external_signing::{
