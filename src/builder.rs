@@ -789,6 +789,7 @@ impl CompanionRoutineChangeFact {
 ///         chain_state_generation: 0,
 ///         inputs: vec![],
 ///         change_outputs: vec![],
+///         protected_preview_ids: vec![],
 ///     }
 /// }
 /// ```
@@ -798,6 +799,7 @@ pub struct CompanionRoutineWalletSnapshot {
     chain_state_generation: u64,
     inputs: Vec<CompanionRoutineInputFact>,
     change_outputs: Vec<CompanionRoutineChangeFact>,
+    protected_preview_ids: Vec<String>,
 }
 
 impl CompanionRoutineWalletSnapshot {
@@ -830,11 +832,20 @@ impl CompanionRoutineWalletSnapshot {
     pub fn change_outputs(&self) -> &[CompanionRoutineChangeFact] {
         &self.change_outputs
     }
+
+    /// Canonical IDs for up to three protected inscriptions which the exact
+    /// transaction does not spend. The list is sorted and comes only from the
+    /// phone's coherent Ordinals snapshot for this active account.
+    #[must_use]
+    pub fn protected_preview_ids(&self) -> &[String] {
+        &self.protected_preview_ids
+    }
 }
 
 impl Drop for CompanionRoutineWalletSnapshot {
     fn drop(&mut self) {
         self.tip_hash.zeroize();
+        self.protected_preview_ids.zeroize();
     }
 }
 
@@ -1782,12 +1793,37 @@ impl ZincWallet {
         if tip.height() == 0 || tip.hash() == bitcoin::BlockHash::all_zeros() {
             return Err("Companion routine chain tip is unavailable".to_string());
         }
+        let canonical_inscription_id = |value: &str| {
+            let bytes = value.as_bytes();
+            (66..=80).contains(&bytes.len())
+                && bytes[..64]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+                && bytes[64] == b'i'
+                && !bytes[65..].is_empty()
+                && bytes[65..].iter().all(u8::is_ascii_digit)
+                && (bytes.len() == 66 || bytes[65] != b'0')
+        };
+        let mut protected_preview_ids: Vec<String> = self
+            .inscriptions
+            .iter()
+            .filter(|inscription| {
+                self.inscribed_utxos
+                    .contains(&inscription.satpoint.outpoint)
+                    && canonical_inscription_id(&inscription.id)
+            })
+            .map(|inscription| inscription.id.clone())
+            .collect();
+        protected_preview_ids.sort();
+        protected_preview_ids.dedup();
+        protected_preview_ids.truncate(3);
         Ok(CompanionRoutineWalletSnapshot {
             observed_at_unix: chain_observed_at.min(ordinals_observed_at),
             tip_hash: tip.hash().to_byte_array(),
             chain_state_generation: self.chain_state_generation,
             inputs,
             change_outputs,
+            protected_preview_ids,
         })
     }
 
