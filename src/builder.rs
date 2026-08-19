@@ -302,6 +302,8 @@ pub const ABSURD_FEE_SATS: u64 = 1_000_000;
 pub const ABSURD_FEE_RATE_SAT_VB: u64 = 5_000;
 /// Absolute ceiling used only when a signed size cannot be estimated.
 pub const ABSURD_UNESTIMATED_FEE_SATS: u64 = 10_000_000;
+/// Maximum age of the chain and Ordinals observations used for Companion review.
+pub const MAX_COMPANION_ROUTINE_FACT_AGE_SECONDS: u64 = 120;
 
 /// Typed request for PSBT creation in native Rust flows.
 #[derive(Debug, Clone)]
@@ -697,6 +699,145 @@ impl Drop for CompanionPublicAccountExport {
     }
 }
 
+/// Descriptor branch proven by the unlocked wallet for one Companion fact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CompanionRoutineDescriptorSlot {
+    /// BIP-86 external/receive branch.
+    TaprootExternal,
+    /// BIP-86 internal/change branch.
+    TaprootInternal,
+    /// BIP-84 external/receive branch.
+    PaymentExternal,
+    /// BIP-84 internal/change branch.
+    PaymentInternal,
+}
+
+/// One clean, currently unspent input proven by the unlocked seed wallet.
+pub struct CompanionRoutineInputFact {
+    outpoint: bitcoin::OutPoint,
+    txout: bitcoin::TxOut,
+    slot: CompanionRoutineDescriptorSlot,
+    derivation_index: u32,
+}
+
+impl CompanionRoutineInputFact {
+    /// Exact outpoint requested by the canonical PSBT.
+    #[must_use]
+    pub const fn outpoint(&self) -> bitcoin::OutPoint {
+        self.outpoint
+    }
+
+    /// Exact wallet-owned output from the current BDK UTXO set.
+    #[must_use]
+    pub const fn txout(&self) -> &bitcoin::TxOut {
+        &self.txout
+    }
+
+    /// Seed-derived descriptor branch that owns the output.
+    #[must_use]
+    pub const fn slot(&self) -> CompanionRoutineDescriptorSlot {
+        self.slot
+    }
+
+    /// Logical descriptor index used by the Companion public bundle.
+    #[must_use]
+    pub const fn derivation_index(&self) -> u32 {
+        self.derivation_index
+    }
+}
+
+/// One wallet-owned internal output proven directly from the exact PSBT.
+pub struct CompanionRoutineChangeFact {
+    vout: u32,
+    slot: CompanionRoutineDescriptorSlot,
+    derivation_index: u32,
+}
+
+impl CompanionRoutineChangeFact {
+    /// Exact transaction output index.
+    #[must_use]
+    pub const fn vout(&self) -> u32 {
+        self.vout
+    }
+
+    /// Seed-derived internal descriptor branch that owns the output.
+    #[must_use]
+    pub const fn slot(&self) -> CompanionRoutineDescriptorSlot {
+        self.slot
+    }
+
+    /// Logical descriptor index used by the Companion public bundle.
+    #[must_use]
+    pub const fn derivation_index(&self) -> u32 {
+        self.derivation_index
+    }
+}
+
+/// Coherent phone-wallet facts for one exact routine PSBT.
+///
+/// This type has no public constructor and cannot be cloned, debugged, or
+/// serialized. It is minted only after the unlocked seed wallet proves the
+/// active account, fresh matching chain/Ordinals generations, clean inputs,
+/// and descriptor-owned internal outputs.
+///
+/// ```compile_fail
+/// use zinc_core::CompanionRoutineWalletSnapshot;
+/// fn fabricate() -> CompanionRoutineWalletSnapshot {
+///     CompanionRoutineWalletSnapshot {
+///         observed_at_unix: 0,
+///         tip_hash: [0; 32],
+///         chain_state_generation: 0,
+///         inputs: vec![],
+///         change_outputs: vec![],
+///     }
+/// }
+/// ```
+pub struct CompanionRoutineWalletSnapshot {
+    observed_at_unix: u64,
+    tip_hash: [u8; 32],
+    chain_state_generation: u64,
+    inputs: Vec<CompanionRoutineInputFact>,
+    change_outputs: Vec<CompanionRoutineChangeFact>,
+}
+
+impl CompanionRoutineWalletSnapshot {
+    /// Oldest authoritative observation used by this coherent snapshot.
+    #[must_use]
+    pub const fn observed_at_unix(&self) -> u64 {
+        self.observed_at_unix
+    }
+
+    /// Current wallet-chain tip bound to the snapshot.
+    #[must_use]
+    pub const fn tip_hash(&self) -> &[u8; 32] {
+        &self.tip_hash
+    }
+
+    /// Exact BDK generation classified by the Ordinals result.
+    #[must_use]
+    pub const fn chain_state_generation(&self) -> u64 {
+        self.chain_state_generation
+    }
+
+    /// Clean input facts in exact PSBT input order.
+    #[must_use]
+    pub fn inputs(&self) -> &[CompanionRoutineInputFact] {
+        &self.inputs
+    }
+
+    /// Wallet-owned internal outputs in transaction order.
+    #[must_use]
+    pub fn change_outputs(&self) -> &[CompanionRoutineChangeFact] {
+        &self.change_outputs
+    }
+}
+
+impl Drop for CompanionRoutineWalletSnapshot {
+    fn drop(&mut self) {
+        self.tip_hash.zeroize();
+    }
+}
+
 /// Operational mode for the profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1011,8 +1152,12 @@ pub struct ZincWallet {
     pub(crate) ordinals_metadata_complete: bool,
     /// Monotonic generation of the BDK chain/UTXO state.
     pub(crate) chain_state_generation: u64,
+    /// Wall-clock receipt time of the last successfully applied chain update.
+    pub(crate) chain_observed_at_unix: Option<u64>,
     /// Chain generation for which the current asset classification was produced.
     pub(crate) ordinals_verified_generation: Option<u64>,
+    /// Wall-clock receipt time of the matching verified Ordinals update.
+    pub(crate) ordinals_observed_at_unix: Option<u64>,
     /// Wallet outpoints explicitly covered by the verified Ord response.
     pub(crate) classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
     /// Cryptographic identity of this wallet (Seed or Hardware).
@@ -1484,6 +1629,168 @@ impl ZincWallet {
         })
     }
 
+    /// Prove fresh phone-authoritative wallet facts for one exact routine PSBT.
+    ///
+    /// The caller supplies no prevout value, ownership path, asset state, or
+    /// change classification. Those facts come only from this unlocked seed
+    /// wallet's current BDK UTXO set and the verified Ordinals result for the
+    /// same chain generation. The snapshot becomes unavailable after 120
+    /// seconds, during sync, or whenever either state source is incomplete.
+    pub fn companion_routine_wallet_snapshot(
+        &self,
+        logical_account: u32,
+        psbt_bytes: &[u8],
+    ) -> Result<CompanionRoutineWalletSnapshot, String> {
+        const MAX_PSBT_BYTES: usize = 256 * 1024;
+        if logical_account != self.account_index || logical_account >= crate::MAX_DISCOVERY_ACCOUNTS
+        {
+            return Err("Companion routine account does not match the active wallet".to_string());
+        }
+        if !matches!(&self.kind, WalletKind::Seed { .. }) || self.signing_layout.is_none() {
+            return Err("Companion routine facts require an unlocked seed wallet".to_string());
+        }
+        if self.is_syncing || !self.asset_state_is_current() {
+            return Err("Companion routine wallet facts are unavailable or stale".to_string());
+        }
+        let now_unix = wasm_now_secs();
+        let chain_observed_at = self
+            .chain_observed_at_unix
+            .ok_or_else(|| "Companion chain facts have not been refreshed".to_string())?;
+        let ordinals_observed_at = self
+            .ordinals_observed_at_unix
+            .ok_or_else(|| "Companion asset facts have not been refreshed".to_string())?;
+        if chain_observed_at > now_unix
+            || ordinals_observed_at > now_unix
+            || now_unix.saturating_sub(chain_observed_at) > MAX_COMPANION_ROUTINE_FACT_AGE_SECONDS
+            || now_unix.saturating_sub(ordinals_observed_at)
+                > MAX_COMPANION_ROUTINE_FACT_AGE_SECONDS
+        {
+            return Err("Companion routine wallet facts are stale".to_string());
+        }
+        if psbt_bytes.is_empty() || psbt_bytes.len() > MAX_PSBT_BYTES {
+            return Err("Companion routine PSBT is outside the accepted bound".to_string());
+        }
+        let psbt = Psbt::deserialize(psbt_bytes)
+            .map_err(|_| "Companion routine PSBT could not be decoded".to_string())?;
+        if psbt.serialize() != psbt_bytes {
+            return Err("Companion routine PSBT is not canonical".to_string());
+        }
+        if psbt.unsigned_tx.input.is_empty()
+            || psbt.unsigned_tx.input.len() > 256
+            || psbt.unsigned_tx.output.is_empty()
+            || psbt.unsigned_tx.output.len() > 64
+        {
+            return Err(
+                "Companion routine transaction shape is outside the accepted bound".to_string(),
+            );
+        }
+        let input_outpoints: std::collections::HashSet<_> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect();
+        if input_outpoints.len() != psbt.unsigned_tx.input.len()
+            || input_outpoints.iter().any(bitcoin::OutPoint::is_null)
+        {
+            return Err("Companion routine transaction inputs are invalid".to_string());
+        }
+
+        let slot = |payment: bool, keychain: KeychainKind| match (payment, keychain) {
+            (false, KeychainKind::External) => CompanionRoutineDescriptorSlot::TaprootExternal,
+            (false, KeychainKind::Internal) => CompanionRoutineDescriptorSlot::TaprootInternal,
+            (true, KeychainKind::External) => CompanionRoutineDescriptorSlot::PaymentExternal,
+            (true, KeychainKind::Internal) => CompanionRoutineDescriptorSlot::PaymentInternal,
+        };
+        let companion_index = |child: u32| match self.derivation_mode {
+            DerivationMode::Account => child,
+            DerivationMode::Index => logical_account,
+        };
+
+        let mut available_inputs = std::collections::HashMap::new();
+        for (wallet, payment) in std::iter::once((&self.vault_wallet, false))
+            .chain(self.payment_wallet.as_ref().map(|wallet| (wallet, true)))
+        {
+            for unspent in wallet
+                .list_unspent()
+                .filter(|utxo| input_outpoints.contains(&utxo.outpoint))
+            {
+                let descriptor_slot = slot(payment, unspent.keychain);
+                let expected_script_type = match descriptor_slot {
+                    CompanionRoutineDescriptorSlot::TaprootExternal
+                    | CompanionRoutineDescriptorSlot::TaprootInternal => {
+                        unspent.txout.script_pubkey.is_p2tr()
+                    }
+                    CompanionRoutineDescriptorSlot::PaymentExternal
+                    | CompanionRoutineDescriptorSlot::PaymentInternal => {
+                        unspent.txout.script_pubkey.is_p2wpkh()
+                    }
+                };
+                if !expected_script_type {
+                    return Err("Companion routine input uses an unsupported script".to_string());
+                }
+                let fact = CompanionRoutineInputFact {
+                    outpoint: unspent.outpoint,
+                    txout: unspent.txout.clone(),
+                    slot: descriptor_slot,
+                    derivation_index: companion_index(unspent.derivation_index),
+                };
+                if available_inputs.insert(unspent.outpoint, fact).is_some() {
+                    return Err("Companion routine input ownership is ambiguous".to_string());
+                }
+            }
+        }
+
+        let mut inputs = Vec::with_capacity(psbt.unsigned_tx.input.len());
+        for input in &psbt.unsigned_tx.input {
+            let outpoint = input.previous_output;
+            if !self.classified_outpoints.contains(&outpoint)
+                || self.inscribed_utxos.contains(&outpoint)
+                || self.rare_sat_outpoints.contains_key(&outpoint)
+                || self.outpoint_runes.contains_key(&outpoint)
+            {
+                return Err("Companion routine input is unclassified or asset-bearing".to_string());
+            }
+            inputs.push(available_inputs.remove(&outpoint).ok_or_else(|| {
+                "Companion routine input is not currently unspent by this wallet".to_string()
+            })?);
+        }
+
+        let mut change_outputs = Vec::new();
+        for (index, output) in psbt.unsigned_tx.output.iter().enumerate() {
+            for (wallet, payment) in std::iter::once((&self.vault_wallet, false))
+                .chain(self.payment_wallet.as_ref().map(|wallet| (wallet, true)))
+            {
+                let Some((keychain, child)) =
+                    wallet.derivation_of_spk(output.script_pubkey.clone())
+                else {
+                    continue;
+                };
+                if keychain == KeychainKind::Internal {
+                    change_outputs.push(CompanionRoutineChangeFact {
+                        vout: u32::try_from(index)
+                            .map_err(|_| "Companion routine output index overflow".to_string())?,
+                        slot: slot(payment, keychain),
+                        derivation_index: companion_index(child),
+                    });
+                }
+                break;
+            }
+        }
+
+        let tip = self.vault_wallet.local_chain().tip();
+        if tip.height() == 0 || tip.hash() == bitcoin::BlockHash::all_zeros() {
+            return Err("Companion routine chain tip is unavailable".to_string());
+        }
+        Ok(CompanionRoutineWalletSnapshot {
+            observed_at_unix: chain_observed_at.min(ordinals_observed_at),
+            tip_hash: tip.hash().to_byte_array(),
+            chain_state_generation: self.chain_state_generation,
+            inputs,
+            change_outputs,
+        })
+    }
+
     fn temporary_signers(
         &self,
         wallet: &Wallet,
@@ -1834,6 +2141,7 @@ impl ZincWallet {
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = false;
         self.ordinals_verified_generation = None;
+        self.ordinals_observed_at_unix = None;
         self.classified_outpoints.clear();
     }
 
@@ -1847,6 +2155,7 @@ impl ZincWallet {
         self.ordinals_verified = true;
         self.ordinals_metadata_complete = true;
         self.ordinals_verified_generation = Some(self.chain_state_generation);
+        self.ordinals_observed_at_unix = Some(wasm_now_secs());
     }
 
     /// Height of the wallet's local chain tip. Lets hosts that orchestrate
@@ -2131,6 +2440,7 @@ impl ZincWallet {
         // before applying either update so even a partial apply followed by an
         // error cannot leave an older Ord result marked current.
         self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+        self.chain_observed_at_unix = None;
         self.invalidate_asset_state();
         let mut all_events = Vec::new();
 
@@ -2145,12 +2455,20 @@ impl ZincWallet {
         }
 
         // 2. Apply Payment Update
-        if let (Some(w), Some(u)) = (&mut self.payment_wallet, payment_update) {
-            let payment_events = w.apply_update_events(u).map_err(|e| e.to_string())?;
-            for event in payment_events {
-                all_events.push(format!("payment:{event:?}"));
+        match (&mut self.payment_wallet, payment_update) {
+            (Some(w), Some(u)) => {
+                let payment_events = w.apply_update_events(u).map_err(|e| e.to_string())?;
+                for event in payment_events {
+                    all_events.push(format!("payment:{event:?}"));
+                }
             }
+            (Some(_), None) => {
+                return Err("Payment wallet update is required for a coherent sync".to_string())
+            }
+            (None, _) => {}
         }
+
+        self.chain_observed_at_unix = Some(wasm_now_secs());
 
         Ok(all_events)
     }
@@ -2202,6 +2520,7 @@ impl ZincWallet {
         // 3. Increment account generation to invalidate any in-flight syncs
         self.account_generation = self.account_generation.wrapping_add(1);
         self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+        self.chain_observed_at_unix = None;
         self.invalidate_asset_state();
         // In-flight syncs of the old generation bail on the generation check without clearing
         // the latch, so release it here or the new account could never sync.
@@ -2460,6 +2779,7 @@ impl ZincWallet {
         self.ordinals_verified = true;
         self.ordinals_metadata_complete = true;
         self.ordinals_verified_generation = Some(expected_chain_generation);
+        self.ordinals_observed_at_unix = Some(wasm_now_secs());
 
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
@@ -2518,6 +2838,7 @@ impl ZincWallet {
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = true;
         self.ordinals_verified_generation = None;
+        self.ordinals_observed_at_unix = None;
         self.classified_outpoints.clear();
 
         self.inscriptions.len()
@@ -7573,7 +7894,9 @@ impl WalletBuilder {
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             chain_state_generation: 0,
+            chain_observed_at_unix: None,
             ordinals_verified_generation: None,
+            ordinals_observed_at_unix: None,
             classified_outpoints: std::collections::HashSet::new(),
             kind,
             signing_layout,
@@ -7719,7 +8042,9 @@ impl WalletBuilder {
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             chain_state_generation: 0,
+            chain_observed_at_unix: None,
             ordinals_verified_generation: None,
+            ordinals_observed_at_unix: None,
             classified_outpoints: std::collections::HashSet::new(),
             kind: WalletKind::Hardware {
                 fingerprint,
