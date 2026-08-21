@@ -128,6 +128,97 @@ mod tests {
     }
 
     #[test]
+    fn companion_transfer_is_rbf_minimal_and_signable_with_phone_local_metadata() {
+        let mut wallet = funded_wallet();
+        let recipient = foreign_address();
+        let request = CreatePsbtRequest::from_parts(&recipient.to_string(), 25_000, 2.0).unwrap();
+        let result = wallet.create_companion_bitcoin_transfer(&request).unwrap();
+        let psbt = decode(&result.psbt);
+        let recipient_vout = usize::try_from(result.intent.recipient_vout).unwrap();
+
+        assert!(psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .all(|input| input.sequence.is_rbf()));
+        assert!(psbt.xpub.is_empty());
+        assert!(psbt.proprietary.is_empty());
+        assert!(psbt.unknown.is_empty());
+        for input in &psbt.inputs {
+            assert!(input.witness_utxo.is_some());
+            assert!(input.sighash_type.is_none());
+            assert!(input.partial_sigs.is_empty());
+            assert!(input.final_script_sig.is_none());
+            assert!(input.final_script_witness.is_none());
+            assert!(input.redeem_script.is_none());
+            assert!(input.witness_script.is_none());
+            assert!(input.bip32_derivation.is_empty());
+            assert!(input.tap_script_sigs.is_empty());
+            assert!(input.tap_scripts.is_empty());
+            assert!(input.tap_key_origins.is_empty());
+            assert!(input.tap_key_sig.is_none());
+            assert!(input.tap_internal_key.is_none());
+            assert!(input.tap_merkle_root.is_none());
+            assert!(input.proprietary.is_empty());
+            assert!(input.unknown.is_empty());
+        }
+        for output in &psbt.outputs {
+            assert!(output.redeem_script.is_none());
+            assert!(output.witness_script.is_none());
+            assert!(output.bip32_derivation.is_empty());
+            assert!(output.tap_internal_key.is_none());
+            assert!(output.tap_tree.is_none());
+            assert!(output.tap_key_origins.is_empty());
+            assert!(output.proprietary.is_empty());
+            assert!(output.unknown.is_empty());
+        }
+
+        let change_outputs: Vec<_> = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(vout, _)| *vout != recipient_vout)
+            .collect();
+        assert!(!change_outputs.is_empty());
+        for (_, output) in &change_outputs {
+            let (keychain, _) = wallet
+                .vault_wallet
+                .derivation_of_spk(output.script_pubkey.clone())
+                .unwrap();
+            assert_eq!(keychain, KeychainKind::Internal);
+        }
+
+        let signed = wallet
+            .sign_companion_bitcoin_transfer_psbt(
+                &result.psbt,
+                &result.intent,
+                Some(SignOptions {
+                    finalize: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let verified = wallet
+            .verify_external_signed_psbt(&result.psbt, &signed, None, true)
+            .unwrap();
+        assert!(decode(&verified).extract_tx().is_ok());
+
+        let mut ordinary_wallet = funded_wallet();
+        let ordinary = decode(
+            &ordinary_wallet
+                .create_bitcoin_transfer(&request)
+                .unwrap()
+                .psbt,
+        );
+        assert!(ordinary
+            .unsigned_tx
+            .input
+            .iter()
+            .any(|input| input.sequence.is_rbf()));
+    }
+
+    #[test]
     fn recipient_amount_fee_and_input_mutations_are_rejected_at_both_boundaries() {
         let mut wallet = funded_wallet();
         let recipient = foreign_address();
