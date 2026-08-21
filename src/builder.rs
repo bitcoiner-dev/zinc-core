@@ -13,7 +13,7 @@ use bdk_wallet::{KeychainKind, Wallet};
 use bitcoin::address::{AddressType, NetworkUnchecked};
 use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
-use bitcoin::{Address, Amount, FeeRate, Network, Transaction};
+use bitcoin::{Address, Amount, FeeRate, Network, Sequence, Transaction};
 // use bitcoin::PsbtSighashType; // Failed
 use crate::error::ZincError;
 use crate::keys::ZincMnemonic;
@@ -4919,6 +4919,15 @@ impl ZincWallet {
 
     /// Create an unsigned PSBT for sending BTC.
     pub fn create_psbt_tx(&mut self, request: &CreatePsbtRequest) -> Result<Psbt, ZincError> {
+        self.create_psbt_tx_with_policy(request, KeychainKind::External, None)
+    }
+
+    fn create_psbt_tx_with_policy(
+        &mut self,
+        request: &CreatePsbtRequest,
+        change_keychain: KeychainKind,
+        input_sequence: Option<Sequence>,
+    ) -> Result<Psbt, ZincError> {
         if !self.ordinals_verified {
             return Err(ZincError::WalletError(
                 "Ordinals verification failed - safety lock engaged. Please retry sync."
@@ -4942,10 +4951,13 @@ impl ZincWallet {
             .map_err(|e| ZincError::ConfigError(format!("Network mismatch: {e}")))?;
 
         let change_script = wallet
-            .peek_address(KeychainKind::External, active_receive_index)
+            .peek_address(change_keychain, active_receive_index)
             .script_pubkey();
 
         let mut builder = wallet.build_tx();
+        if let Some(sequence) = input_sequence {
+            builder.set_exact_sequence(sequence);
+        }
         if !self.inscribed_utxos.is_empty() {
             builder.unspendable(self.inscribed_utxos.iter().copied().collect());
         }
@@ -4973,6 +4985,49 @@ impl ZincWallet {
         request: &CreatePsbtRequest,
     ) -> Result<BitcoinTransferResult, ZincError> {
         let psbt = self.create_psbt_tx(request)?;
+        self.bitcoin_transfer_result(request, psbt)
+    }
+
+    /// Create an ordinary Bitcoin transfer for Companion signing.
+    ///
+    /// Companion review independently proves every non-recipient output from
+    /// the account's internal descriptor. Keeping this construction policy at
+    /// the wallet boundary prevents a normal external-branch drain output from
+    /// becoming an unreviewable request on the phone.
+    pub fn create_companion_bitcoin_transfer(
+        &mut self,
+        request: &CreatePsbtRequest,
+    ) -> Result<BitcoinTransferResult, ZincError> {
+        let psbt = self.create_psbt_tx_with_policy(request, KeychainKind::Internal, None)?;
+        let psbt = Self::minimal_companion_psbt(psbt)?;
+        self.bitcoin_transfer_result(request, psbt)
+    }
+
+    /// Reduce an engine-built PSBT to the facts a Companion phone must verify.
+    ///
+    /// BDK normally includes key origins and Taproot internal keys so the same
+    /// process can sign the PSBT later. Those hints are neither needed nor
+    /// trusted across the Companion boundary: the phone reconstructs them from
+    /// its own seed-backed descriptors only after semantic review and user
+    /// presence. Rebuilding the maps from an allowlist also keeps future BDK
+    /// metadata additions from silently expanding the wire protocol.
+    fn minimal_companion_psbt(psbt: Psbt) -> Result<Psbt, ZincError> {
+        let unsigned_tx = psbt.unsigned_tx.clone();
+        let mut minimal = Psbt::from_unsigned_tx(unsigned_tx).map_err(|error| {
+            ZincError::WalletError(format!("Failed to minimize Companion PSBT: {error}"))
+        })?;
+        for (source, target) in psbt.inputs.iter().zip(&mut minimal.inputs) {
+            target.witness_utxo.clone_from(&source.witness_utxo);
+            target.non_witness_utxo.clone_from(&source.non_witness_utxo);
+        }
+        Ok(minimal)
+    }
+
+    fn bitcoin_transfer_result(
+        &self,
+        request: &CreatePsbtRequest,
+        psbt: Psbt,
+    ) -> Result<BitcoinTransferResult, ZincError> {
         let recipient = request
             .recipient
             .clone()
@@ -6187,6 +6242,31 @@ impl ZincWallet {
         self.validate_bitcoin_transfer_psbt(&psbt, intent)
             .map_err(|error| format!("Security Violation: {error}"))?;
         self.sign_psbt_with_policy(psbt_base64, options, false)
+    }
+
+    /// Sign an ordinary Companion transfer after validating its minimal wire
+    /// PSBT and independently restoring derivation metadata from this wallet.
+    ///
+    /// The receiver cannot influence the key paths used for signing: validation
+    /// happens before enrichment and enrichment consults only the phone's live
+    /// wallet descriptors and owned UTXOs.
+    pub fn sign_companion_bitcoin_transfer_psbt(
+        &mut self,
+        psbt_base64: &str,
+        intent: &BitcoinTransferIntent,
+        options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| format!("Invalid base64: {error}"))?;
+        let psbt =
+            Psbt::deserialize(&psbt_bytes).map_err(|error| format!("Invalid PSBT: {error}"))?;
+        self.validate_bitcoin_transfer_psbt(&psbt, intent)
+            .map_err(|error| format!("Security Violation: {error}"))?;
+        let enriched = self.enrich_psbt_key_origins(psbt_base64)?;
+        self.sign_psbt_with_policy(&enriched, options, false)
     }
 
     /// Sign a first-party constructed transaction only after its exact template
