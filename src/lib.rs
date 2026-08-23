@@ -129,6 +129,7 @@ pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
 #[cfg(not(target_arch = "wasm32"))]
 pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
+pub use ordinals::error::OrdError;
 pub use ordinals::types::{Inscription, RuneBalance, Satpoint};
 pub use sign_intent::{
     build_pairing_transport_event, build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
