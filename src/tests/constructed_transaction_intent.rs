@@ -188,6 +188,19 @@ mod tests {
                     }),
                 )
                 .unwrap();
+            let companion_psbt = wallet
+                .prepare_companion_constructed_transaction_psbt(&psbt_base64, &intent)
+                .unwrap();
+            wallet
+                .sign_companion_constructed_transaction_psbt(
+                    &companion_psbt,
+                    &intent,
+                    Some(SignOptions {
+                        finalize: true,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
         }
     }
 
