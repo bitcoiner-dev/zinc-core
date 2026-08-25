@@ -5003,6 +5003,48 @@ impl ZincWallet {
         self.bitcoin_transfer_result(request, psbt)
     }
 
+    /// Validate and minimize a first-party constructed transaction for the
+    /// Companion wire boundary.
+    ///
+    /// Only UTXO facts required for independent phone validation survive. Key
+    /// origins and signer hints are intentionally removed and reconstructed by
+    /// the phone after it has accepted the exact typed intent.
+    pub fn prepare_companion_constructed_transaction_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: &ConstructedTransactionIntent,
+    ) -> Result<String, ZincError> {
+        use base64::Engine;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| ZincError::WalletError(format!("Invalid PSBT base64: {error}")))?;
+        let psbt = Psbt::deserialize(&bytes)
+            .map_err(|error| ZincError::WalletError(format!("Invalid PSBT: {error}")))?;
+        self.validate_constructed_transaction_psbt(&psbt, intent)
+            .map_err(ZincError::WalletError)?;
+        Self::minimal_companion_psbt(psbt).map(|minimal| Self::encode_psbt_base64(&minimal))
+    }
+
+    /// Validate and minimize a first-party Rune transfer for the Companion
+    /// wire boundary while retaining only its required previous-output facts.
+    pub fn prepare_companion_rune_transfer_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: &RuneTransferIntent,
+    ) -> Result<String, ZincError> {
+        use base64::Engine;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| ZincError::WalletError(format!("Invalid PSBT base64: {error}")))?;
+        let psbt = Psbt::deserialize(&bytes)
+            .map_err(|error| ZincError::WalletError(format!("Invalid PSBT: {error}")))?;
+        self.validate_rune_transfer_psbt(&psbt, intent)
+            .map_err(ZincError::WalletError)?;
+        Self::minimal_companion_psbt(psbt).map(|minimal| Self::encode_psbt_base64(&minimal))
+    }
+
     /// Reduce an engine-built PSBT to the facts a Companion phone must verify.
     ///
     /// BDK normally includes key origins and Taproot internal keys so the same
@@ -6267,6 +6309,58 @@ impl ZincWallet {
             .map_err(|error| format!("Security Violation: {error}"))?;
         let enriched = self.enrich_psbt_key_origins(psbt_base64)?;
         self.sign_psbt_with_policy(&enriched, options, false)
+    }
+
+    /// Sign a first-party constructed Companion transaction after validating
+    /// its exact operation-specific intent and independently restoring key
+    /// origins from this wallet.
+    ///
+    /// The receiver-supplied PSBT is treated as a minimal, hostile transport
+    /// object. CPFP, cancellation, inscription transfer, and coin-control
+    /// semantics are all enforced by `validate_constructed_transaction_psbt`
+    /// before phone-local descriptor metadata is added.
+    pub fn sign_companion_constructed_transaction_psbt(
+        &mut self,
+        psbt_base64: &str,
+        intent: &ConstructedTransactionIntent,
+        options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| format!("Invalid base64: {error}"))?;
+        let psbt =
+            Psbt::deserialize(&psbt_bytes).map_err(|error| format!("Invalid PSBT: {error}"))?;
+        self.validate_constructed_transaction_psbt(&psbt, intent)
+            .map_err(|error| format!("Security Violation: {error}"))?;
+        let enriched = self.enrich_psbt_key_origins(psbt_base64)?;
+        self.sign_psbt_with_policy(&enriched, options, false)
+    }
+
+    /// Sign a first-party Rune transfer received over the Companion boundary.
+    ///
+    /// Rune allocation, recipient, amount, wallet-owned change, and zero-burn
+    /// invariants are checked before key origins are reconstructed from the
+    /// phone wallet. The validated Rune default-transfer policy is then carried
+    /// into the ordinary signing engine.
+    pub fn sign_companion_rune_transfer_psbt(
+        &mut self,
+        psbt_base64: &str,
+        intent: &RuneTransferIntent,
+        options: Option<SignOptions>,
+    ) -> Result<String, String> {
+        use base64::Engine;
+
+        let psbt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| format!("Invalid base64: {error}"))?;
+        let psbt =
+            Psbt::deserialize(&psbt_bytes).map_err(|error| format!("Invalid PSBT: {error}"))?;
+        self.validate_rune_transfer_psbt(&psbt, intent)
+            .map_err(|error| format!("Security Violation: {error}"))?;
+        let enriched = self.enrich_psbt_key_origins(psbt_base64)?;
+        self.sign_psbt_with_policy(&enriched, options, true)
     }
 
     /// Sign a first-party constructed transaction only after its exact template

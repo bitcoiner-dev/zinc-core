@@ -145,6 +145,19 @@ mod tests {
                 }),
             )
             .unwrap();
+        let companion_psbt = wallet
+            .prepare_companion_rune_transfer_psbt(&result.psbt, &result.intent)
+            .unwrap();
+        wallet
+            .sign_companion_rune_transfer_psbt(
+                &companion_psbt,
+                &result.intent,
+                Some(SignOptions {
+                    finalize: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
     }
 
     #[test]
