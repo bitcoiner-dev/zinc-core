@@ -5,6 +5,7 @@ mod tests {
     use std::collections::HashSet;
     use std::str::FromStr;
     use zinc_core::ordinals::shield::{analyze_psbt_with_scope, audit_psbt, is_safe_to_spend};
+    use zinc_core::ordinals::OrdError;
 
     fn make_outpoint(i: u8) -> OutPoint {
         let hash = format!("{i:064x}");
@@ -132,11 +133,7 @@ mod tests {
         );
 
         let err = result.expect_err("scoped input missing metadata should fail");
-        let message = err.to_string();
-        assert!(
-            message.contains("missing witness_utxo"),
-            "unexpected error message: {message}"
-        );
+        assert!(matches!(err, OrdError::InvalidData(_)));
     }
 
     #[test]
@@ -188,10 +185,7 @@ mod tests {
         );
 
         let err = result.expect_err("out-of-bounds scope must fail");
-        assert!(
-            err.to_string().contains("out of bounds"),
-            "unexpected error message: {err}"
-        );
+        assert!(matches!(err, OrdError::InvalidData(_)));
     }
 
     #[test]

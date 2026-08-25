@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Add `BackendFailureV1`, a versioned data-only schema for Esplora and Ord
+  dependency, operation, category, status/code, and bounded retry-delay data.
+
+### Changed
+- Preserve typed Esplora and Ord failures across native and WASM boundaries
+  without exposing response bodies, URLs, or upstream prose.
+- Treat an exact duplicate transaction broadcast as success and reconcile an
+  ambiguous Esplora result by its locally computed txid before returning an
+  error; reconciliation never issues a second broadcast.
+- Disable hidden Esplora HTTP retries, apply an explicit request timeout, and
+  expose generation retirement so hosts can safely discard late WASM scans.
+- Return versioned base-chain/Ord sync receipts for host-owned dependency health.
+
 ## [0.12.0] - 2026-08-08
 
 ### Security

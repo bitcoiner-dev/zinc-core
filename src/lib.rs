@@ -36,6 +36,8 @@ pub const MAX_DISCOVERY_ACCOUNTS: u32 = 100;
 mod logging;
 
 // Core modules
+pub mod backend_error;
+pub mod backend_receipt;
 pub mod builder;
 pub mod crypto;
 pub mod error;
@@ -70,6 +72,14 @@ pub mod ordinals;
 pub mod sign_intent;
 
 // Re-exports for convenience
+pub use backend_error::{
+    BackendDependencyV1, BackendFailureCategoryV1, BackendFailureV1, BackendOperationV1,
+    MAX_RETRY_AFTER_MS,
+};
+pub use backend_receipt::{
+    BackendCapabilityV1, BackendScanOutcomeV1, BackendSyncReceiptV1, ScanCheckpointV1,
+    ScanOutcomeStatusV1, SyncCompletenessV1,
+};
 pub use builder::{
     Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
     CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
@@ -119,6 +129,7 @@ pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
 #[cfg(not(target_arch = "wasm32"))]
 pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
+pub use ordinals::error::OrdError;
 pub use ordinals::types::{Inscription, RuneBalance, Satpoint};
 pub use sign_intent::{
     build_pairing_transport_event, build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
@@ -148,6 +159,48 @@ pub use sign_intent::{
 // Re-export bitcoin types we use
 pub use bdk_wallet::bitcoin::Network;
 use bdk_wallet::KeychainKind;
+
+#[cfg(target_arch = "wasm32")]
+fn backend_failure_to_js(failure: &BackendFailureV1) -> JsValue {
+    serde_wasm_bindgen::to_value(failure)
+        .unwrap_or_else(|_| JsValue::from_str("ZINC_BACKEND_FAILURE_V1"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn backend_scan_failure_to_js(
+    failure: BackendFailureV1,
+    last_complete_tip: Option<u32>,
+    operation_generation: u64,
+    completed_keychains: u8,
+    total_keychains: u8,
+) -> JsValue {
+    let retryable = failure.is_scan_retryable();
+    backend_failure_to_js(&failure.with_scan_outcome(BackendScanOutcomeV1::incomplete(
+        retryable,
+        last_complete_tip,
+        operation_generation,
+        completed_keychains,
+        total_keychains,
+    )))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ord_failure_to_js(error: ordinals::OrdError) -> JsValue {
+    match error {
+        ordinals::OrdError::Backend(failure) => backend_failure_to_js(&failure),
+        other => JsValue::from_str(&other.to_string()),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ord_scan_failure_to_js(error: ordinals::OrdError, operation_generation: u64) -> JsValue {
+    match error {
+        ordinals::OrdError::Backend(failure) => {
+            backend_scan_failure_to_js(failure, None, operation_generation, 0, 1)
+        }
+        other => ord_failure_to_js(other),
+    }
+}
 
 // ============================================================================
 // Core Logic (Pure Rust)
@@ -2244,14 +2297,31 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Retire an in-flight sync generation after the shell cancels or times out.
+    /// The network future may still resolve, but its apply step will fail stale.
+    #[wasm_bindgen(js_name = retireSyncGeneration)]
+    pub fn retire_sync_generation(&self) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                inner.retire_inflight_sync();
+                Ok(())
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (retire_sync_generation): {error}"
+            ))),
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = sync)]
     pub fn sync(&self, esplora_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        use crate::builder::{SyncRequestType, SyncSleeper};
+        use crate::builder::{configured_esplora_client, SyncRequestType};
         use bdk_esplora::EsploraAsyncExt;
 
         let inner_rc = self.inner.clone();
+        let network = self.state_snapshot().network;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
@@ -2261,7 +2331,7 @@ impl ZincWasmWallet {
             );
 
             // 1. Prepare Request (lock briefly)
-            let (sync_req, sync_generation) = {
+            let (sync_req, sync_generation, last_complete_tip, total_keychains) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if !inner.try_begin_sync(js_sys::Date::now()) {
@@ -2272,9 +2342,13 @@ impl ZincWasmWallet {
                         // Consume any pending full-rescan request: full scan once, then incremental.
                         let force_full = inner.force_next_full;
                         inner.force_next_full = false;
+                        let request = inner.prepare_requests(force_full);
+                        let total_keychains = 1 + u8::from(request.payment.is_some());
                         (
-                            inner.prepare_requests(force_full),
+                            request,
                             inner.account_generation(),
+                            (inner.chain_tip_height() > 0).then(|| inner.chain_tip_height()),
+                            total_keychains,
                         )
                     }
                     Err(e) => {
@@ -2287,9 +2361,7 @@ impl ZincWasmWallet {
                 }
             };
 
-            let client = match esplora_client::Builder::new(&esplora_url)
-                .build_async_with_sleeper::<SyncSleeper>()
-            {
+            let client = match configured_esplora_client(&esplora_url) {
                 Ok(c) => c,
                 Err(e) => {
                     zinc_log_error!(target: LOG_TARGET_WASM, "failed to create esplora client");
@@ -2306,12 +2378,20 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(JsValue::from(format!("{:?}", e)));
+                    return Err(backend_scan_failure_to_js(
+                        BackendFailureV1::from_esplora(&e, BackendOperationV1::Connect),
+                        last_complete_tip,
+                        sync_generation,
+                        0,
+                        total_keychains,
+                    ));
                 }
             };
 
             // 2. Fetch (NO LOCK HELD)
-            let vault_update_res: Result<bdk_wallet::Update, JsValue> = match sync_req.taproot {
+            let vault_update_res: Result<bdk_wallet::Update, BackendFailureV1> = match sync_req
+                .taproot
+            {
                 SyncRequestType::Full(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot full scan");
                     client
@@ -2320,14 +2400,14 @@ impl ZincWasmWallet {
                         .map(|u| u.into())
                         .map_err(|e| {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Vault full scan failed: {:?}", e);
-                            JsValue::from(e.to_string())
+                            BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                         })
                 }
                 SyncRequestType::Incremental(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot incremental sync");
                     client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "Vault sync failed: {:?}", e);
-                        JsValue::from(e.to_string())
+                        BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                     })
                 }
             };
@@ -2343,14 +2423,20 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(e);
+                    return Err(backend_scan_failure_to_js(
+                        e,
+                        last_complete_tip,
+                        sync_generation,
+                        0,
+                        total_keychains,
+                    ));
                 }
             };
 
             let payment_update: Option<bdk_wallet::Update> = if let Some(req_type) =
                 sync_req.payment
             {
-                let update_res: Result<bdk_wallet::Update, JsValue> = match req_type {
+                let update_res: Result<bdk_wallet::Update, BackendFailureV1> = match req_type {
                     SyncRequestType::Full(req) => {
                         zinc_log_info!(target: LOG_TARGET_WASM, "starting payment full scan");
                         client
@@ -2359,7 +2445,7 @@ impl ZincWasmWallet {
                                 .map(|u| u.into())
                                 .map_err(|e| {
                                     zinc_log_debug!(target: LOG_TARGET_WASM, "Payment full scan failed: {:?}", e);
-                                    JsValue::from(e.to_string())
+                                    BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                                 })
                     }
                     SyncRequestType::Incremental(req) => {
@@ -2369,7 +2455,7 @@ impl ZincWasmWallet {
                         );
                         client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                                 zinc_log_debug!(target: LOG_TARGET_WASM, "Payment sync failed: {:?}", e);
-                                JsValue::from(e.to_string())
+                                BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                             })
                     }
                 };
@@ -2388,7 +2474,13 @@ impl ZincWasmWallet {
                         ) {
                             return Err(stale);
                         }
-                        return Err(e);
+                        return Err(backend_scan_failure_to_js(
+                            e,
+                            last_complete_tip,
+                            sync_generation,
+                            1,
+                            total_keychains,
+                        ));
                     }
                 }
             } else {
@@ -2397,7 +2489,7 @@ impl ZincWasmWallet {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync: chain client returned");
 
             // 3. Apply (lock briefly)
-            let events = {
+            let (events, observed_tip) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.account_generation() != sync_generation {
@@ -2418,7 +2510,8 @@ impl ZincWasmWallet {
                             })?;
                         inner.is_syncing = false;
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: updates applied");
-                        res
+                        let observed_tip = inner.chain_tip_height();
+                        (res, observed_tip)
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "FAILED TO BORROW MUT INNER: {:?}", e);
@@ -2435,7 +2528,16 @@ impl ZincWasmWallet {
             };
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync: finished. events: {:?}", events);
 
-            serde_wasm_bindgen::to_value(&events).map_err(|e| JsValue::from(e.to_string()))
+            let receipt = BackendSyncReceiptV1::complete(
+                network,
+                BackendDependencyV1::Esplora,
+                BackendCapabilityV1::BaseChain,
+                esplora_url,
+                observed_tip,
+                sync_generation,
+            )
+            .with_total_keychains(total_keychains);
+            serde_wasm_bindgen::to_value(&receipt).map_err(|e| JsValue::from(e.to_string()))
         }))
     }
 
@@ -2895,6 +2997,7 @@ impl ZincWasmWallet {
     pub fn sync_ordinals(&self, ord_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         let inner_rc = self.inner.clone();
+        let network = self.state_snapshot().network;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
@@ -2960,11 +3063,11 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(JsValue::from_str(&e.to_string()));
+                    return Err(ord_scan_failure_to_js(e, sync_generation));
                 }
             };
 
-            if ord_height < wallet_height.saturating_sub(1) {
+            if ord_height < wallet_height.saturating_sub(2) {
                 // We need to set verified=false safely
                 zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: Ord lagging, setting verified=false");
                 match inner_rc.try_borrow_mut() {
@@ -2986,10 +3089,18 @@ impl ZincWasmWallet {
                         );
                     }
                 }
-                return Err(JsValue::from_str(&format!(
-                    "Ord Indexer is lagging! Ord: {}, Wallet: {}. Safety lock engaged.",
-                    ord_height, wallet_height
-                )));
+                return Err(backend_scan_failure_to_js(
+                    BackendFailureV1::new(
+                        BackendDependencyV1::Ord,
+                        BackendOperationV1::BlockHeight,
+                        BackendFailureCategoryV1::Unavailable,
+                    )
+                    .with_upstream_code("index_lag"),
+                    None,
+                    sync_generation,
+                    0,
+                    1,
+                ));
             }
 
             // 2b. Restrict the bulk query to outpoints ord is guaranteed to have indexed:
@@ -3055,7 +3166,7 @@ impl ZincWasmWallet {
                             );
                         }
                     }
-                    return Err(JsValue::from_str(&e.to_string()));
+                    return Err(ord_scan_failure_to_js(e, sync_generation));
                 }
             };
             let all_inscriptions = resolved.inscriptions;
@@ -3072,7 +3183,7 @@ impl ZincWasmWallet {
 
             // 3. Apply Update (Borrow Mut)
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: applying update (borrow mut)");
-            let count = {
+            {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.account_generation() != sync_generation {
@@ -3103,7 +3214,15 @@ impl ZincWasmWallet {
                 }
             };
 
-            Ok(JsValue::from(count as u32))
+            let receipt = BackendSyncReceiptV1::complete(
+                network,
+                BackendDependencyV1::Ord,
+                BackendCapabilityV1::Ord,
+                ord_url,
+                ord_height,
+                sync_generation,
+            );
+            serde_wasm_bindgen::to_value(&receipt).map_err(|error| JsValue::from(error.to_string()))
         }))
     }
     // ========================================================================
@@ -4075,7 +4194,7 @@ impl ZincWasmWallet {
         esplora_url: String,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        use crate::builder::SyncSleeper;
+        use crate::builder::configured_esplora_client;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             // Decode PSBT - no borrow needed
@@ -4093,16 +4212,17 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Failed to extract tx: {e}")))?;
 
             // Broadcast via Esplora (no RefCell borrow needed)
-            let client = esplora_client::Builder::new(&esplora_url)
-                .build_async_with_sleeper::<SyncSleeper>()
-                .map_err(|e| JsValue::from_str(&format!("Failed to create client: {e:?}")))?;
+            let client = configured_esplora_client(&esplora_url).map_err(|e| {
+                backend_failure_to_js(&BackendFailureV1::from_esplora(
+                    &e,
+                    BackendOperationV1::Connect,
+                ))
+            })?;
 
-            client
-                .broadcast(&tx)
+            crate::builder::broadcast_esplora_transaction(&client, &tx)
                 .await
-                .map_err(|e| JsValue::from_str(&format!("Broadcast failed: {e}")))?;
-
-            Ok(JsValue::from(tx.compute_txid().to_string()))
+                .map(|txid| JsValue::from(txid.to_string()))
+                .map_err(|failure| backend_failure_to_js(&failure))
         }))
     }
 }

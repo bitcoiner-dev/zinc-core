@@ -341,12 +341,11 @@ fn apply_rare_sat_flow(analysis: &mut AnalysisResult, known: &KnownRareSats) {
         let input_vout = analysis.inputs[input_index].vout;
         let input_value = analysis.inputs[input_index].value;
         let input_inscriptions = analysis.inputs[input_index].inscriptions.clone();
-        let key = match input_txid.parse::<Txid>() {
-            Ok(txid) => (txid, input_vout),
-            Err(_) => {
-                input_base = input_base.saturating_add(input_value);
-                continue;
-            }
+        let key = if let Ok(txid) = input_txid.parse::<Txid>() {
+            (txid, input_vout)
+        } else {
+            input_base = input_base.saturating_add(input_value);
+            continue;
         };
         let locations = known.get(&key).cloned().unwrap_or_default();
         if let Some(info) = analysis.inputs.get_mut(input_index) {
@@ -522,7 +521,7 @@ fn normalize_input_scope(
     };
 
     if scope.is_empty() {
-        return Err(OrdError::RequestFailed(
+        return Err(OrdError::InvalidData(
             "Ordinal Shield Error: input scope cannot be empty.".to_string(),
         ));
     }
@@ -532,7 +531,7 @@ fn normalize_input_scope(
     deduped.dedup();
 
     if let Some(index) = deduped.iter().find(|&&idx| idx >= input_count) {
-        return Err(OrdError::RequestFailed(format!(
+        return Err(OrdError::InvalidData(format!(
             "Ordinal Shield Error: input scope index {index} is out of bounds ({input_count} inputs)."
         )));
     }
@@ -556,14 +555,14 @@ fn input_value_for_audit(
             .get(vout_idx)
             .map(|output| Some(output.value.to_sat()))
             .ok_or_else(|| {
-                OrdError::RequestFailed(format!(
+                OrdError::InvalidData(format!(
                     "Ordinal Shield Error: Input #{index} non_witness_utxo found but vout index {vout_idx} invalid."
                 ))
             });
     }
 
     if require_metadata {
-        return Err(OrdError::RequestFailed(format!(
+        return Err(OrdError::InvalidData(format!(
             "Ordinal Shield Error: Input #{index} missing witness_utxo data. Cannot safely analyze."
         )));
     }
@@ -731,13 +730,13 @@ pub fn analyze_psbt_with_scope(
                     "analyze_psbt: Input #{} non_witness_utxo mismatch (vout out of bounds)",
                     i
                 );
-                return Err(OrdError::RequestFailed(format!(
+                return Err(OrdError::InvalidData(format!(
                     "Ordinal Shield Error: Input #{i} non_witness_utxo found but vout index {vout_idx} invalid."
                 )));
             }
         } else if in_scope {
             zinc_log_debug!(target: LOG_TARGET_SHIELD, "analyze_psbt: BLIND SPOT at input #{} - returning error", i);
-            return Err(OrdError::RequestFailed(format!(
+            return Err(OrdError::InvalidData(format!(
                 "Ordinal Shield Error: Input #{i} missing witness_utxo data. Cannot safely analyze."
             )));
         } else {
@@ -981,7 +980,7 @@ pub fn analyze_psbt_with_scope(
         // SECURITY: convert the output index once, up front, instead of an unchecked
         // `as u32` truncation; fail loudly rather than silently corrupting the index.
         let vout_u32 = u32::try_from(vout).map_err(|_| {
-            OrdError::RequestFailed(format!(
+            OrdError::InvalidData(format!(
                 "Ordinal Shield Error: Output index {vout} exceeds u32 limit"
             ))
         })?;

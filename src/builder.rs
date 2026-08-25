@@ -15,12 +15,47 @@ use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
 use bitcoin::{Address, Amount, FeeRate, Network, Sequence, Transaction};
 // use bitcoin::PsbtSighashType; // Failed
+use crate::backend_error::{
+    is_ambiguous_esplora_broadcast, is_duplicate_esplora_broadcast, BackendFailureV1,
+    BackendOperationV1,
+};
 use crate::error::ZincError;
 use crate::keys::ZincMnemonic;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 const LOG_TARGET_BUILDER: &str = "zinc_core::builder";
+
+fn serialize_backend_failure(failure: &BackendFailureV1) -> String {
+    serde_json::to_string(failure).unwrap_or_else(|_| {
+        "{\"version\":1,\"dependency\":\"esplora\",\"operation\":\"sync\",\"category\":\"unknown\"}".to_string()
+    })
+}
+
+fn serialize_ord_error(error: crate::ordinals::OrdError) -> String {
+    match error {
+        crate::ordinals::OrdError::Backend(failure) => serialize_backend_failure(&failure),
+        other => other.to_string(),
+    }
+}
+
+/// Broadcast one exact transaction and reconcile only outcomes that may have
+/// occurred after the upstream accepted it. No second broadcast is performed.
+pub(crate) async fn broadcast_esplora_transaction<S: esplora_client::Sleeper>(
+    client: &esplora_client::AsyncClient<S>,
+    tx: &Transaction,
+) -> Result<bitcoin::Txid, BackendFailureV1> {
+    let txid = tx.compute_txid();
+    match client.broadcast(tx).await {
+        Ok(()) => Ok(txid),
+        Err(error) if is_duplicate_esplora_broadcast(&error) => Ok(txid),
+        Err(error) if is_ambiguous_esplora_broadcast(&error) => match client.get_tx(&txid).await {
+            Ok(Some(found)) if found.compute_txid() == txid => Ok(txid),
+            _ => Err(BackendFailureV1::from_esplora_broadcast(&error)),
+        },
+        Err(error) => Err(BackendFailureV1::from_esplora_broadcast(&error)),
+    }
+}
 
 /// Platform-safe current-time-in-seconds for BDK sync request start times.
 ///
@@ -930,6 +965,21 @@ impl esplora_client::Sleeper for TokioSleeper {
 /// Platform-specific async sleeper used for sync calls.
 #[cfg(not(target_arch = "wasm32"))]
 pub type SyncSleeper = TokioSleeper;
+
+/// Zinc owns operation-level retries and provider failover. Keep the Esplora
+/// client itself single-attempt so one logical attempt cannot silently expand
+/// into the crate default of seven HTTP requests.
+const ESPLORA_INTERNAL_MAX_RETRIES: usize = 0;
+const ESPLORA_REQUEST_TIMEOUT_SECS: u64 = 20;
+
+pub(crate) fn configured_esplora_client(
+    esplora_url: &str,
+) -> Result<esplora_client::AsyncClient<SyncSleeper>, esplora_client::Error> {
+    esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
+        .max_retries(ESPLORA_INTERNAL_MAX_RETRIES)
+        .timeout(ESPLORA_REQUEST_TIMEOUT_SECS)
+        .build_async_with_sleeper::<SyncSleeper>()
+}
 
 /// Return the current UNIX epoch seconds for the active target.
 pub fn now_unix() -> u64 {
@@ -2423,8 +2473,7 @@ impl ZincWallet {
 
     /// Check whether the configured Esplora endpoint is reachable.
     pub async fn check_connection(esplora_url: &str) -> bool {
-        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
-            .build_async_with_sleeper::<SyncSleeper>();
+        let client = configured_esplora_client(esplora_url);
 
         match client {
             Ok(c) => c.get_height().await.is_ok(),
@@ -2466,15 +2515,44 @@ impl ZincWallet {
         self.force_next_full = true;
     }
 
+    /// Retire every in-flight read generation without changing wallet identity
+    /// or descriptors. Legacy WASM fetches cannot always be physically aborted;
+    /// their apply step observes this generation change and fails stale instead.
+    pub fn retire_inflight_sync(&mut self) {
+        self.account_generation = self.account_generation.wrapping_add(1);
+        self.is_syncing = false;
+        self.sync_latch_started_at_ms = 0.0;
+    }
+
     /// Apply taproot/payment updates and return merged event strings.
     pub fn apply_sync(
         &mut self,
         vault_update: impl Into<bdk_wallet::Update>,
         payment_update: Option<impl Into<bdk_wallet::Update>>,
     ) -> Result<Vec<String>, String> {
-        // Chain data and asset classifications are one snapshot. Invalidate
-        // before applying either update so even a partial apply followed by an
-        // error cannot leave an older Ord result marked current.
+        let vault_update = vault_update.into();
+        let payment_update = payment_update.map(Into::into);
+
+        // `Wallet::apply_update` can only fail while connecting its chain update;
+        // preflight both chains on clones before mutating either wallet. This makes
+        // the two-keychain apply boundary atomic without cloning signer state.
+        let preflight = |wallet: &Wallet, update: &bdk_wallet::Update| -> Result<(), String> {
+            if let Some(chain_update) = update.chain.clone() {
+                wallet
+                    .local_chain()
+                    .clone()
+                    .apply_update(chain_update)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+        preflight(&self.vault_wallet, &vault_update)?;
+        if let (Some(wallet), Some(update)) = (&self.payment_wallet, &payment_update) {
+            preflight(wallet, update)?;
+        }
+
+        // Chain data and asset classifications are one snapshot. Invalidate only
+        // after every fallible chain connection has passed preflight.
         self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
         self.chain_observed_at_unix = None;
         self.invalidate_asset_state();
@@ -2570,9 +2648,12 @@ impl ZincWallet {
 
     /// Run a full sync against Esplora for taproot and optional payment wallets.
     pub async fn sync(&mut self, esplora_url: &str) -> Result<Vec<String>, String> {
-        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
-            .build_async_with_sleeper::<SyncSleeper>()
-            .map_err(|e| format!("{e:?}"))?;
+        let client = configured_esplora_client(esplora_url).map_err(|error| {
+            serialize_backend_failure(&BackendFailureV1::from_esplora(
+                &error,
+                BackendOperationV1::Connect,
+            ))
+        })?;
 
         let now = wasm_now_secs();
         let vault_req = Self::flexible_full_scan_request(&self.vault_wallet, self.scan_policy, now);
@@ -2588,7 +2669,12 @@ impl ZincWallet {
         let vault_update = client
             .full_scan(vault_req, stop_gap, parallel_requests)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| {
+                serialize_backend_failure(&BackendFailureV1::from_esplora(
+                    &error,
+                    BackendOperationV1::Sync,
+                ))
+            })?;
 
         // 2. Sync Payment (if exists)
         let payment_update = if let Some(req) = payment_req {
@@ -2596,7 +2682,12 @@ impl ZincWallet {
                 client
                     .full_scan(req, stop_gap, parallel_requests)
                     .await
-                    .map_err(|e| e.to_string())?,
+                    .map_err(|error| {
+                        serialize_backend_failure(&BackendFailureV1::from_esplora(
+                            &error,
+                            BackendOperationV1::Sync,
+                        ))
+                    })?,
             )
         } else {
             None
@@ -2904,7 +2995,7 @@ impl ZincWallet {
         let ord_height = client
             .get_indexing_height()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(serialize_ord_error)?;
 
         // Get Wallet Tip (from Vault, which is always present)
         let wallet_height = self.vault_wallet.local_chain().tip().height();
@@ -2928,7 +3019,7 @@ impl ZincWallet {
         let resolved = client
             .resolve_assets_for_outpoints(&queryable_outpoints)
             .await
-            .map_err(|e| format!("Failed to resolve wallet outpoints: {e}"))?;
+            .map_err(serialize_ord_error)?;
 
         let count = self.apply_verified_ordinals_update(
             resolved.inscriptions,
@@ -2950,26 +3041,26 @@ impl ZincWallet {
         let ord_height = client
             .get_indexing_height()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(serialize_ord_error)?;
         let wallet_height = self.vault_wallet.local_chain().tip().height();
         self.verify_ord_indexer_is_current(ord_height, wallet_height)?;
         let rune_balances = client
             .get_rune_balances_for_addresses(&addresses)
             .await
-            .map_err(|e| format!("Failed to fetch rune balances: {e}"))?;
+            .map_err(serialize_ord_error)?;
 
         let mut all_inscriptions = Vec::new();
         for addr_str in addresses {
             let snapshot = client
                 .get_address_asset_snapshot(&addr_str)
                 .await
-                .map_err(|e| format!("Failed to fetch for {addr_str}: {e}"))?;
+                .map_err(serialize_ord_error)?;
 
             for inscription_id in snapshot.inscription_ids {
                 let inscription = client
                     .get_inscription_details(&inscription_id)
                     .await
-                    .map_err(|e| format!("Failed to fetch details for {inscription_id}: {e}"))?;
+                    .map_err(serialize_ord_error)?;
                 all_inscriptions.push(inscription);
             }
         }
@@ -7262,15 +7353,17 @@ impl ZincWallet {
             .map_err(|e| format!("Failed to extract tx: {e}"))?;
 
         // Broadcast via Esplora
-        let client = esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
-            .build_async_with_sleeper::<SyncSleeper>()
-            .map_err(|e| format!("Failed to create client: {e:?}"))?;
+        let client = configured_esplora_client(esplora_url).map_err(|error| {
+            serialize_backend_failure(&BackendFailureV1::from_esplora(
+                &error,
+                BackendOperationV1::Connect,
+            ))
+        })?;
 
-        let broadcast_res: Result<(), _> = client.broadcast(&tx).await;
-
-        broadcast_res.map_err(|e| format!("Broadcast failed: {e}"))?;
-
-        Ok(tx.compute_txid().to_string())
+        broadcast_esplora_transaction(&client, &tx)
+            .await
+            .map(|txid| txid.to_string())
+            .map_err(|failure| serialize_backend_failure(&failure))
     }
 
     /// Sign a message with the private key corresponding to the given address.
@@ -8453,5 +8546,106 @@ mod tests {
 
         assert!(!wallet.is_syncing());
         assert_eq!(wallet.account_generation(), generation_before + 1);
+    }
+
+    #[test]
+    fn retiring_inflight_sync_invalidates_late_apply_and_releases_latch() {
+        use bdk_wallet::bitcoin::bip32::Xpriv;
+        let mnemonic = ZincMnemonic::generate(12).unwrap();
+        let seed = mnemonic.to_seed("");
+        let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
+        let mut wallet = WalletBuilder::new(Network::Signet)
+            .kind(WalletKind::Seed { master_xprv })
+            .build()
+            .unwrap();
+
+        assert!(wallet.try_begin_sync(1_000.0));
+        let generation_before = wallet.account_generation();
+        wallet.retire_inflight_sync();
+
+        assert_eq!(wallet.account_generation(), generation_before + 1);
+        assert!(!wallet.is_syncing());
+        assert!(wallet.try_begin_sync(1_001.0));
+    }
+
+    #[tokio::test]
+    async fn configured_esplora_client_never_hides_http_retries() {
+        let mut server = mockito::Server::new_async().await;
+        let tip = server
+            .mock("GET", "/blocks/tip/height")
+            .with_status(503)
+            .with_body("not ready")
+            .expect(1)
+            .create_async()
+            .await;
+
+        assert!(!ZincWallet::check_connection(&server.url()).await);
+        tip.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_esplora_broadcast_returns_the_local_txid() {
+        let mut server = mockito::Server::new_async().await;
+        let broadcast = server
+            .mock("POST", "/tx")
+            .with_status(400)
+            .with_body("txn-already-known")
+            .expect(1)
+            .create_async()
+            .await;
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .expect("client");
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let expected_txid = tx.compute_txid();
+
+        assert_eq!(
+            broadcast_esplora_transaction(&client, &tx).await,
+            Ok(expected_txid)
+        );
+        broadcast.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_esplora_broadcast_reconciles_by_exact_txid_without_rebroadcast() {
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let expected_txid = tx.compute_txid();
+        let mut server = mockito::Server::new_async().await;
+        let broadcast = server
+            .mock("POST", "/tx")
+            .with_status(503)
+            .with_body("temporarily unavailable")
+            .expect(1)
+            .create_async()
+            .await;
+        let lookup = server
+            .mock("GET", format!("/tx/{expected_txid}/raw").as_str())
+            .with_status(200)
+            .with_body(bitcoin::consensus::serialize(&tx))
+            .expect(1)
+            .create_async()
+            .await;
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .expect("client");
+
+        assert_eq!(
+            broadcast_esplora_transaction(&client, &tx).await,
+            Ok(expected_txid)
+        );
+        broadcast.assert_async().await;
+        lookup.assert_async().await;
     }
 }
