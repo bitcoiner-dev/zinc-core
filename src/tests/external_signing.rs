@@ -652,9 +652,9 @@ mod tests {
     }
 
     #[test]
-    fn chain_update_invalidates_asset_state_and_stale_result_cannot_restore_it() {
+    fn empty_chain_update_preserves_generation_and_verified_asset_state() {
         let (mut wallet, _) = setup();
-        let stale_generation = wallet.chain_state_generation();
+        let generation = wallet.chain_state_generation();
         assert!(wallet.ordinals_verified());
 
         wallet
@@ -667,12 +667,70 @@ mod tests {
                 None::<bdk_wallet::Update>,
             )
             .unwrap();
+        assert_eq!(wallet.chain_state_generation(), generation,);
+        assert!(wallet.ordinals_verified());
+    }
+
+    #[test]
+    fn chain_tip_change_advances_generation_and_invalidates_assets() {
+        let (mut wallet, _) = setup();
+        let generation = wallet.chain_state_generation();
+        let current_tip = wallet.vault_wallet.latest_checkpoint();
+        let next_height = current_tip.height().saturating_add(1);
+        let next_tip = current_tip.insert(BlockId {
+            height: next_height,
+            hash: BlockHash::from_byte_array([3; 32]),
+        });
+
+        wallet
+            .apply_sync(
+                bdk_wallet::Update {
+                    tx_update: Default::default(),
+                    chain: Some(next_tip),
+                    last_active_indices: Default::default(),
+                },
+                None::<bdk_wallet::Update>,
+            )
+            .unwrap();
+
+        assert_eq!(wallet.chain_state_generation(), generation.wrapping_add(1));
+        assert!(!wallet.ordinals_verified());
+    }
+
+    #[test]
+    fn material_owned_output_change_advances_generation_and_invalidates_assets() {
+        let (mut wallet, _) = setup();
+        let stale_generation = wallet.chain_state_generation();
+        assert!(wallet.ordinals_verified());
+
+        let existing = wallet
+            .vault_wallet
+            .list_unspent()
+            .next()
+            .expect("funded fixture");
+        let mut next = dummy_tx(25_000, existing.txout.script_pubkey, 2);
+        next.input[0].previous_output = existing.outpoint;
+        let mut graph = TxGraph::<ConfirmationBlockTime>::default();
+        let next_txid = next.compute_txid();
+        let _ = graph.insert_tx(next);
+        let _ = graph.insert_seen_at(next_txid, 2_000);
+
+        wallet
+            .apply_sync(
+                bdk_wallet::Update {
+                    tx_update: graph.into(),
+                    chain: Default::default(),
+                    last_active_indices: Default::default(),
+                },
+                None::<bdk_wallet::Update>,
+            )
+            .unwrap();
+
         assert_eq!(
             wallet.chain_state_generation(),
             stale_generation.wrapping_add(1)
         );
         assert!(!wallet.ordinals_verified());
-
         let error = wallet
             .apply_verified_ordinals_update(
                 Vec::new(),
@@ -683,6 +741,106 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("Stale ordinals update"), "{error}");
-        assert!(!wallet.ordinals_verified());
+    }
+
+    #[test]
+    fn inscription_transfer_snapshot_reuses_verified_owned_output_facts() {
+        use crate::ordinals::types::{Inscription, Satpoint};
+
+        let (mut wallet, _) = setup();
+        let selected = wallet
+            .vault_wallet
+            .list_unspent()
+            .next()
+            .expect("funded fixture");
+        let inscription_id = format!("{}i0", selected.outpoint.txid);
+        wallet.inscriptions.push(Inscription {
+            id: inscription_id.clone(),
+            number: 1,
+            satpoint: Satpoint {
+                outpoint: selected.outpoint,
+                offset: 0,
+            },
+            content_type: Some("image/png".to_string()),
+            value: Some(selected.txout.value.to_sat()),
+            content_length: None,
+            timestamp: None,
+        });
+        wallet.inscribed_utxos.insert(selected.outpoint);
+        wallet
+            .apply_sync(
+                bdk_wallet::Update {
+                    tx_update: Default::default(),
+                    chain: Default::default(),
+                    last_active_indices: Default::default(),
+                },
+                None::<bdk_wallet::Update>,
+            )
+            .unwrap();
+
+        let snapshot = wallet
+            .inscription_transfer_construction_snapshot(std::slice::from_ref(&inscription_id))
+            .expect("current verified state should produce a snapshot");
+        assert_eq!(snapshot.inscriptions().len(), 1);
+        assert_eq!(snapshot.inscriptions()[0].inscription_id(), inscription_id);
+        assert_eq!(snapshot.inscriptions()[0].txout(), &selected.txout);
+        assert!(snapshot.fee_inputs().is_empty());
+        assert!(wallet.inscription_transfer_snapshot_is_current(&snapshot));
+
+        wallet
+            .apply_sync(
+                bdk_wallet::Update {
+                    tx_update: Default::default(),
+                    chain: Default::default(),
+                    last_active_indices: Default::default(),
+                },
+                None::<bdk_wallet::Update>,
+            )
+            .unwrap();
+        assert!(wallet.inscription_transfer_snapshot_is_current(&snapshot));
+    }
+
+    #[test]
+    fn inscription_transfer_snapshot_rejects_stale_or_syncing_facts() {
+        use crate::ordinals::types::{Inscription, Satpoint};
+
+        let (mut wallet, _) = setup();
+        let selected = wallet
+            .vault_wallet
+            .list_unspent()
+            .next()
+            .expect("funded fixture");
+        let inscription_id = format!("{}i0", selected.outpoint.txid);
+        wallet.inscriptions.push(Inscription {
+            id: inscription_id.clone(),
+            number: 1,
+            satpoint: Satpoint {
+                outpoint: selected.outpoint,
+                offset: 0,
+            },
+            content_type: Some("image/png".to_string()),
+            value: Some(selected.txout.value.to_sat()),
+            content_length: None,
+            timestamp: None,
+        });
+        wallet.inscribed_utxos.insert(selected.outpoint);
+
+        wallet.chain_observed_at_unix = Some(0);
+        let stale_error = wallet
+            .inscription_transfer_construction_snapshot(std::slice::from_ref(&inscription_id))
+            .err()
+            .expect("stale construction facts must not be reused");
+        assert!(stale_error.contains("stale"), "{stale_error}");
+
+        wallet.chain_observed_at_unix = wallet.ordinals_observed_at_unix;
+        wallet.is_syncing = true;
+        let syncing_error = wallet
+            .inscription_transfer_construction_snapshot(std::slice::from_ref(&inscription_id))
+            .err()
+            .expect("in-flight sync must block snapshot reuse");
+        assert!(
+            syncing_error.contains("sync is in progress"),
+            "{syncing_error}"
+        );
     }
 }

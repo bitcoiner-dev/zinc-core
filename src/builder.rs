@@ -808,6 +808,80 @@ impl CompanionRoutineChangeFact {
     }
 }
 
+/// One selected inscription resolved against the wallet's current verified
+/// Ordinals state and owned BDK output set.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InscriptionTransferInputFact {
+    inscription_id: String,
+    satpoint: crate::ordinals::types::Satpoint,
+    txout: bitcoin::TxOut,
+}
+
+impl InscriptionTransferInputFact {
+    #[must_use]
+    pub fn inscription_id(&self) -> &str {
+        &self.inscription_id
+    }
+
+    #[must_use]
+    pub const fn satpoint(&self) -> &crate::ordinals::types::Satpoint {
+        &self.satpoint
+    }
+
+    #[must_use]
+    pub const fn txout(&self) -> &bitcoin::TxOut {
+        &self.txout
+    }
+}
+
+/// One confirmed, wallet-owned, asset-free output eligible to pay transfer fees.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InscriptionTransferFeeInputFact {
+    outpoint: bitcoin::OutPoint,
+    txout: bitcoin::TxOut,
+}
+
+impl InscriptionTransferFeeInputFact {
+    #[must_use]
+    pub const fn outpoint(&self) -> bitcoin::OutPoint {
+        self.outpoint
+    }
+
+    #[must_use]
+    pub const fn txout(&self) -> &bitcoin::TxOut {
+        &self.txout
+    }
+}
+
+/// Coherent native construction inputs for an inscription transfer.
+///
+/// The private fields prevent webview data from masquerading as a verified
+/// wallet snapshot. Callers must re-check it against the wallet before
+/// publishing a constructed result.
+pub struct InscriptionTransferConstructionSnapshot {
+    account_generation: u64,
+    chain_state_generation: u64,
+    inscriptions: Vec<InscriptionTransferInputFact>,
+    fee_inputs: Vec<InscriptionTransferFeeInputFact>,
+}
+
+impl InscriptionTransferConstructionSnapshot {
+    #[must_use]
+    pub const fn chain_state_generation(&self) -> u64 {
+        self.chain_state_generation
+    }
+
+    #[must_use]
+    pub fn inscriptions(&self) -> &[InscriptionTransferInputFact] {
+        &self.inscriptions
+    }
+
+    #[must_use]
+    pub fn fee_inputs(&self) -> &[InscriptionTransferFeeInputFact] {
+        &self.fee_inputs
+    }
+}
+
 /// Coherent phone-wallet facts for one exact routine PSBT.
 ///
 /// This type has no public constructor and cannot be cloned, debugged, or
@@ -2533,6 +2607,29 @@ impl ZincWallet {
         let vault_update = vault_update.into();
         let payment_update = payment_update.map(Into::into);
 
+        if self.payment_wallet.is_some() && payment_update.is_none() {
+            // An incomplete dual-wallet sync cannot establish a coherent spend
+            // view. Retire the previous verified snapshot even though no update
+            // is applied.
+            self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+            self.chain_observed_at_unix = None;
+            self.invalidate_asset_state();
+            return Err("Payment wallet update is required for a coherent sync".to_string());
+        }
+
+        // A construction snapshot only becomes stale when the best-chain tip or an
+        // owned output actually changes. Esplora may return a valid but identical
+        // update on every poll; treating that as a new generation needlessly retires
+        // verified Ordinals state and every transaction prepared from it.
+        let construction_state = |wallet: &Wallet| {
+            let tip = wallet.latest_checkpoint().block_id();
+            let mut outputs: Vec<_> = wallet.list_unspent().collect();
+            outputs.sort_by_key(|output| output.outpoint);
+            (tip, outputs)
+        };
+        let vault_before = construction_state(&self.vault_wallet);
+        let payment_before = self.payment_wallet.as_ref().map(&construction_state);
+
         // `Wallet::apply_update` can only fail while connecting its chain update;
         // preflight both chains on clones before mutating either wallet. This makes
         // the two-keychain apply boundary atomic without cloning signer state.
@@ -2551,18 +2648,18 @@ impl ZincWallet {
             preflight(wallet, update)?;
         }
 
-        // Chain data and asset classifications are one snapshot. Invalidate only
-        // after every fallible chain connection has passed preflight.
-        self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
-        self.chain_observed_at_unix = None;
-        self.invalidate_asset_state();
         let mut all_events = Vec::new();
 
         // 1. Apply Vault Update
-        let vault_events = self
-            .vault_wallet
-            .apply_update_events(vault_update)
-            .map_err(|e| e.to_string())?;
+        let vault_events = match self.vault_wallet.apply_update_events(vault_update) {
+            Ok(events) => events,
+            Err(error) => {
+                self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+                self.chain_observed_at_unix = None;
+                self.invalidate_asset_state();
+                return Err(error.to_string());
+            }
+        };
 
         for event in vault_events {
             all_events.push(format!("taproot:{event:?}"));
@@ -2571,17 +2668,31 @@ impl ZincWallet {
         // 2. Apply Payment Update
         match (&mut self.payment_wallet, payment_update) {
             (Some(w), Some(u)) => {
-                let payment_events = w.apply_update_events(u).map_err(|e| e.to_string())?;
+                let payment_events = match w.apply_update_events(u) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+                        self.chain_observed_at_unix = None;
+                        self.invalidate_asset_state();
+                        return Err(error.to_string());
+                    }
+                };
                 for event in payment_events {
                     all_events.push(format!("payment:{event:?}"));
                 }
             }
-            (Some(_), None) => {
-                return Err("Payment wallet update is required for a coherent sync".to_string())
-            }
+            (Some(_), None) => unreachable!("coherent payment update checked before mutation"),
             (None, _) => {}
         }
 
+        let vault_after = construction_state(&self.vault_wallet);
+        let payment_after = self.payment_wallet.as_ref().map(construction_state);
+        if vault_before != vault_after || payment_before != payment_after {
+            // Chain data and asset classifications form one coherent snapshot.
+            // Only a material spend-state change retires that snapshot.
+            self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+            self.invalidate_asset_state();
+        }
         self.chain_observed_at_unix = Some(wasm_now_secs());
 
         Ok(all_events)
@@ -3616,6 +3727,134 @@ impl ZincWallet {
                 .map(|u| u.txout.clone())
         };
         find(&self.vault_wallet).or_else(|| self.payment_wallet.as_ref().and_then(find))
+    }
+
+    /// Resolve all authoritative facts needed to construct an inscription
+    /// transfer without repeating Esplora and Ord lookups at review time.
+    pub fn inscription_transfer_construction_snapshot(
+        &self,
+        inscription_ids: &[String],
+    ) -> Result<InscriptionTransferConstructionSnapshot, String> {
+        if inscription_ids.is_empty() {
+            return Err("At least one inscription is required".to_string());
+        }
+        if self.is_syncing {
+            return Err("Wallet sync is in progress".to_string());
+        }
+        if !self.asset_state_is_current() {
+            return Err("Verified Ordinals state is not current".to_string());
+        }
+        let now_unix = wasm_now_secs();
+        let chain_observed_at = self
+            .chain_observed_at_unix
+            .ok_or_else(|| "Wallet chain facts have not been refreshed".to_string())?;
+        let ordinals_observed_at = self
+            .ordinals_observed_at_unix
+            .ok_or_else(|| "Verified Ordinals facts have not been refreshed".to_string())?;
+        if chain_observed_at > now_unix
+            || ordinals_observed_at > now_unix
+            || now_unix.saturating_sub(chain_observed_at) > MAX_COMPANION_ROUTINE_FACT_AGE_SECONDS
+            || now_unix.saturating_sub(ordinals_observed_at)
+                > MAX_COMPANION_ROUTINE_FACT_AGE_SECONDS
+        {
+            return Err("Wallet construction facts are stale".to_string());
+        }
+
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut inscriptions = Vec::with_capacity(inscription_ids.len());
+        let mut selected_outpoints = std::collections::HashSet::new();
+        for inscription_id in inscription_ids {
+            if !seen_ids.insert(inscription_id.as_str()) {
+                return Err("Inscription transfer IDs must be unique".to_string());
+            }
+            let inscription = self
+                .inscriptions
+                .iter()
+                .find(|candidate| candidate.id == *inscription_id)
+                .ok_or_else(|| {
+                    format!("Inscription is not in the verified wallet state: {inscription_id}")
+                })?;
+            let outpoint = inscription.satpoint.outpoint;
+            if !self.inscribed_utxos.contains(&outpoint) {
+                return Err(format!(
+                    "Inscription outpoint is not protected by the verified wallet state: {outpoint}"
+                ));
+            }
+            let txout = self.resolve_owned_txout(&outpoint).ok_or_else(|| {
+                format!("Inscription output is no longer unspent by this wallet: {outpoint}")
+            })?;
+            if inscription
+                .value
+                .is_some_and(|value| value != txout.value.to_sat())
+            {
+                return Err(format!(
+                    "Inscription postage does not match the owned output: {outpoint}"
+                ));
+            }
+            selected_outpoints.insert(outpoint);
+            inscriptions.push(InscriptionTransferInputFact {
+                inscription_id: inscription.id.clone(),
+                satpoint: inscription.satpoint.clone(),
+                txout,
+            });
+        }
+
+        let payment_script = self
+            .peek_payment_address(0)
+            .unwrap_or_else(|| self.peek_taproot_address(0))
+            .script_pubkey();
+        let mut fee_inputs = Vec::new();
+        for wallet in std::iter::once(&self.vault_wallet).chain(self.payment_wallet.as_ref()) {
+            for unspent in wallet.list_unspent() {
+                let outpoint = unspent.outpoint;
+                if !unspent.chain_position.is_confirmed()
+                    || unspent.txout.script_pubkey != payment_script
+                    || selected_outpoints.contains(&outpoint)
+                    || !self.classified_outpoints.contains(&outpoint)
+                    || self.inscribed_utxos.contains(&outpoint)
+                    || self.rare_sat_outpoints.contains_key(&outpoint)
+                    || self.outpoint_runes.contains_key(&outpoint)
+                {
+                    continue;
+                }
+                fee_inputs.push(InscriptionTransferFeeInputFact {
+                    outpoint,
+                    txout: unspent.txout,
+                });
+            }
+        }
+        fee_inputs.sort_by_key(InscriptionTransferFeeInputFact::outpoint);
+
+        Ok(InscriptionTransferConstructionSnapshot {
+            account_generation: self.account_generation,
+            chain_state_generation: self.chain_state_generation,
+            inscriptions,
+            fee_inputs,
+        })
+    }
+
+    /// Revalidate an earlier snapshot immediately before exposing its result.
+    #[must_use]
+    pub fn inscription_transfer_snapshot_is_current(
+        &self,
+        snapshot: &InscriptionTransferConstructionSnapshot,
+    ) -> bool {
+        if snapshot.account_generation != self.account_generation
+            || snapshot.chain_state_generation != self.chain_state_generation
+            || !self.asset_state_is_current()
+        {
+            return false;
+        }
+        let ids: Vec<String> = snapshot
+            .inscriptions
+            .iter()
+            .map(|fact| fact.inscription_id.clone())
+            .collect();
+        self.inscription_transfer_construction_snapshot(&ids)
+            .is_ok_and(|current| {
+                current.inscriptions == snapshot.inscriptions
+                    && current.fee_inputs == snapshot.fee_inputs
+            })
     }
 
     /// Build an unsigned "sat surgery" / salvage PSBT: spend the given inscription-bearing UTXOs and
