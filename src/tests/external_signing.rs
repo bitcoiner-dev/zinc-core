@@ -647,14 +647,27 @@ mod tests {
             )
             .unwrap();
         assert!(wallet.ordinals_verified());
+        let asset_generation = wallet.asset_data_generation();
         wallet.mark_ordinals_unverified();
         assert!(!wallet.ordinals_verified());
+        assert_eq!(
+            wallet.asset_data_generation(),
+            asset_generation.wrapping_add(1)
+        );
+        wallet.mark_ordinals_unverified();
+        assert_eq!(
+            wallet.asset_data_generation(),
+            asset_generation.wrapping_add(1),
+            "repeating an already-unverified state must not churn publication"
+        );
     }
 
     #[test]
     fn empty_chain_update_preserves_generation_and_verified_asset_state() {
         let (mut wallet, _) = setup();
         let generation = wallet.chain_state_generation();
+        let wallet_data_generation = wallet.wallet_data_generation();
+        let asset_data_generation = wallet.asset_data_generation();
         assert!(wallet.ordinals_verified());
 
         wallet
@@ -668,13 +681,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wallet.chain_state_generation(), generation,);
+        assert_eq!(wallet.wallet_data_generation(), wallet_data_generation);
+        assert_eq!(wallet.asset_data_generation(), asset_data_generation);
         assert!(wallet.ordinals_verified());
+    }
+
+    #[test]
+    fn irrelevant_tip_change_does_not_advance_public_wallet_data() {
+        let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0x77; 64]))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+        let chain_generation = wallet.chain_state_generation();
+        let wallet_data_generation = wallet.wallet_data_generation();
+        let current_tip = wallet.vault_wallet.latest_checkpoint();
+        let next_height = current_tip.height().saturating_add(1);
+        let next_tip = current_tip.insert(BlockId {
+            height: next_height,
+            hash: BlockHash::from_byte_array([0x77; 32]),
+        });
+
+        wallet
+            .apply_sync(
+                bdk_wallet::Update {
+                    tx_update: Default::default(),
+                    chain: Some(next_tip),
+                    last_active_indices: Default::default(),
+                },
+                None::<bdk_wallet::Update>,
+            )
+            .unwrap();
+
+        assert_eq!(
+            wallet.chain_state_generation(),
+            chain_generation.wrapping_add(1),
+            "the security generation still tracks the best-chain change"
+        );
+        assert_eq!(
+            wallet.wallet_data_generation(),
+            wallet_data_generation,
+            "an empty wallet has no public confirmation or owned-output change"
+        );
     }
 
     #[test]
     fn chain_tip_change_advances_generation_and_invalidates_assets() {
         let (mut wallet, _) = setup();
         let generation = wallet.chain_state_generation();
+        let wallet_data_generation = wallet.wallet_data_generation();
+        let asset_data_generation = wallet.asset_data_generation();
         let current_tip = wallet.vault_wallet.latest_checkpoint();
         let next_height = current_tip.height().saturating_add(1);
         let next_tip = current_tip.insert(BlockId {
@@ -694,6 +749,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(wallet.chain_state_generation(), generation.wrapping_add(1));
+        assert_eq!(
+            wallet.wallet_data_generation(),
+            wallet_data_generation.wrapping_add(1),
+            "a funded UTXO's confirmation count changes at a new tip"
+        );
+        assert_eq!(
+            wallet.asset_data_generation(),
+            asset_data_generation.wrapping_add(1)
+        );
         assert!(!wallet.ordinals_verified());
     }
 
@@ -701,6 +765,7 @@ mod tests {
     fn material_owned_output_change_advances_generation_and_invalidates_assets() {
         let (mut wallet, _) = setup();
         let stale_generation = wallet.chain_state_generation();
+        let wallet_data_generation = wallet.wallet_data_generation();
         assert!(wallet.ordinals_verified());
 
         let existing = wallet
@@ -729,6 +794,10 @@ mod tests {
         assert_eq!(
             wallet.chain_state_generation(),
             stale_generation.wrapping_add(1)
+        );
+        assert_eq!(
+            wallet.wallet_data_generation(),
+            wallet_data_generation.wrapping_add(1)
         );
         assert!(!wallet.ordinals_verified());
         let error = wallet

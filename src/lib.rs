@@ -3192,16 +3192,17 @@ impl ZincWasmWallet {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
                         let c = inner
-                            .apply_verified_ordinals_update_with_rare_sats(
+                            .apply_complete_verified_ordinals_update_with_rare_sats(
                                 all_inscriptions,
                                 protected_outpoints,
                                 rune_balances,
                                 rare_sat_outpoints,
+                                outpoint_runes,
+                                rune_infos,
                                 classified_outpoints,
                                 chain_generation,
                             )
                             .map_err(|error| JsValue::from_str(&error))?;
-                        inner.apply_outpoint_rune_holdings(outpoint_runes, rune_infos);
                         inner.is_syncing = false; // FINISHED
                         c
                     }
