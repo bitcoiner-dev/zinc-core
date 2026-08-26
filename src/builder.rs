@@ -1287,6 +1287,12 @@ pub struct ZincWallet {
     pub(crate) ordinals_metadata_complete: bool,
     /// Monotonic generation of the BDK chain/UTXO state.
     pub(crate) chain_state_generation: u64,
+    /// Monotonic hint for hosts that publish balance/history/owned-output data.
+    /// This is transport/cache metadata only, never signing authority.
+    pub(crate) wallet_data_generation: u64,
+    /// Monotonic hint for hosts that publish Ordinals/rune/classification data.
+    /// This is transport/cache metadata only, never signing authority.
+    pub(crate) asset_data_generation: u64,
     /// Wall-clock receipt time of the last successfully applied chain update.
     pub(crate) chain_observed_at_unix: Option<u64>,
     /// Chain generation for which the current asset classification was produced.
@@ -2291,6 +2297,25 @@ impl ZincWallet {
         self.chain_state_generation
     }
 
+    /// Return the material public wallet-data generation for host publication.
+    ///
+    /// This generation is a cache/transport hint. Transaction construction and
+    /// signing must continue to use the account/chain generations and native
+    /// snapshot revalidation APIs.
+    #[must_use]
+    pub fn wallet_data_generation(&self) -> u64 {
+        self.wallet_data_generation
+    }
+
+    /// Return the material public asset-data generation for host publication.
+    ///
+    /// This generation is a cache/transport hint. It does not prove that asset
+    /// state is current; callers must still check the native verification APIs.
+    #[must_use]
+    pub fn asset_data_generation(&self) -> u64 {
+        self.asset_data_generation
+    }
+
     fn asset_state_is_current(&self) -> bool {
         self.ordinals_verified
             && self.ordinals_metadata_complete
@@ -2298,15 +2323,26 @@ impl ZincWallet {
     }
 
     fn invalidate_asset_state(&mut self) {
+        let changed = self.ordinals_verified
+            || self.ordinals_metadata_complete
+            || self.ordinals_verified_generation.is_some()
+            || self.ordinals_observed_at_unix.is_some()
+            || !self.classified_outpoints.is_empty();
         self.ordinals_verified = false;
         self.ordinals_metadata_complete = false;
         self.ordinals_verified_generation = None;
         self.ordinals_observed_at_unix = None;
         self.classified_outpoints.clear();
+        if changed {
+            self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn mark_current_wallet_outpoints_classified_for_test(&mut self) {
+        let changed = !self.ordinals_verified
+            || !self.ordinals_metadata_complete
+            || self.ordinals_verified_generation != Some(self.chain_state_generation);
         self.classified_outpoints = self
             .collect_utxo_outpoints()
             .into_iter()
@@ -2316,6 +2352,9 @@ impl ZincWallet {
         self.ordinals_metadata_complete = true;
         self.ordinals_verified_generation = Some(self.chain_state_generation);
         self.ordinals_observed_at_unix = Some(wasm_now_secs());
+        if changed {
+            self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+        }
     }
 
     /// Height of the wallet's local chain tip. Lets hosts that orchestrate
@@ -2629,6 +2668,8 @@ impl ZincWallet {
         };
         let vault_before = construction_state(&self.vault_wallet);
         let payment_before = self.payment_wallet.as_ref().map(&construction_state);
+        let balance_before = self.get_raw_balance();
+        let history_before = self.get_transaction_page(20, None).ok();
 
         // `Wallet::apply_update` can only fail while connecting its chain update;
         // preflight both chains on clones before mutating either wallet. This makes
@@ -2655,6 +2696,7 @@ impl ZincWallet {
             Ok(events) => events,
             Err(error) => {
                 self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+                self.wallet_data_generation = self.wallet_data_generation.wrapping_add(1);
                 self.chain_observed_at_unix = None;
                 self.invalidate_asset_state();
                 return Err(error.to_string());
@@ -2672,6 +2714,7 @@ impl ZincWallet {
                     Ok(events) => events,
                     Err(error) => {
                         self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+                        self.wallet_data_generation = self.wallet_data_generation.wrapping_add(1);
                         self.chain_observed_at_unix = None;
                         self.invalidate_asset_state();
                         return Err(error.to_string());
@@ -2687,6 +2730,26 @@ impl ZincWallet {
 
         let vault_after = construction_state(&self.vault_wallet);
         let payment_after = self.payment_wallet.as_ref().map(construction_state);
+        let balance_after = self.get_raw_balance();
+        let history_after = self.get_transaction_page(20, None).ok();
+        let vault_confirmation_view_changed = vault_before.0 != vault_after.0
+            && (!vault_before.1.is_empty() || !vault_after.1.is_empty());
+        let payment_confirmation_view_changed = match (&payment_before, &payment_after) {
+            (Some(before), Some(after)) => {
+                before.0 != after.0 && (!before.1.is_empty() || !after.1.is_empty())
+            }
+            _ => false,
+        };
+        if vault_confirmation_view_changed
+            || payment_confirmation_view_changed
+            || vault_before.1 != vault_after.1
+            || payment_before.as_ref().map(|state| &state.1)
+                != payment_after.as_ref().map(|state| &state.1)
+            || balance_before != balance_after
+            || history_before != history_after
+        {
+            self.wallet_data_generation = self.wallet_data_generation.wrapping_add(1);
+        }
         if vault_before != vault_after || payment_before != payment_after {
             // Chain data and asset classifications form one coherent snapshot.
             // Only a material spend-state change retires that snapshot.
@@ -2745,6 +2808,7 @@ impl ZincWallet {
         // 3. Increment account generation to invalidate any in-flight syncs
         self.account_generation = self.account_generation.wrapping_add(1);
         self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+        self.wallet_data_generation = self.wallet_data_generation.wrapping_add(1);
         self.chain_observed_at_unix = None;
         self.invalidate_asset_state();
         // In-flight syncs of the old generation bail on the generation check without clearing
@@ -2969,12 +3033,48 @@ impl ZincWallet {
     pub fn apply_verified_ordinals_update_with_rare_sats(
         &mut self,
         inscriptions: Vec<crate::ordinals::types::Inscription>,
-        mut protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+        protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
         rune_balances: Vec<crate::ordinals::types::RuneBalance>,
         rare_sat_outpoints: std::collections::HashMap<
             bitcoin::OutPoint,
             crate::ordinals::client::RareSatSummary,
         >,
+        classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+        expected_chain_generation: u64,
+    ) -> Result<usize, String> {
+        // Preserve the legacy two-step API's rune state. Existing callers may
+        // still publish per-outpoint rune holdings in a subsequent call.
+        let outpoint_runes = self.outpoint_runes.clone();
+        let rune_infos = self.rune_info_cache.clone();
+        self.apply_complete_verified_ordinals_update_with_rare_sats(
+            inscriptions,
+            protected_outpoints,
+            rune_balances,
+            rare_sat_outpoints,
+            outpoint_runes,
+            rune_infos,
+            classified_outpoints,
+            expected_chain_generation,
+        )
+    }
+
+    /// Atomically apply the complete verified Ordinals publication state.
+    ///
+    /// Hosts that resolve outpoint rune holdings separately must still join
+    /// them here so [`Self::asset_data_generation`] advances only after the
+    /// complete coherent asset snapshot has landed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_complete_verified_ordinals_update_with_rare_sats(
+        &mut self,
+        inscriptions: Vec<crate::ordinals::types::Inscription>,
+        mut protected_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+        mut rune_balances: Vec<crate::ordinals::types::RuneBalance>,
+        rare_sat_outpoints: std::collections::HashMap<
+            bitcoin::OutPoint,
+            crate::ordinals::client::RareSatSummary,
+        >,
+        outpoint_runes: std::collections::HashMap<bitcoin::OutPoint, Vec<(String, u128)>>,
+        rune_infos: std::collections::HashMap<String, crate::ordinals::types::RuneInfo>,
         classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
         expected_chain_generation: u64,
     ) -> Result<usize, String> {
@@ -3009,15 +3109,41 @@ impl ZincWallet {
             }
         }
 
+        for balance in &mut rune_balances {
+            if balance.id.is_none() {
+                balance.id = rune_infos
+                    .values()
+                    .find(|info| info.spaced_rune == balance.rune)
+                    .map(|info| info.id.clone());
+            }
+        }
+        let mut rune_info_cache = self.rune_info_cache.clone();
+        rune_info_cache.extend(rune_infos);
+        let changed = self.inscribed_utxos != protected_outpoints
+            || self.rare_sat_outpoints != rare_sat_outpoints
+            || self.inscriptions != inscriptions
+            || self.rune_balances != rune_balances
+            || self.outpoint_runes != outpoint_runes
+            || self.rune_info_cache != rune_info_cache
+            || self.classified_outpoints != classified_outpoints
+            || !self.ordinals_verified
+            || !self.ordinals_metadata_complete
+            || self.ordinals_verified_generation != Some(expected_chain_generation);
+
         self.inscribed_utxos = protected_outpoints;
         self.rare_sat_outpoints = rare_sat_outpoints;
         self.inscriptions = inscriptions;
         self.rune_balances = rune_balances;
+        self.outpoint_runes = outpoint_runes;
+        self.rune_info_cache = rune_info_cache;
         self.classified_outpoints = classified_outpoints;
         self.ordinals_verified = true;
         self.ordinals_metadata_complete = true;
         self.ordinals_verified_generation = Some(expected_chain_generation);
         self.ordinals_observed_at_unix = Some(wasm_now_secs());
+        if changed {
+            self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+        }
 
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
@@ -3040,7 +3166,8 @@ impl ZincWallet {
             outpoint_runes.len(),
             rune_infos.len()
         );
-        for balance in &mut self.rune_balances {
+        let mut rune_balances = self.rune_balances.clone();
+        for balance in &mut rune_balances {
             if balance.id.is_none() {
                 balance.id = rune_infos
                     .values()
@@ -3048,10 +3175,19 @@ impl ZincWallet {
                     .map(|info| info.id.clone());
             }
         }
-        self.outpoint_runes = outpoint_runes;
         // Merge rather than replace: infos for runes no longer held remain
         // useful for resolveRuneInfo lookups.
-        self.rune_info_cache.extend(rune_infos);
+        let mut rune_info_cache = self.rune_info_cache.clone();
+        rune_info_cache.extend(rune_infos);
+        if self.rune_balances != rune_balances
+            || self.outpoint_runes != outpoint_runes
+            || self.rune_info_cache != rune_info_cache
+        {
+            self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+        }
+        self.rune_balances = rune_balances;
+        self.outpoint_runes = outpoint_runes;
+        self.rune_info_cache = rune_info_cache;
     }
 
     /// Apply cached inscription metadata from an untrusted caller boundary.
@@ -3068,6 +3204,15 @@ impl ZincWallet {
             inscriptions.len()
         );
 
+        let changed = !self.inscribed_utxos.is_empty()
+            || !self.rare_sat_outpoints.is_empty()
+            || self.inscriptions != inscriptions
+            || !self.rune_balances.is_empty()
+            || !self.outpoint_runes.is_empty()
+            || self.ordinals_verified
+            || !self.ordinals_metadata_complete
+            || self.ordinals_verified_generation.is_some()
+            || !self.classified_outpoints.is_empty();
         self.inscribed_utxos.clear();
         self.rare_sat_outpoints.clear();
         self.inscriptions = inscriptions;
@@ -3078,6 +3223,9 @@ impl ZincWallet {
         self.ordinals_verified_generation = None;
         self.ordinals_observed_at_unix = None;
         self.classified_outpoints.clear();
+        if changed {
+            self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+        }
 
         self.inscriptions.len()
     }
@@ -3088,7 +3236,7 @@ impl ZincWallet {
         wallet_height: u32,
     ) -> Result<(), String> {
         if ord_height < wallet_height.saturating_sub(1) {
-            self.ordinals_verified = false;
+            self.mark_ordinals_unverified();
             return Err(format!(
                 "Ord Indexer is lagging! Ord: {ord_height}, Wallet: {wallet_height}. Safety lock engaged."
             ));
@@ -3132,53 +3280,79 @@ impl ZincWallet {
             .await
             .map_err(serialize_ord_error)?;
 
-        let count = self.apply_verified_ordinals_update(
+        let count = self.apply_complete_verified_ordinals_update_with_rare_sats(
             resolved.inscriptions,
             resolved.protected_outpoints,
             resolved.rune_balances,
+            resolved.rare_sat_outpoints,
+            resolved.outpoint_runes,
+            resolved.rune_infos,
             classified_outpoints,
             chain_generation,
         )?;
-        self.apply_outpoint_rune_holdings(resolved.outpoint_runes, resolved.rune_infos);
         Ok(count)
     }
 
     /// Refresh inscription metadata used by UI and PSBT analysis.
     pub async fn sync_ordinals_metadata(&mut self, ord_url: &str) -> Result<usize, String> {
+        let previous_metadata_complete = self.ordinals_metadata_complete;
+        let previous_inscriptions = self.inscriptions.clone();
+        let previous_rune_balances = self.rune_balances.clone();
+        let generation_before = self.asset_data_generation;
         self.ordinals_metadata_complete = false;
         let addresses = self.collect_active_addresses();
         let client = crate::ordinals::OrdClient::new(ord_url.to_string());
 
-        let ord_height = client
-            .get_indexing_height()
-            .await
-            .map_err(serialize_ord_error)?;
-        let wallet_height = self.vault_wallet.local_chain().tip().height();
-        self.verify_ord_indexer_is_current(ord_height, wallet_height)?;
-        let rune_balances = client
-            .get_rune_balances_for_addresses(&addresses)
-            .await
-            .map_err(serialize_ord_error)?;
-
-        let mut all_inscriptions = Vec::new();
-        for addr_str in addresses {
-            let snapshot = client
-                .get_address_asset_snapshot(&addr_str)
+        let fetched = async {
+            let ord_height = client
+                .get_indexing_height()
+                .await
+                .map_err(serialize_ord_error)?;
+            let wallet_height = self.vault_wallet.local_chain().tip().height();
+            self.verify_ord_indexer_is_current(ord_height, wallet_height)?;
+            let rune_balances = client
+                .get_rune_balances_for_addresses(&addresses)
                 .await
                 .map_err(serialize_ord_error)?;
 
-            for inscription_id in snapshot.inscription_ids {
-                let inscription = client
-                    .get_inscription_details(&inscription_id)
+            let mut all_inscriptions = Vec::new();
+            for addr_str in addresses {
+                let snapshot = client
+                    .get_address_asset_snapshot(&addr_str)
                     .await
                     .map_err(serialize_ord_error)?;
-                all_inscriptions.push(inscription);
-            }
-        }
 
+                for inscription_id in snapshot.inscription_ids {
+                    let inscription = client
+                        .get_inscription_details(&inscription_id)
+                        .await
+                        .map_err(serialize_ord_error)?;
+                    all_inscriptions.push(inscription);
+                }
+            }
+            Ok::<_, String>((all_inscriptions, rune_balances))
+        }
+        .await;
+
+        let (all_inscriptions, rune_balances) = match fetched {
+            Ok(values) => values,
+            Err(error) => {
+                if previous_metadata_complete && self.asset_data_generation == generation_before {
+                    self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+                }
+                return Err(error);
+            }
+        };
+        let changed = !previous_metadata_complete
+            || previous_inscriptions != all_inscriptions
+            || previous_rune_balances != rune_balances;
         self.inscriptions = all_inscriptions;
         self.rune_balances = rune_balances;
         self.ordinals_metadata_complete = true;
+        if changed && self.asset_data_generation == generation_before {
+            self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+        }
+
         Ok(self.inscriptions.len())
     }
 
@@ -8436,6 +8610,8 @@ impl WalletBuilder {
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             chain_state_generation: 0,
+            wallet_data_generation: 0,
+            asset_data_generation: 0,
             chain_observed_at_unix: None,
             ordinals_verified_generation: None,
             ordinals_observed_at_unix: None,
@@ -8584,6 +8760,8 @@ impl WalletBuilder {
             ordinals_verified: false,
             ordinals_metadata_complete: false,
             chain_state_generation: 0,
+            wallet_data_generation: 0,
+            asset_data_generation: 0,
             chain_observed_at_unix: None,
             ordinals_verified_generation: None,
             ordinals_observed_at_unix: None,
@@ -8632,6 +8810,57 @@ mod tests {
         let master_xprv = Xpriv::new_master(Network::Signet, seed.as_ref()).expect("valid seed");
         let kind = WalletKind::Seed { master_xprv };
         assert!(format!("{kind:?}").contains("master_xprv: \"[REDACTED]\""));
+    }
+
+    #[test]
+    fn asset_data_generation_tracks_only_material_complete_ord_publications() {
+        let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0x31; 64]))
+            .build()
+            .expect("wallet");
+        let chain_generation = wallet.chain_state_generation();
+        let initial_generation = wallet.asset_data_generation();
+
+        let apply = |wallet: &mut ZincWallet, rune_balances| {
+            wallet
+                .apply_complete_verified_ordinals_update_with_rare_sats(
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    rune_balances,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::HashSet::new(),
+                    chain_generation,
+                )
+                .expect("matching Ord snapshot")
+        };
+
+        apply(&mut wallet, Vec::new());
+        let verified_generation = wallet.asset_data_generation();
+        assert_eq!(verified_generation, initial_generation.wrapping_add(1));
+
+        apply(&mut wallet, Vec::new());
+        assert_eq!(
+            wallet.asset_data_generation(),
+            verified_generation,
+            "an identical verified refresh must not republish assets"
+        );
+
+        apply(
+            &mut wallet,
+            vec![crate::ordinals::types::RuneBalance {
+                rune: "TEST•RUNE".to_string(),
+                amount: "1".to_string(),
+                divisibility: Some(0),
+                symbol: None,
+                id: Some("1:0".to_string()),
+            }],
+        );
+        assert_eq!(
+            wallet.asset_data_generation(),
+            verified_generation.wrapping_add(1),
+            "same-chain metadata corrections must republish assets"
+        );
     }
 
     #[test]
