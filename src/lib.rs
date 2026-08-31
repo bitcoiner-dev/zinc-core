@@ -665,10 +665,109 @@ where
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AccountDiscoveryProbeError {
     Deadline,
+    /// Retained for pure helper tests that do not construct a transport error.
+    #[cfg(test)]
     Backend,
+    #[cfg(target_arch = "wasm32")]
+    BackendFailure(BackendFailureV1),
+}
+
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_ADDRESS_BATCH_SIZE: u32 = 2;
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_ADDRESS_REQUEST_TIMEOUT_MS: u32 = 10_000;
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_BATCH_COOLDOWN_MS: u32 = 250;
+
+#[cfg(target_arch = "wasm32")]
+async fn probe_esplora_address_activity(
+    client: &reqwest::Client,
+    url: String,
+    deadline_ms: f64,
+) -> Result<bool, AccountDiscoveryProbeError> {
+    let remaining_ms = deadline_ms - js_sys::Date::now();
+    if remaining_ms <= 0.0 {
+        return Err(AccountDiscoveryProbeError::Deadline);
+    }
+    let request_timeout_ms = remaining_ms
+        .min(f64::from(ACCOUNT_DISCOVERY_ADDRESS_REQUEST_TIMEOUT_MS))
+        .ceil() as u32;
+    let request = client.get(&url).send();
+    let timeout = gloo_timers::future::TimeoutFuture::new(request_timeout_ms.max(1));
+    futures_util::pin_mut!(request);
+    futures_util::pin_mut!(timeout);
+
+    let response = match futures_util::future::select(request, timeout).await {
+        futures_util::future::Either::Left((result, _)) => result.map_err(|error| {
+            AccountDiscoveryProbeError::BackendFailure(
+                BackendFailureV1::from_reqwest(
+                    &error,
+                    BackendDependencyV1::Esplora,
+                    BackendOperationV1::Sync,
+                )
+                .with_upstream_code("account_discovery_probe_transport"),
+            )
+        })?,
+        futures_util::future::Either::Right((_timed_out, _)) => {
+            if js_sys::Date::now() >= deadline_ms {
+                return Err(AccountDiscoveryProbeError::Deadline);
+            }
+            return Err(AccountDiscoveryProbeError::BackendFailure(
+                BackendFailureV1::new(
+                    BackendDependencyV1::Esplora,
+                    BackendOperationV1::Sync,
+                    BackendFailureCategoryV1::Timeout,
+                )
+                .with_upstream_code("account_discovery_probe_timeout"),
+            ));
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok());
+        return Err(AccountDiscoveryProbeError::BackendFailure(
+            BackendFailureV1::from_http_status(
+                BackendDependencyV1::Esplora,
+                BackendOperationV1::Sync,
+                status,
+                retry_after,
+            )
+            .with_upstream_code("account_discovery_probe_http"),
+        ));
+    }
+
+    let json = response.json::<serde_json::Value>().await.map_err(|_| {
+        AccountDiscoveryProbeError::BackendFailure(
+            BackendFailureV1::invalid_response(
+                BackendDependencyV1::Esplora,
+                BackendOperationV1::Sync,
+            )
+            .with_upstream_code("account_discovery_probe_invalid_response"),
+        )
+    })?;
+    let invalid_response = || {
+        AccountDiscoveryProbeError::BackendFailure(
+            BackendFailureV1::invalid_response(
+                BackendDependencyV1::Esplora,
+                BackendOperationV1::Sync,
+            )
+            .with_upstream_code("account_discovery_probe_invalid_response"),
+        )
+    };
+    let chain_txs = json["chain_stats"]["tx_count"]
+        .as_u64()
+        .ok_or_else(&invalid_response)?;
+    let mempool_txs = json["mempool_stats"]["tx_count"]
+        .as_u64()
+        .ok_or_else(invalid_response)?;
+    Ok(chain_txs > 0 || mempool_txs > 0)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -695,6 +794,9 @@ where
     Fut: Future<Output = Result<bool, AccountDiscoveryProbeError>>,
 {
     let depth = address_scan_depth.max(1);
+    #[cfg(target_arch = "wasm32")]
+    const ADDRESS_SCAN_BATCH_SIZE: u32 = ACCOUNT_DISCOVERY_ADDRESS_BATCH_SIZE;
+    #[cfg(not(target_arch = "wasm32"))]
     const ADDRESS_SCAN_BATCH_SIZE: u32 = 20;
 
     let mut batch_start = 0;
@@ -714,6 +816,10 @@ where
         }
 
         batch_start = batch_end;
+        #[cfg(target_arch = "wasm32")]
+        if batch_start < depth {
+            gloo_timers::future::TimeoutFuture::new(ACCOUNT_DISCOVERY_BATCH_COOLDOWN_MS).await;
+        }
     }
 
     Ok(None)
@@ -2622,45 +2728,10 @@ impl ZincWasmWallet {
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-                const ADDRESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
-
                 let check_activity = |addr_str: String| {
                     let client = client.clone();
                     let url = format!("{}/address/{}", esplora_url, addr_str);
-                    async move {
-                        let request = async {
-                            let response = client
-                                .get(&url)
-                                .send()
-                                .await
-                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
-                            if !response.status().is_success() {
-                                return Err(AccountDiscoveryProbeError::Backend);
-                            }
-                            let json = response
-                                .json::<serde_json::Value>()
-                                .await
-                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
-                            let chain_txs = json["chain_stats"]["tx_count"]
-                                .as_u64()
-                                .ok_or(AccountDiscoveryProbeError::Backend)?;
-                            let mempool_txs = json["mempool_stats"]["tx_count"]
-                                .as_u64()
-                                .ok_or(AccountDiscoveryProbeError::Backend)?;
-                            Ok(chain_txs > 0 || mempool_txs > 0)
-                        };
-                        let timeout =
-                            gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
-                        futures_util::pin_mut!(request);
-                        futures_util::pin_mut!(timeout);
-
-                        match futures_util::future::select(request, timeout).await {
-                            futures_util::future::Either::Left((value, _)) => value,
-                            futures_util::future::Either::Right((_timed_out, _)) => {
-                                Err(AccountDiscoveryProbeError::Backend)
-                            }
-                        }
-                    }
+                    async move { probe_esplora_address_activity(&client, url, deadline_ms).await }
                 };
 
                 // Scan each account's receive chain deeply enough to catch funds parked
@@ -2705,10 +2776,14 @@ impl ZincWasmWallet {
                         stop_reason = AccountDiscoveryStopReasonV1::Deadline;
                         break;
                     }
+                    #[cfg(test)]
                     Err(AccountDiscoveryProbeError::Backend) => {
                         return Err(JsValue::from_str(
                             "Account discovery backend request failed",
                         ));
+                    }
+                    Err(AccountDiscoveryProbeError::BackendFailure(failure)) => {
+                        return Err(backend_failure_to_js(&failure));
                     }
                 };
 
@@ -2841,45 +2916,10 @@ impl ZincWasmWallet {
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-                const ADDRESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
-
                 let check_activity = |addr_str: String| {
                     let client = client.clone();
                     let url = format!("{}/address/{}", esplora_url, addr_str);
-                    async move {
-                        let request = async {
-                            let response = client
-                                .get(&url)
-                                .send()
-                                .await
-                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
-                            if !response.status().is_success() {
-                                return Err(AccountDiscoveryProbeError::Backend);
-                            }
-                            let json = response
-                                .json::<serde_json::Value>()
-                                .await
-                                .map_err(|_| AccountDiscoveryProbeError::Backend)?;
-                            let chain_txs = json["chain_stats"]["tx_count"]
-                                .as_u64()
-                                .ok_or(AccountDiscoveryProbeError::Backend)?;
-                            let mempool_txs = json["mempool_stats"]["tx_count"]
-                                .as_u64()
-                                .ok_or(AccountDiscoveryProbeError::Backend)?;
-                            Ok(chain_txs > 0 || mempool_txs > 0)
-                        };
-                        let timeout =
-                            gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
-                        futures_util::pin_mut!(request);
-                        futures_util::pin_mut!(timeout);
-
-                        match futures_util::future::select(request, timeout).await {
-                            futures_util::future::Either::Left((value, _)) => value,
-                            futures_util::future::Either::Right((_timed_out, _)) => {
-                                Err(AccountDiscoveryProbeError::Backend)
-                            }
-                        }
-                    }
+                    async move { probe_esplora_address_activity(&client, url, deadline_ms).await }
                 };
 
                 let first_active_address_index = first_active_receive_index_from_scan_strict(
@@ -2924,8 +2964,12 @@ impl ZincWasmWallet {
                         stop_reason = ImportPathDiscoveryStopReasonV1::Deadline;
                         break;
                     }
+                    #[cfg(test)]
                     Err(AccountDiscoveryProbeError::Backend) => {
                         return Err(JsValue::from_str("Import discovery backend request failed"));
+                    }
+                    Err(AccountDiscoveryProbeError::BackendFailure(failure)) => {
+                        return Err(backend_failure_to_js(&failure));
                     }
                 };
 
