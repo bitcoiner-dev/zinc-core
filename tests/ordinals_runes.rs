@@ -90,9 +90,11 @@ fn analyze(
     input_scope: Option<&[usize]>,
 ) -> zinc_core::ordinals::shield::AnalysisResult {
     let known_inscriptions = HashMap::new();
+    let known_rare_sats = HashMap::new();
     let ctx = ShieldContext {
         known_inscriptions: &known_inscriptions,
         known_runes,
+        known_rare_sats: &known_rare_sats,
         input_scope,
         network: bitcoin::Network::Bitcoin,
         mint_terms,
@@ -344,11 +346,13 @@ fn mixed_inscription_and_rune_input_reports_both() {
     let mut known_inscriptions: HashMap<(Txid, u32), Vec<(String, u64)>> = HashMap::new();
     known_inscriptions.insert((op.txid, op.vout), vec![("insc-1".to_string(), 0)]);
     let known_runes = known_runes_for(op, 42);
+    let known_rare_sats = HashMap::new();
     let mut terms = HashMap::new();
     terms.insert(DOG.to_string(), 0u128);
     let ctx = ShieldContext {
         known_inscriptions: &known_inscriptions,
         known_runes: &known_runes,
+        known_rare_sats: &known_rare_sats,
         input_scope: None,
         network: bitcoin::Network::Bitcoin,
         mint_terms: &terms,

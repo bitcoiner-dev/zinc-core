@@ -12,7 +12,7 @@ use bdk_wallet::bitcoin::hashes::{sha256, Hash};
 use bdk_wallet::bitcoin::psbt::{Input as PsbtInput, Psbt};
 use bdk_wallet::bitcoin::secp256k1::XOnlyPublicKey;
 use bdk_wallet::bitcoin::secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey};
-use bdk_wallet::bitcoin::OutPoint;
+use bdk_wallet::bitcoin::{OutPoint, Script};
 use getrandom::getrandom;
 use nostr::key::{PublicKey as NostrPublicKey, SecretKey as NostrSecretKey};
 use nostr::nips::nip44;
@@ -993,11 +993,13 @@ pub struct SignSellerInputScopeV1 {
     pub input_count: usize,
     pub expected_seller_outpoint: String,
     pub expected_ask_sats: u64,
+    pub expected_payout_script_pubkey_hex: String,
 }
 
 pub fn verify_sign_seller_input_scope(
     signed_intent: &SignedSignIntentV1,
     now_unix: i64,
+    expected_payout_script: &Script,
 ) -> Result<SignSellerInputScopeV1, ZincError> {
     signed_intent.verify()?;
     if now_unix > signed_intent.intent.expires_at_unix {
@@ -1030,6 +1032,7 @@ pub fn verify_sign_seller_input_scope(
         seller_input_index,
         expected_seller_outpoint,
         details.expected_ask_sats,
+        expected_payout_script,
     )?;
 
     Ok(SignSellerInputScopeV1 {
@@ -1039,18 +1042,20 @@ pub fn verify_sign_seller_input_scope(
         input_count: psbt.inputs.len(),
         expected_seller_outpoint: details.expected_seller_outpoint.clone(),
         expected_ask_sats: details.expected_ask_sats,
+        expected_payout_script_pubkey_hex: hex::encode(expected_payout_script.as_bytes()),
     })
 }
 
 pub fn verify_sign_seller_input_scope_json(
     signed_intent_json: &str,
     now_unix: i64,
+    expected_payout_script: &Script,
 ) -> Result<SignSellerInputScopeV1, ZincError> {
     let signed_intent: SignedSignIntentV1 =
         serde_json::from_str(signed_intent_json).map_err(|e| {
             ZincError::SerializationError(format!("invalid signed sign intent json: {e}"))
         })?;
-    verify_sign_seller_input_scope(&signed_intent, now_unix)
+    verify_sign_seller_input_scope(&signed_intent, now_unix, expected_payout_script)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1109,6 +1114,7 @@ pub fn build_signed_sign_intent_approved_receipt(
     now_unix: i64,
     signed_psbt_base64: Option<&str>,
     artifact_json: Option<&str>,
+    expected_payout_script: Option<&Script>,
 ) -> Result<SignedSignIntentReceiptV1, ZincError> {
     signed_intent.verify()?;
     if now_unix > signed_intent.intent.expires_at_unix {
@@ -1128,7 +1134,13 @@ pub fn build_signed_sign_intent_approved_receipt(
         signed_intent.intent.payload,
         SignIntentPayloadV1::SignSellerInput(_)
     ) {
-        verify_sign_seller_input_scope(signed_intent, now_unix)?;
+        let expected_payout_script = expected_payout_script.ok_or_else(|| {
+            ZincError::OfferError(
+                "approved SignSellerInput receipt requires a locally derived payout script"
+                    .to_string(),
+            )
+        })?;
+        verify_sign_seller_input_scope(signed_intent, now_unix, expected_payout_script)?;
         if signed_psbt_base64.is_none() {
             return Err(ZincError::OfferError(
                 "approved SignSellerInput receipt must include signed_psbt_base64".to_string(),
@@ -1192,7 +1204,13 @@ fn enforce_sign_seller_input_scope_constraints(
     seller_input_index: usize,
     expected_seller_outpoint: OutPoint,
     expected_ask_sats: u64,
+    expected_payout_script: &Script,
 ) -> Result<(), ZincError> {
+    if expected_payout_script.is_empty() {
+        return Err(ZincError::OfferError(
+            "expected payout script must not be empty".to_string(),
+        ));
+    }
     if seller_input_index != 0 {
         return Err(ZincError::OfferError(format!(
             "expected seller input `{expected_seller_outpoint}` must be first input (index 0), found index {seller_input_index}"
@@ -1222,14 +1240,19 @@ fn enforce_sign_seller_input_scope_constraints(
 
     let seller_postage_sats =
         seller_input_prevout_sats(psbt, seller_input_index, expected_seller_outpoint)?;
-    if psbt.unsigned_tx.output.len() < 2 {
+    if !(2..=3).contains(&psbt.unsigned_tx.output.len()) {
         return Err(ZincError::OfferError(
-            "sign seller input psbt must include buyer postage and seller payout outputs"
+            "sign seller input psbt must contain buyer postage, seller payout, and at most one buyer change output"
                 .to_string(),
         ));
     }
 
     let buyer_postage_out = &psbt.unsigned_tx.output[0];
+    if !crate::offer_accept::is_standard_spendable_output_script(&buyer_postage_out.script_pubkey) {
+        return Err(ZincError::OfferError(
+            "buyer postage output must use a non-empty spendable script".to_string(),
+        ));
+    }
     if buyer_postage_out.value.to_sat() != seller_postage_sats {
         return Err(ZincError::OfferError(format!(
             "expected buyer postage output at index 0 to equal seller postage {} sats; found {} sats",
@@ -1252,6 +1275,18 @@ fn enforce_sign_seller_input_scope_constraints(
             expected_seller_payout,
             seller_payout_out.value.to_sat()
         )));
+    }
+    if seller_payout_out.script_pubkey.as_script() != expected_payout_script {
+        return Err(ZincError::OfferError(
+            "seller payout output does not pay this wallet's payout script".to_string(),
+        ));
+    }
+    if psbt.unsigned_tx.output[2..].iter().any(|output| {
+        !crate::offer_accept::is_standard_spendable_output_script(&output.script_pubkey)
+    }) {
+        return Err(ZincError::OfferError(
+            "buyer change output must use a non-empty spendable script".to_string(),
+        ));
     }
 
     Ok(())

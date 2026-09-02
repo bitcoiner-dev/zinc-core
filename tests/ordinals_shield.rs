@@ -5,6 +5,7 @@ mod tests {
     use std::collections::HashSet;
     use std::str::FromStr;
     use zinc_core::ordinals::shield::{analyze_psbt_with_scope, audit_psbt, is_safe_to_spend};
+    use zinc_core::ordinals::OrdError;
 
     fn make_outpoint(i: u8) -> OutPoint {
         let hash = format!("{i:064x}");
@@ -132,11 +133,7 @@ mod tests {
         );
 
         let err = result.expect_err("scoped input missing metadata should fail");
-        let message = err.to_string();
-        assert!(
-            message.contains("missing witness_utxo"),
-            "unexpected error message: {message}"
-        );
+        assert!(matches!(err, OrdError::InvalidData(_)));
     }
 
     #[test]
@@ -188,10 +185,7 @@ mod tests {
         );
 
         let err = result.expect_err("out-of-bounds scope must fail");
-        assert!(
-            err.to_string().contains("out of bounds"),
-            "unexpected error message: {err}"
-        );
+        assert!(matches!(err, OrdError::InvalidData(_)));
     }
 
     #[test]
@@ -226,5 +220,75 @@ mod tests {
             "expected partial-scope warning, got: {:?}",
             analysis.warnings
         );
+    }
+
+    #[test]
+    fn test_analyze_psbt_marks_input_value_overflow_unreliable() {
+        let psbt = build_test_psbt(vec![
+            (
+                make_outpoint(50),
+                Some(TxOut {
+                    value: bitcoin::Amount::from_sat(u64::MAX),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }),
+            ),
+            (
+                make_outpoint(51),
+                Some(TxOut {
+                    value: bitcoin::Amount::from_sat(1),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }),
+            ),
+        ]);
+
+        let analysis = analyze_psbt_with_scope(
+            &psbt,
+            &std::collections::HashMap::new(),
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .expect("overflow must produce a fail-closed analysis, not panic");
+
+        assert!(!analysis.sat_flow_reliable);
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("overflow")));
+    }
+
+    #[test]
+    fn test_analyze_psbt_marks_output_value_overflow_unreliable() {
+        let mut psbt = build_test_psbt(vec![(
+            make_outpoint(52),
+            Some(TxOut {
+                value: bitcoin::Amount::from_sat(u64::MAX),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }),
+        )]);
+        psbt.unsigned_tx.output = vec![
+            TxOut {
+                value: bitcoin::Amount::from_sat(u64::MAX),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            },
+            TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            },
+        ];
+        psbt.outputs = vec![Default::default(), Default::default()];
+
+        let analysis = analyze_psbt_with_scope(
+            &psbt,
+            &std::collections::HashMap::new(),
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .expect("overflow must produce a fail-closed analysis, not panic");
+
+        assert!(!analysis.sat_flow_reliable);
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("overflow")));
     }
 }

@@ -56,11 +56,15 @@ fn main() -> Result<(), String> {
         timestamp: None,
     };
 
-    wallet.apply_verified_ordinals_update(
-        vec![tracked_inscription],
-        HashSet::from([tracked_outpoint]),
-        Vec::new(),
-    );
+    wallet
+        .apply_verified_ordinals_update(
+            vec![tracked_inscription],
+            HashSet::from([tracked_outpoint]),
+            Vec::new(),
+            HashSet::from([tracked_outpoint]),
+            wallet.chain_state_generation(),
+        )
+        .expect("apply current asset classification");
 
     let psbt = build_demo_psbt(tracked_outpoint, 10_000, 9_999)?;
     let psbt_base64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());

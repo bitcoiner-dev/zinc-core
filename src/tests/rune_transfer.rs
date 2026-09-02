@@ -2,7 +2,8 @@
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::builder::{
-        AddressScheme, CreateRuneTransferRequest, Seed64, SignOptions, WalletBuilder, ZincWallet,
+        AddressScheme, CreateRuneTransferRequest, Seed64, SignOptions, WalletBuilder, WalletKind,
+        ZincWallet,
     };
     use crate::error::ZincError;
     use base64::Engine;
@@ -77,7 +78,7 @@ mod tests {
                 last_active_indices: last_active,
             })
             .unwrap();
-        wallet.ordinals_verified = true;
+        wallet.mark_current_wallet_outpoints_classified_for_test();
         (wallet, address, outpoints)
     }
 
@@ -145,6 +146,45 @@ mod tests {
                 }),
             )
             .unwrap();
+        let companion_psbt = wallet
+            .prepare_companion_rune_transfer_psbt(&result.psbt, &result.intent)
+            .unwrap();
+        wallet
+            .sign_companion_rune_transfer_psbt(
+                &companion_psbt,
+                &result.intent,
+                Some(SignOptions {
+                    finalize: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn companion_watch_wallet_can_construct_but_not_sign_a_rune_transfer() {
+        let (mut wallet, _, outpoints) = funded_wallet(&[10_000]);
+        wallet
+            .outpoint_runes
+            .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
+        wallet.inscribed_utxos.insert(outpoints[0]);
+        wallet.kind = WalletKind::Hardware {
+            fingerprint: [0; 4],
+            taproot_external: "test-companion-descriptor".to_string(),
+            payment_external: None,
+        };
+
+        let request = request("100", &foreign_address());
+        assert!(matches!(
+            wallet.create_rune_transfer(&request),
+            Err(ZincError::CapabilityMissing)
+        ));
+
+        let result = wallet.create_companion_rune_transfer(&request).unwrap();
+        let signing_error = wallet
+            .sign_rune_transfer_psbt(&result.psbt, &result.intent, None)
+            .unwrap_err();
+        assert_eq!(signing_error, ZincError::CapabilityMissing.to_string());
     }
 
     #[test]

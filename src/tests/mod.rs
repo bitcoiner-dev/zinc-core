@@ -1,7 +1,10 @@
 pub mod balance;
 pub mod bip_vectors;
+pub mod bitcoin_transfer;
 pub mod builder_depth;
 pub mod builder_planning;
+pub mod companion_routine;
+pub mod constructed_transaction_intent;
 pub mod discovery_scan;
 pub mod dual_send_signing;
 pub mod external_signing;

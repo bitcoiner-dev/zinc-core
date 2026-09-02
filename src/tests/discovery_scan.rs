@@ -56,4 +56,95 @@ mod tests {
             "depth=1 must not scan derived addresses beyond index 0"
         );
     }
+
+    #[test]
+    fn strict_receive_scan_does_not_treat_errors_as_inactive() {
+        let result = run_async(crate::account_is_active_from_receive_scan_strict(
+            2,
+            |index| async move {
+                if index == 0 {
+                    Err(crate::AccountDiscoveryProbeError::Backend)
+                } else {
+                    Ok(false)
+                }
+            },
+        ));
+
+        assert_eq!(result, Err(crate::AccountDiscoveryProbeError::Backend));
+    }
+
+    #[test]
+    fn strict_receive_scan_accepts_conclusive_activity_despite_peer_error() {
+        let result = run_async(crate::account_is_active_from_receive_scan_strict(
+            2,
+            |index| async move {
+                if index == 0 {
+                    Err(crate::AccountDiscoveryProbeError::Backend)
+                } else {
+                    Ok(true)
+                }
+            },
+        ));
+
+        assert_eq!(result, Ok(true));
+    }
+
+    #[test]
+    fn strict_receive_scan_preserves_deadline_errors() {
+        let result = run_async(crate::account_is_active_from_receive_scan_strict(
+            1,
+            |_index| async move { Err(crate::AccountDiscoveryProbeError::Deadline) },
+        ));
+
+        assert_eq!(result, Err(crate::AccountDiscoveryProbeError::Deadline));
+    }
+
+    #[test]
+    fn strict_receive_scan_reports_the_first_active_address_index() {
+        let result = run_async(crate::first_active_receive_index_from_scan_strict(
+            40,
+            |index| async move { Ok(index == 27) },
+        ));
+
+        assert_eq!(result, Ok(Some(27)));
+    }
+
+    #[test]
+    fn strict_receive_index_scan_never_collapses_backend_failure_to_empty() {
+        let result = run_async(crate::first_active_receive_index_from_scan_strict(
+            20,
+            |index| async move {
+                if index == 7 {
+                    Err(crate::AccountDiscoveryProbeError::Backend)
+                } else {
+                    Ok(false)
+                }
+            },
+        ));
+
+        assert_eq!(result, Err(crate::AccountDiscoveryProbeError::Backend));
+    }
+
+    #[test]
+    fn discovery_tracker_publishes_only_monotonic_active_frontiers() {
+        let mut tracker = crate::AccountDiscoveryTracker::default();
+
+        assert_eq!(tracker.record_probe(0, true), None);
+        assert_eq!(tracker.record_probe(1, false), None);
+        assert_eq!(tracker.record_probe(2, true), Some(3));
+        assert_eq!(tracker.discovered_count(), 3);
+        assert_eq!(tracker.scanned_accounts, 3);
+        assert!(!tracker.gap_reached(2));
+    }
+
+    #[test]
+    fn discovery_tracker_stops_only_after_the_full_trailing_gap() {
+        let mut tracker = crate::AccountDiscoveryTracker::default();
+        tracker.record_probe(0, true);
+        tracker.record_probe(1, false);
+        assert!(!tracker.gap_reached(2));
+        tracker.record_probe(2, false);
+        assert!(tracker.gap_reached(2));
+        assert_eq!(tracker.discovered_count(), 1);
+    }
 }

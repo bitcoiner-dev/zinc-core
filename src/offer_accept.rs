@@ -10,6 +10,14 @@ use bdk_wallet::bitcoin::psbt::{Input, Psbt};
 use bdk_wallet::bitcoin::{OutPoint, Script};
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn is_standard_spendable_output_script(script: &Script) -> bool {
+    script.is_p2tr()
+        || script.is_p2wpkh()
+        || script.is_p2wsh()
+        || script.is_p2pkh()
+        || script.is_p2sh()
+}
+
 /// Acceptance metadata derived from a validated offer payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferAcceptancePlanV1 {
@@ -178,13 +186,19 @@ fn validate_ord_layout(
             ))
         })?;
 
-    if psbt.unsigned_tx.output.len() < 2 {
+    if !(2..=3).contains(&psbt.unsigned_tx.output.len()) {
         return Err(ZincError::OfferError(
-            "offer psbt must include buyer postage and seller payout outputs".to_string(),
+            "offer psbt must contain buyer postage, seller payout, and at most one buyer change output"
+                .to_string(),
         ));
     }
 
     let buyer_postage_out = &psbt.unsigned_tx.output[0];
+    if !is_standard_spendable_output_script(&buyer_postage_out.script_pubkey) {
+        return Err(ZincError::OfferError(
+            "buyer postage output must use a non-empty spendable script".to_string(),
+        ));
+    }
     if buyer_postage_out.value.to_sat() != seller_postage_sats {
         return Err(ZincError::OfferError(format!(
             "buyer postage output must be first and equal seller postage {} sats; found {} sats",
@@ -211,6 +225,15 @@ fn validate_ord_layout(
     if seller_payout_out.script_pubkey.as_script() != expected_payout_script {
         return Err(ZincError::OfferError(
             "seller payout output does not pay this wallet's payout script".to_string(),
+        ));
+    }
+
+    if psbt.unsigned_tx.output[2..]
+        .iter()
+        .any(|output| !is_standard_spendable_output_script(&output.script_pubkey))
+    {
+        return Err(ZincError::OfferError(
+            "buyer change output must use a non-empty spendable script".to_string(),
         ));
     }
 

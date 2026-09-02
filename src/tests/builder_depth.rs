@@ -102,6 +102,111 @@ mod tests {
     }
 
     #[test]
+    fn verified_clean_cpfp_anchor_reclassifies_only_the_current_unconfirmed_output() {
+        let mut wallet = unified();
+        let outpoint = fund(&mut wallet, &[(10_000, false)])[0];
+        let chain_generation = wallet.chain_state_generation();
+        wallet
+            .apply_verified_ordinals_update(
+                Vec::new(),
+                HashSet::new(),
+                Vec::new(),
+                HashSet::new(),
+                chain_generation,
+            )
+            .expect("current empty Ord snapshot");
+        assert!(wallet.inscribed_utxos.contains(&outpoint));
+        assert!(!wallet.classified_outpoints.contains(&outpoint));
+        let asset_generation = wallet.asset_data_generation();
+
+        wallet
+            .apply_verified_clean_cpfp_anchor(outpoint, 10_000, &[(100, 10_100)], chain_generation)
+            .expect("complete common-sat proof");
+
+        assert!(!wallet.inscribed_utxos.contains(&outpoint));
+        assert!(wallet.classified_outpoints.contains(&outpoint));
+        assert_eq!(
+            wallet.asset_data_generation(),
+            asset_generation.wrapping_add(1)
+        );
+        assert!(wallet
+            .apply_verified_clean_cpfp_anchor(
+                outpoint,
+                10_000,
+                &[(100, 10_100)],
+                chain_generation.wrapping_add(1),
+            )
+            .unwrap_err()
+            .contains("Stale CPFP anchor proof"));
+    }
+
+    #[test]
+    fn verified_clean_cpfp_anchor_refuses_value_mismatch_and_rare_sats() {
+        let mut wallet = unified();
+        let outpoint = fund(&mut wallet, &[(10_000, false)])[0];
+        let chain_generation = wallet.chain_state_generation();
+        wallet
+            .apply_verified_ordinals_update(
+                Vec::new(),
+                HashSet::new(),
+                Vec::new(),
+                HashSet::new(),
+                chain_generation,
+            )
+            .expect("current empty Ord snapshot");
+
+        assert!(wallet
+            .apply_verified_clean_cpfp_anchor(outpoint, 9_999, &[(100, 10_099)], chain_generation,)
+            .unwrap_err()
+            .contains("value does not match"));
+        assert!(wallet
+            .apply_verified_clean_cpfp_anchor(outpoint, 10_000, &[(0, 10_000)], chain_generation,)
+            .unwrap_err()
+            .contains("protected rare sats"));
+        assert!(wallet.inscribed_utxos.contains(&outpoint));
+        assert!(!wallet.classified_outpoints.contains(&outpoint));
+    }
+
+    #[test]
+    fn apply_sync_preflights_both_keychains_before_mutating_either() {
+        let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([1u8; 64]))
+            .with_scheme(AddressScheme::Dual)
+            .build()
+            .expect("dual wallet");
+        wallet.mark_current_wallet_outpoints_classified_for_test();
+        let generation_before = wallet.chain_state_generation;
+        let vault_tip_before = wallet.vault_wallet.latest_checkpoint().height();
+
+        let vault_update = bdk_wallet::Update {
+            chain: Some(wallet.vault_wallet.latest_checkpoint().insert(BlockId {
+                height: 1,
+                hash: BlockHash::all_zeros(),
+            })),
+            ..Default::default()
+        };
+        let disconnected_payment_update = bdk_wallet::Update {
+            chain: Some(bdk_wallet::chain::CheckPoint::new(BlockId {
+                height: 99,
+                hash: BlockHash::all_zeros(),
+            })),
+            ..Default::default()
+        };
+
+        let error = wallet
+            .apply_sync(vault_update, Some(disconnected_payment_update))
+            .expect_err("disconnected payment update must fail preflight");
+
+        assert!(!error.is_empty());
+        assert_eq!(
+            wallet.vault_wallet.latest_checkpoint().height(),
+            vault_tip_before
+        );
+        assert_eq!(wallet.chain_state_generation, generation_before);
+        assert!(wallet.ordinals_verified);
+        assert!(wallet.ordinals_metadata_complete);
+    }
+
+    #[test]
     fn reset_sync_state_restores_primary_reveal() {
         let mut w = unified();
         w.reset_sync_state().expect("reset succeeds");
@@ -135,6 +240,30 @@ mod tests {
             .find(|(op, _)| *op == ops[1].to_string())
             .expect("unconfirmed outpoint present");
         assert_eq!(unconfirmed.1, None, "unconfirmed UTXO has no height");
+    }
+
+    #[test]
+    fn verified_ordinals_update_quarantines_unclassified_wallet_outpoints() {
+        let mut w = unified();
+        let ops = fund(&mut w, &[(10_000, true), (30_000, false)]);
+        let classified = HashSet::from([ops[0]]);
+
+        w.apply_verified_ordinals_update(
+            Vec::new(),
+            HashSet::new(),
+            Vec::new(),
+            classified,
+            w.chain_state_generation(),
+        )
+        .unwrap();
+
+        assert!(w.ordinals_verified());
+        assert!(!w.inscribed_utxos.contains(&ops[0]));
+        assert!(
+            w.inscribed_utxos.contains(&ops[1]),
+            "an unconfirmed outpoint omitted from the Ord query must be quarantined"
+        );
+        assert_eq!(w.get_balance().spendable.trusted_pending.to_sat(), 0);
     }
 
     #[test]
@@ -212,7 +341,19 @@ mod tests {
                 last_active_indices: last,
             })
             .unwrap();
-        w.apply_verified_ordinals_update(Vec::new(), HashSet::new(), Vec::new());
+        let classified = w
+            .collect_utxo_outpoints()
+            .into_iter()
+            .filter_map(|(outpoint, _)| outpoint.parse().ok())
+            .collect();
+        w.apply_verified_ordinals_update(
+            Vec::new(),
+            HashSet::new(),
+            Vec::new(),
+            classified,
+            w.chain_state_generation(),
+        )
+        .unwrap();
 
         let funded = w
             .dapp_address_candidates(Some(3))
