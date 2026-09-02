@@ -144,6 +144,45 @@ fn test_salvage_high_offset_burn_is_blocked() {
 }
 
 #[test]
+fn nonzero_op_return_burns_inscription() {
+    // The first inscription lands in a value-bearing OP_RETURN output. A
+    // second inscription reaches a normal output whose size-change warning
+    // must not downgrade the burn from Danger to Warn.
+    let mut psbt = create_dummy_psbt(&[(20_000, None)], &[546, 19_454]);
+    psbt.unsigned_tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
+
+    let mut known_inscriptions = HashMap::new();
+    known_inscriptions.insert(
+        (psbt.unsigned_tx.input[0].previous_output.txid, 0),
+        vec![
+            ("burned-inscription".to_string(), 0),
+            ("preserved-inscription".to_string(), 1_000),
+        ],
+    );
+
+    let result = analyze_psbt(&psbt, &known_inscriptions, bitcoin::Network::Regtest).unwrap();
+
+    assert_eq!(result.warning_level, WarningLevel::Danger);
+    assert_eq!(
+        result.inscriptions_burned,
+        vec!["burned-inscription".to_string()]
+    );
+    assert_eq!(
+        result.inscription_destinations["burned-inscription"].vout,
+        None
+    );
+    assert_eq!(
+        result.inscription_destinations["preserved-inscription"].vout,
+        Some(1)
+    );
+    assert!(result.outputs[0].inscriptions.is_empty());
+    assert!(result
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("unspendable OP_RETURN")));
+}
+
+#[test]
 fn test_survivor_boundary() {
     // Input: 10,000 sats. Inscription @ 9,999.
     // Output: 10,000 sats.

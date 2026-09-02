@@ -32,8 +32,9 @@ pub struct NewInscription {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Destination mapping for an inscription after simulated PSBT sat flow.
 pub struct InscriptionDestination {
-    /// Destination output index, or `None` when inscription is burned to fee.
-    pub vout: Option<u32>, // None means fee/burned
+    /// Destination output index, or `None` when the inscription is burned to
+    /// fees or routed to a provably unspendable output.
+    pub vout: Option<u32>, // None means burned
     /// Offset within destination output where inscription lands.
     pub offset: u64, // Offset within that output
 }
@@ -120,7 +121,7 @@ pub struct AnalysisResult {
     #[serde(default)]
     /// Inscriptions that are currently being minted in this transaction.
     pub new_inscriptions: Vec<NewInscription>,
-    /// Inscriptions that would be burned as fee.
+    /// Inscriptions that would be burned as fees or in unspendable outputs.
     pub inscriptions_burned: Vec<String>, // List of inscription IDs
     /// Destination map keyed by inscription id.
     pub inscription_destinations: HashMap<String, InscriptionDestination>,
@@ -998,12 +999,30 @@ pub fn analyze_psbt_with_scope(
             .map(|a| a.to_string());
 
         let mut output_inscriptions = Vec::new();
+        let is_op_return = output.script_pubkey.is_op_return();
 
         // Check which inscriptions fall into this output's range
         for (key, abs_offset, original_input_value) in &active_inscriptions {
             if *abs_offset >= current_output_offset && *abs_offset < output_end {
                 // Found destination!
                 let relative_offset = abs_offset - current_output_offset;
+
+                if is_op_return {
+                    inscription_destinations.insert(
+                        key.clone(),
+                        InscriptionDestination {
+                            vout: None,
+                            offset: 0,
+                        },
+                    );
+                    inscriptions_burned.push(key.clone());
+                    warning_level = WarningLevel::Danger;
+                    warnings.push(format!(
+                        "Inscription {} is routed to an unspendable OP_RETURN output and will be permanently burned.",
+                        shorten_id(key)
+                    ));
+                    continue;
+                }
 
                 inscription_destinations.insert(
                     key.clone(),
@@ -1031,7 +1050,6 @@ pub fn analyze_psbt_with_scope(
             }
         }
 
-        let is_op_return = output.script_pubkey.is_op_return();
         outputs_info.push(OutputInfo {
             vout: vout_u32,
             value: output_value,
@@ -1070,6 +1088,12 @@ pub fn analyze_psbt_with_scope(
                 },
             );
         }
+    }
+
+    // Warning severity is monotonic: a later, less severe output observation
+    // must never downgrade an OP_RETURN burn discovered earlier in the flow.
+    if !inscriptions_burned.is_empty() {
+        warning_level = WarningLevel::Danger;
     }
 
     zinc_log_debug!(target: LOG_TARGET_SHIELD,

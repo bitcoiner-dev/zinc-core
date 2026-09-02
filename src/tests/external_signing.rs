@@ -490,6 +490,51 @@ mod tests {
     }
 
     #[test]
+    fn signing_and_external_preparation_reject_nonzero_op_return_inscription_burn() {
+        use crate::ordinals::types::{Inscription, Satpoint};
+
+        let (mut wallet, unsigned) = setup();
+        let mut psbt = decode(&unsigned);
+        psbt.unsigned_tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
+        let outpoint = psbt.unsigned_tx.input[0].previous_output;
+        let op_return_psbt = b64(&psbt.serialize());
+
+        wallet
+            .apply_verified_ordinals_update(
+                vec![Inscription {
+                    id: "op-return-burn-test-inscription".to_string(),
+                    number: 1,
+                    satpoint: Satpoint {
+                        outpoint,
+                        offset: 0,
+                    },
+                    content_type: None,
+                    value: Some(50_000),
+                    content_length: None,
+                    timestamp: None,
+                }],
+                [outpoint].into_iter().collect(),
+                Vec::new(),
+                [outpoint].into_iter().collect(),
+                wallet.chain_state_generation(),
+            )
+            .unwrap();
+
+        let sign_error = wallet.sign_psbt(&op_return_psbt, None).unwrap_err();
+        assert!(
+            sign_error.contains("would burn inscription"),
+            "{sign_error}"
+        );
+        let prepare_error = wallet
+            .prepare_external_sign_psbt(&op_return_psbt, None)
+            .unwrap_err();
+        assert!(
+            prepare_error.contains("would burn inscription"),
+            "{prepare_error}"
+        );
+    }
+
+    #[test]
     fn absurd_fee_ceiling_is_identical_for_software_and_external_signing() {
         use crate::builder::ABSURD_FEE_SATS;
 
