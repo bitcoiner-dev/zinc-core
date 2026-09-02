@@ -8791,7 +8791,7 @@ pub struct ZincPersistence {
     pub payment: Option<bdk_wallet::ChangeSet>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use bitcoin::Network;
