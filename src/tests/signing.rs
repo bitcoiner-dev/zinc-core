@@ -78,6 +78,7 @@ mod tests {
             last_active_indices: last_active,
         };
         builder.vault_wallet.apply_update(update).unwrap();
+        builder.mark_current_wallet_outpoints_classified_for_test();
 
         // 3. Create a PSBT that spends all 3 inputs
         // We'll manually construct a PSBT since create_psbt relies on BDK coin selection which might not pick all 3.
@@ -203,6 +204,7 @@ mod tests {
             last_active_indices: last_active,
         };
         builder.vault_wallet.apply_update(update).unwrap();
+        builder.mark_current_wallet_outpoints_classified_for_test();
 
         // 3. Create PSBT
         let inputs = vec![bdk_wallet::bitcoin::TxIn {
@@ -289,6 +291,7 @@ mod tests {
             last_active_indices: last_active,
         };
         builder.vault_wallet.apply_update(update).unwrap();
+        builder.mark_current_wallet_outpoints_classified_for_test();
 
         let unsigned_tx = Transaction {
             version: bdk_wallet::bitcoin::transaction::Version::TWO,
@@ -364,6 +367,7 @@ mod tests {
             last_active_indices: last_active,
         };
         builder.vault_wallet.apply_update(update).unwrap();
+        builder.mark_current_wallet_outpoints_classified_for_test();
 
         let unsigned_tx = Transaction {
             version: bdk_wallet::bitcoin::transaction::Version::TWO,
@@ -447,6 +451,7 @@ mod tests {
             last_active_indices: last_active,
         };
         builder.vault_wallet.apply_update(update).unwrap();
+        builder.mark_current_wallet_outpoints_classified_for_test();
 
         let foreign_prev_tx = create_dummy_tx(15_000, foreign_script.clone(), 24);
 

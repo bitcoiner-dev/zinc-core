@@ -26,10 +26,18 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use wasm_bindgen::prelude::*;
 
+/// Maximum logical accounts a first-party host may discover in one bounded scan.
+///
+/// Companion public export is compile-time coupled to this ceiling so account
+/// discovery and Mobile selection cannot silently diverge.
+pub const MAX_DISCOVERY_ACCOUNTS: u32 = 100;
+
 #[macro_use]
 mod logging;
 
 // Core modules
+pub mod backend_error;
+pub mod backend_receipt;
 pub mod builder;
 pub mod crypto;
 pub mod error;
@@ -64,12 +72,29 @@ pub mod ordinals;
 pub mod sign_intent;
 
 // Re-exports for convenience
+pub use backend_error::{
+    BackendDependencyV1, BackendFailureCategoryV1, BackendFailureV1, BackendOperationV1,
+    MAX_RETRY_AFTER_MS,
+};
+pub use backend_receipt::{
+    BackendCapabilityV1, BackendScanOutcomeV1, BackendSyncReceiptV1, ScanCheckpointV1,
+    ScanOutcomeStatusV1, SyncCompletenessV1,
+};
 pub use builder::{
-    Account, AddressScheme, CreatePsbtRequest, CreatePsbtTransportRequest,
-    CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan, DiscoveryContext,
-    PaymentAddressType, ProfileMode, RuneTransferIntent, RuneTransferResult, ScanPolicy, Seed64,
-    SignOptions, SyncRequestType, SyncSleeper, WalletBuilder, WalletKind, ZincBalance,
-    ZincPersistence, ZincSyncRequest, ZincWallet,
+    Account, AddressScheme, BitcoinTransferIntent, BitcoinTransferResult, CancelIntentDetails,
+    CancelIntentRequest, CoinControlAction, CoinControlIntentDetails, CoinControlIntentRequest,
+    CompanionPublicAccountExport, CompanionRoutineChangeFact, CompanionRoutineDescriptorSlot,
+    CompanionRoutineInputFact, CompanionRoutineWalletSnapshot, ConstructedTransactionIntent,
+    ConstructedTransactionIntentRequest, CpfpIntentDetails, CpfpIntentRequest, CreatePsbtRequest,
+    CreatePsbtTransportRequest, CreateRuneTransferRequest, DerivationMode, DiscoveryAccountPlan,
+    DiscoveryContext, ExactTransactionOutput, ExactTransactionTemplate,
+    InscriptionTransferConstructionSnapshot, InscriptionTransferFeeInputFact,
+    InscriptionTransferInputFact, InscriptionTransferIntentDetails,
+    InscriptionTransferIntentRequest, PaymentAddressType, ProfileMode, RuneTransferIntent,
+    RuneTransferResult, ScanPolicy, Seed64, SignOptions, SmartSendWithSalvageIntentDetails,
+    SmartSendWithSalvageIntentRequest, SyncRequestType, SyncSleeper, WalletBuilder, WalletKind,
+    ZincBalance, ZincPersistence, ZincSyncRequest, ZincWallet, ABSURD_FEE_RATE_SAT_VB,
+    ABSURD_FEE_SATS, MAX_COMPANION_ROUTINE_FACT_AGE_SECONDS,
 };
 pub use error::{ZincError, ZincResult};
 pub use external_signing::{
@@ -82,7 +107,7 @@ pub use external_signing::{
     ExternalSigningPlanV2, ExternalSigningRequirementsV2, PrepareExternalSigningErrorV2,
     PreparedExternalSigningRequestV2, RequirementsDerivationError, EXTERNAL_SIGNING_SCHEMA_V2,
 };
-pub use history::TxItem;
+pub use history::{TransactionPage, TxItem, MAX_TRANSACTION_PAGE_SIZE};
 pub use keys::{taproot_descriptors, DescriptorPair, ZincMnemonic};
 pub use layout::{derive_layout_addresses, BranchSpec, LayoutAddresses, LayoutSpec, ScriptKind};
 pub use listing::{
@@ -106,6 +131,7 @@ pub use offer_nostr::{NostrOfferEvent, OFFER_EVENT_KIND};
 #[cfg(not(target_arch = "wasm32"))]
 pub use offer_relay::{NostrRelayClient, RelayPublishResult, RelayQueryOptions};
 pub use ordinals::client::OrdClient;
+pub use ordinals::error::OrdError;
 pub use ordinals::types::{Inscription, RuneBalance, Satpoint};
 pub use sign_intent::{
     build_pairing_transport_event, build_signed_pairing_ack, build_signed_pairing_ack_with_granted,
@@ -135,6 +161,48 @@ pub use sign_intent::{
 // Re-export bitcoin types we use
 pub use bdk_wallet::bitcoin::Network;
 use bdk_wallet::KeychainKind;
+
+#[cfg(target_arch = "wasm32")]
+fn backend_failure_to_js(failure: &BackendFailureV1) -> JsValue {
+    serde_wasm_bindgen::to_value(failure)
+        .unwrap_or_else(|_| JsValue::from_str("ZINC_BACKEND_FAILURE_V1"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn backend_scan_failure_to_js(
+    failure: BackendFailureV1,
+    last_complete_tip: Option<u32>,
+    operation_generation: u64,
+    completed_keychains: u8,
+    total_keychains: u8,
+) -> JsValue {
+    let retryable = failure.is_scan_retryable();
+    backend_failure_to_js(&failure.with_scan_outcome(BackendScanOutcomeV1::incomplete(
+        retryable,
+        last_complete_tip,
+        operation_generation,
+        completed_keychains,
+        total_keychains,
+    )))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ord_failure_to_js(error: ordinals::OrdError) -> JsValue {
+    match error {
+        ordinals::OrdError::Backend(failure) => backend_failure_to_js(&failure),
+        other => JsValue::from_str(&other.to_string()),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ord_scan_failure_to_js(error: ordinals::OrdError, operation_generation: u64) -> JsValue {
+    match error {
+        ordinals::OrdError::Backend(failure) => {
+            backend_scan_failure_to_js(failure, None, operation_generation, 0, 1)
+        }
+        other => ord_failure_to_js(other),
+    }
+}
 
 // ============================================================================
 // Core Logic (Pure Rust)
@@ -551,7 +619,7 @@ async fn fetch_addr_stats(
     }
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 async fn first_active_receive_index_from_scan<F, Fut>(
     address_scan_depth: u32,
     mut has_activity_at: F,
@@ -582,7 +650,7 @@ where
     None
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 async fn account_is_active_from_receive_scan<F, Fut>(
     address_scan_depth: u32,
     has_activity_at: F,
@@ -594,6 +662,236 @@ where
     first_active_receive_index_from_scan(address_scan_depth, has_activity_at)
         .await
         .is_some()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccountDiscoveryProbeError {
+    Deadline,
+    /// Retained for pure helper tests that do not construct a transport error.
+    #[cfg(test)]
+    Backend,
+    #[cfg(target_arch = "wasm32")]
+    BackendFailure(BackendFailureV1),
+}
+
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_ADDRESS_BATCH_SIZE: u32 = 2;
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_ADDRESS_REQUEST_TIMEOUT_MS: u32 = 10_000;
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_BATCH_COOLDOWN_MS: u32 = 250;
+
+#[cfg(target_arch = "wasm32")]
+async fn probe_esplora_address_activity(
+    client: &reqwest::Client,
+    url: String,
+    deadline_ms: f64,
+) -> Result<bool, AccountDiscoveryProbeError> {
+    let remaining_ms = deadline_ms - js_sys::Date::now();
+    if remaining_ms <= 0.0 {
+        return Err(AccountDiscoveryProbeError::Deadline);
+    }
+    let request_timeout_ms = remaining_ms
+        .min(f64::from(ACCOUNT_DISCOVERY_ADDRESS_REQUEST_TIMEOUT_MS))
+        .ceil() as u32;
+    let request = client.get(&url).send();
+    let timeout = gloo_timers::future::TimeoutFuture::new(request_timeout_ms.max(1));
+    futures_util::pin_mut!(request);
+    futures_util::pin_mut!(timeout);
+
+    let response = match futures_util::future::select(request, timeout).await {
+        futures_util::future::Either::Left((result, _)) => result.map_err(|error| {
+            AccountDiscoveryProbeError::BackendFailure(
+                BackendFailureV1::from_reqwest(
+                    &error,
+                    BackendDependencyV1::Esplora,
+                    BackendOperationV1::Sync,
+                )
+                .with_upstream_code("account_discovery_probe_transport"),
+            )
+        })?,
+        futures_util::future::Either::Right((_timed_out, _)) => {
+            if js_sys::Date::now() >= deadline_ms {
+                return Err(AccountDiscoveryProbeError::Deadline);
+            }
+            return Err(AccountDiscoveryProbeError::BackendFailure(
+                BackendFailureV1::new(
+                    BackendDependencyV1::Esplora,
+                    BackendOperationV1::Sync,
+                    BackendFailureCategoryV1::Timeout,
+                )
+                .with_upstream_code("account_discovery_probe_timeout"),
+            ));
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok());
+        return Err(AccountDiscoveryProbeError::BackendFailure(
+            BackendFailureV1::from_http_status(
+                BackendDependencyV1::Esplora,
+                BackendOperationV1::Sync,
+                status,
+                retry_after,
+            )
+            .with_upstream_code("account_discovery_probe_http"),
+        ));
+    }
+
+    let json = response.json::<serde_json::Value>().await.map_err(|_| {
+        AccountDiscoveryProbeError::BackendFailure(
+            BackendFailureV1::invalid_response(
+                BackendDependencyV1::Esplora,
+                BackendOperationV1::Sync,
+            )
+            .with_upstream_code("account_discovery_probe_invalid_response"),
+        )
+    })?;
+    let invalid_response = || {
+        AccountDiscoveryProbeError::BackendFailure(
+            BackendFailureV1::invalid_response(
+                BackendDependencyV1::Esplora,
+                BackendOperationV1::Sync,
+            )
+            .with_upstream_code("account_discovery_probe_invalid_response"),
+        )
+    };
+    let chain_txs = json["chain_stats"]["tx_count"]
+        .as_u64()
+        .ok_or_else(&invalid_response)?;
+    let mempool_txs = json["mempool_stats"]["tx_count"]
+        .as_u64()
+        .ok_or_else(invalid_response)?;
+    Ok(chain_txs > 0 || mempool_txs > 0)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+async fn account_is_active_from_receive_scan_strict<F, Fut>(
+    address_scan_depth: u32,
+    has_activity_at: F,
+) -> Result<bool, AccountDiscoveryProbeError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<bool, AccountDiscoveryProbeError>>,
+{
+    first_active_receive_index_from_scan_strict(address_scan_depth, has_activity_at)
+        .await
+        .map(|index| index.is_some())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+async fn first_active_receive_index_from_scan_strict<F, Fut>(
+    address_scan_depth: u32,
+    mut has_activity_at: F,
+) -> Result<Option<u32>, AccountDiscoveryProbeError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<bool, AccountDiscoveryProbeError>>,
+{
+    let depth = address_scan_depth.max(1);
+    #[cfg(target_arch = "wasm32")]
+    const ADDRESS_SCAN_BATCH_SIZE: u32 = ACCOUNT_DISCOVERY_ADDRESS_BATCH_SIZE;
+    #[cfg(not(target_arch = "wasm32"))]
+    const ADDRESS_SCAN_BATCH_SIZE: u32 = 20;
+
+    let mut batch_start = 0;
+    while batch_start < depth {
+        let batch_end = (batch_start + ADDRESS_SCAN_BATCH_SIZE).min(depth);
+        let mut checks = Vec::with_capacity((batch_end - batch_start) as usize);
+        for address_index in batch_start..batch_end {
+            checks.push(has_activity_at(address_index));
+        }
+
+        let results = futures_util::future::join_all(checks).await;
+        if let Some(offset) = results.iter().position(|result| matches!(result, Ok(true))) {
+            return Ok(Some(batch_start + offset as u32));
+        }
+        if let Some(error) = results.into_iter().find_map(Result::err) {
+            return Err(error);
+        }
+
+        batch_start = batch_end;
+        #[cfg(target_arch = "wasm32")]
+        if batch_start < depth {
+            gloo_timers::future::TimeoutFuture::new(ACCOUNT_DISCOVERY_BATCH_COOLDOWN_MS).await;
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Default)]
+struct AccountDiscoveryTracker {
+    max_active_index: Option<u32>,
+    current_gap: u32,
+    scanned_accounts: u32,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl AccountDiscoveryTracker {
+    fn record_probe(&mut self, account_index: u32, active: bool) -> Option<u32> {
+        self.scanned_accounts = self.scanned_accounts.saturating_add(1);
+        if active {
+            let previous = self.discovered_count();
+            self.max_active_index = Some(
+                self.max_active_index
+                    .map_or(account_index, |current| current.max(account_index)),
+            );
+            self.current_gap = 0;
+            let next = self.discovered_count();
+            return (next > previous).then_some(next);
+        }
+
+        self.current_gap = self.current_gap.saturating_add(1);
+        None
+    }
+
+    fn discovered_count(&self) -> u32 {
+        self.max_active_index
+            .map_or(1, |index| index.saturating_add(1))
+    }
+
+    fn gap_reached(&self, gap_limit: u32) -> bool {
+        self.current_gap >= gap_limit
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+const ACCOUNT_DISCOVERY_SCHEMA_V1: u8 = 1;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountDiscoveryProgressV1 {
+    version: u8,
+    scanned_account_index: u32,
+    discovered_count: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AccountDiscoveryStopReasonV1 {
+    GapLimit,
+    Deadline,
+    MaxAccounts,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountDiscoveryResponseV1 {
+    version: u8,
+    discovered_count: u32,
+    scanned_accounts: u32,
+    complete: bool,
+    stop_reason: AccountDiscoveryStopReasonV1,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -613,9 +911,22 @@ struct ImportPathAccountHit {
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ImportPathDiscoveryStopReasonV1 {
+    GapLimit,
+    Deadline,
+    MaxAccounts,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportPathDiscoveryResponse {
+    version: u8,
     active_accounts: Vec<ImportPathAccountHit>,
+    scanned_accounts: u32,
+    complete: bool,
+    stop_reason: ImportPathDiscoveryStopReasonV1,
 }
 
 /// Initialize WASM module (call once on load).
@@ -1076,8 +1387,61 @@ pub struct ZincWasmWallet {
     vitality: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifiedCleanCpfpAnchorTransport {
+    outpoint: String,
+    value: u64,
+    sat_ranges: Vec<(u64, u64)>,
+}
+
 #[wasm_bindgen]
 impl ZincWasmWallet {
+    /// Snapshot the chain generation before a trusted asynchronous transaction build.
+    #[wasm_bindgen(js_name = chainStateGeneration)]
+    pub fn chain_state_generation_for_host(&self) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        self.inner
+            .try_borrow()
+            .map(|inner| inner.chain_state_generation().to_string())
+            .map_err(|error| {
+                JsValue::from_str(&format!("Wallet busy (chainStateGeneration): {error}"))
+            })
+    }
+
+    /// Apply Singularity's clean-anchor proof before minting a CPFP signing intent.
+    #[wasm_bindgen(js_name = applyVerifiedCleanCpfpAnchor)]
+    pub fn apply_verified_clean_cpfp_anchor_for_host(
+        &self,
+        proof: JsValue,
+        expected_chain_generation: String,
+    ) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        let proof: VerifiedCleanCpfpAnchorTransport = serde_wasm_bindgen::from_value(proof)
+            .map_err(|_| JsValue::from_str("Invalid CPFP anchor proof"))?;
+        let outpoint = proof
+            .outpoint
+            .parse()
+            .map_err(|_| JsValue::from_str("Invalid CPFP anchor outpoint"))?;
+        let expected_chain_generation = expected_chain_generation
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid CPFP chain generation"))?;
+        self.inner
+            .try_borrow_mut()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (applyVerifiedCleanCpfpAnchor): {error}"
+                ))
+            })?
+            .apply_verified_clean_cpfp_anchor(
+                outpoint,
+                proof.value,
+                &proof.sat_ranges,
+                expected_chain_generation,
+            )
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     /// Irreversibly remove live private material from this handle.
     ///
     /// Unlike dropping the JavaScript wrapper, this also scrubs the shared core wallet retained by
@@ -2006,6 +2370,28 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Return one bounded transaction-history page and an opaque continuation cursor.
+    pub fn get_transaction_page(
+        &self,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let page = inner
+                    .get_transaction_page(limit, cursor.as_deref())
+                    .map_err(|error| JsValue::from_str(&error))?;
+                serde_wasm_bindgen::to_value(&page).map_err(|error| {
+                    JsValue::from(format!("Failed to serialize transaction page: {error}"))
+                })
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (get_transaction_page): {error}"
+            ))),
+        }
+    }
+
     /// Return first receive addresses/public keys for taproot/payment roles.
     ///
     /// In unified mode, `payment*` mirrors the same taproot branch.
@@ -2072,14 +2458,31 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Retire an in-flight sync generation after the shell cancels or times out.
+    /// The network future may still resolve, but its apply step will fail stale.
+    #[wasm_bindgen(js_name = retireSyncGeneration)]
+    pub fn retire_sync_generation(&self) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                inner.retire_inflight_sync();
+                Ok(())
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (retire_sync_generation): {error}"
+            ))),
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = sync)]
     pub fn sync(&self, esplora_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        use crate::builder::{SyncRequestType, SyncSleeper};
+        use crate::builder::{configured_esplora_client, SyncRequestType};
         use bdk_esplora::EsploraAsyncExt;
 
         let inner_rc = self.inner.clone();
+        let network = self.state_snapshot().network;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
@@ -2089,7 +2492,7 @@ impl ZincWasmWallet {
             );
 
             // 1. Prepare Request (lock briefly)
-            let (sync_req, sync_generation) = {
+            let (sync_req, sync_generation, last_complete_tip, total_keychains) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if !inner.try_begin_sync(js_sys::Date::now()) {
@@ -2100,9 +2503,13 @@ impl ZincWasmWallet {
                         // Consume any pending full-rescan request: full scan once, then incremental.
                         let force_full = inner.force_next_full;
                         inner.force_next_full = false;
+                        let request = inner.prepare_requests(force_full);
+                        let total_keychains = 1 + u8::from(request.payment.is_some());
                         (
-                            inner.prepare_requests(force_full),
+                            request,
                             inner.account_generation(),
+                            (inner.chain_tip_height() > 0).then(|| inner.chain_tip_height()),
+                            total_keychains,
                         )
                     }
                     Err(e) => {
@@ -2115,9 +2522,7 @@ impl ZincWasmWallet {
                 }
             };
 
-            let client = match esplora_client::Builder::new(&esplora_url)
-                .build_async_with_sleeper::<SyncSleeper>()
-            {
+            let client = match configured_esplora_client(&esplora_url) {
                 Ok(c) => c,
                 Err(e) => {
                     zinc_log_error!(target: LOG_TARGET_WASM, "failed to create esplora client");
@@ -2134,12 +2539,20 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(JsValue::from(format!("{:?}", e)));
+                    return Err(backend_scan_failure_to_js(
+                        BackendFailureV1::from_esplora(&e, BackendOperationV1::Connect),
+                        last_complete_tip,
+                        sync_generation,
+                        0,
+                        total_keychains,
+                    ));
                 }
             };
 
             // 2. Fetch (NO LOCK HELD)
-            let vault_update_res: Result<bdk_wallet::Update, JsValue> = match sync_req.taproot {
+            let vault_update_res: Result<bdk_wallet::Update, BackendFailureV1> = match sync_req
+                .taproot
+            {
                 SyncRequestType::Full(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot full scan");
                     client
@@ -2148,14 +2561,14 @@ impl ZincWasmWallet {
                         .map(|u| u.into())
                         .map_err(|e| {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Vault full scan failed: {:?}", e);
-                            JsValue::from(e.to_string())
+                            BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                         })
                 }
                 SyncRequestType::Incremental(req) => {
                     zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot incremental sync");
                     client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "Vault sync failed: {:?}", e);
-                        JsValue::from(e.to_string())
+                        BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                     })
                 }
             };
@@ -2171,14 +2584,20 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(e);
+                    return Err(backend_scan_failure_to_js(
+                        e,
+                        last_complete_tip,
+                        sync_generation,
+                        0,
+                        total_keychains,
+                    ));
                 }
             };
 
             let payment_update: Option<bdk_wallet::Update> = if let Some(req_type) =
                 sync_req.payment
             {
-                let update_res: Result<bdk_wallet::Update, JsValue> = match req_type {
+                let update_res: Result<bdk_wallet::Update, BackendFailureV1> = match req_type {
                     SyncRequestType::Full(req) => {
                         zinc_log_info!(target: LOG_TARGET_WASM, "starting payment full scan");
                         client
@@ -2187,7 +2606,7 @@ impl ZincWasmWallet {
                                 .map(|u| u.into())
                                 .map_err(|e| {
                                     zinc_log_debug!(target: LOG_TARGET_WASM, "Payment full scan failed: {:?}", e);
-                                    JsValue::from(e.to_string())
+                                    BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                                 })
                     }
                     SyncRequestType::Incremental(req) => {
@@ -2197,7 +2616,7 @@ impl ZincWasmWallet {
                         );
                         client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
                                 zinc_log_debug!(target: LOG_TARGET_WASM, "Payment sync failed: {:?}", e);
-                                JsValue::from(e.to_string())
+                                BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
                             })
                     }
                 };
@@ -2216,7 +2635,13 @@ impl ZincWasmWallet {
                         ) {
                             return Err(stale);
                         }
-                        return Err(e);
+                        return Err(backend_scan_failure_to_js(
+                            e,
+                            last_complete_tip,
+                            sync_generation,
+                            1,
+                            total_keychains,
+                        ));
                     }
                 }
             } else {
@@ -2225,7 +2650,7 @@ impl ZincWasmWallet {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync: chain client returned");
 
             // 3. Apply (lock briefly)
-            let events = {
+            let (events, observed_tip) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.account_generation() != sync_generation {
@@ -2246,7 +2671,8 @@ impl ZincWasmWallet {
                             })?;
                         inner.is_syncing = false;
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: updates applied");
-                        res
+                        let observed_tip = inner.chain_tip_height();
+                        (res, observed_tip)
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "FAILED TO BORROW MUT INNER: {:?}", e);
@@ -2263,7 +2689,16 @@ impl ZincWasmWallet {
             };
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync: finished. events: {:?}", events);
 
-            serde_wasm_bindgen::to_value(&events).map_err(|e| JsValue::from(e.to_string()))
+            let receipt = BackendSyncReceiptV1::complete(
+                network,
+                BackendDependencyV1::Esplora,
+                BackendCapabilityV1::BaseChain,
+                esplora_url,
+                observed_tip,
+                sync_generation,
+            )
+            .with_total_keychains(total_keychains);
+            serde_wasm_bindgen::to_value(&receipt).map_err(|e| JsValue::from(e.to_string()))
         }))
     }
 
@@ -2275,6 +2710,8 @@ impl ZincWasmWallet {
         account_gap_limit: u32,
         address_scan_depth: Option<u32>,
         timeout_ms: Option<u32>,
+        max_accounts: Option<u32>,
+        on_progress: Option<js_sys::Function>,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
 
@@ -2286,41 +2723,53 @@ impl ZincWasmWallet {
         let scheme = state.scheme;
         let derivation_mode = state.derivation_mode;
         let payment_address_type = state.payment_address_type;
-        let account_gap_limit = account_gap_limit.max(1);
+        const MAX_ACCOUNT_GAP_LIMIT: u32 = 100;
+        const MAX_ADDRESS_SCAN_DEPTH: u32 = 200;
+        let account_gap_limit = account_gap_limit.clamp(1, MAX_ACCOUNT_GAP_LIMIT);
         let requested_address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
         let address_scan_depth = requested_address_scan_depth;
-        let timeout_ms = timeout_ms.unwrap_or(120_000).max(1);
+        let address_scan_depth = address_scan_depth.min(MAX_ADDRESS_SCAN_DEPTH);
+        const MAX_DISCOVERY_TIMEOUT_MS: u32 = 300_000;
+        let timeout_ms = timeout_ms
+            .unwrap_or(120_000)
+            .clamp(1, MAX_DISCOVERY_TIMEOUT_MS);
+        let max_accounts = max_accounts
+            .unwrap_or(MAX_DISCOVERY_ACCOUNTS)
+            .clamp(1, MAX_DISCOVERY_ACCOUNTS);
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
                 target: LOG_TARGET_WASM,
-                "discover_accounts start ({}, account_gap_limit={}, requested_scan_depth={}, effective_scan_depth={}, timeout_ms={})",
+                "discover_accounts start ({}, account_gap_limit={}, requested_scan_depth={}, effective_scan_depth={}, timeout_ms={}, max_accounts={})",
                 logging::redacted_field("esplora_url", &esplora_url),
                 account_gap_limit,
                 requested_address_scan_depth,
                 address_scan_depth,
-                timeout_ms
+                timeout_ms,
+                max_accounts
             );
 
             let client = reqwest::Client::new();
-            let mut max_active_index: i32 = -1;
-            let mut current_gap = 0;
+            let mut tracker = AccountDiscoveryTracker::default();
             let mut account_index: u32 = 0;
             let start_ms = js_sys::Date::now();
             let deadline_ms = start_ms + f64::from(timeout_ms);
+            let mut stop_reason = AccountDiscoveryStopReasonV1::MaxAccounts;
 
-            loop {
+            while account_index < max_accounts {
                 if js_sys::Date::now() >= deadline_ms {
                     zinc_log_warn!(
                         target: LOG_TARGET_WASM,
-                        "discover_accounts reached timeout budget after {}ms (best_so_far_max_active={})",
+                        "discover_accounts reached timeout budget after {}ms (discovered_count={})",
                         timeout_ms,
-                        max_active_index
+                        tracker.discovered_count()
                     );
+                    stop_reason = AccountDiscoveryStopReasonV1::Deadline;
                     break;
                 }
 
-                if current_gap >= account_gap_limit {
+                if tracker.gap_reached(account_gap_limit) {
+                    stop_reason = AccountDiscoveryStopReasonV1::GapLimit;
                     break;
                 }
 
@@ -2332,41 +2781,17 @@ impl ZincWasmWallet {
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-                let timed_out = std::cell::Cell::new(false);
-                const ADDRESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
-
                 let check_activity = |addr_str: String| {
                     let client = client.clone();
                     let url = format!("{}/address/{}", esplora_url, addr_str);
-                    async move {
-                        let request = async {
-                            if let Ok(resp) = client.get(&url).send().await {
-                                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                    let chain_txs =
-                                        json["chain_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    let mempool_txs =
-                                        json["mempool_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    return chain_txs > 0 || mempool_txs > 0;
-                                }
-                            }
-                            false
-                        };
-                        let timeout =
-                            gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
-                        futures_util::pin_mut!(request);
-                        futures_util::pin_mut!(timeout);
-
-                        match futures_util::future::select(request, timeout).await {
-                            futures_util::future::Either::Left((value, _)) => value,
-                            futures_util::future::Either::Right((_timed_out, _)) => false,
-                        }
-                    }
+                    async move { probe_esplora_address_activity(&client, url, deadline_ms).await }
                 };
 
                 // Scan each account's receive chain deeply enough to catch funds parked
                 // on later derived addresses during recovery.
-                let has_activity =
-                    account_is_active_from_receive_scan(address_scan_depth, |address_index| {
+                let has_activity = account_is_active_from_receive_scan_strict(
+                    address_scan_depth,
+                    |address_index| {
                         let vault_addr = zwallet.peek_taproot_address(address_index).to_string();
 
                         let payment_addr = if scheme == AddressScheme::Dual {
@@ -2379,53 +2804,86 @@ impl ZincWasmWallet {
 
                         async {
                             if js_sys::Date::now() >= deadline_ms {
-                                timed_out.set(true);
-                                return false;
+                                return Err(AccountDiscoveryProbeError::Deadline);
                             }
-                            if check_activity(vault_addr).await {
-                                return true;
+                            if check_activity(vault_addr).await? {
+                                return Ok(true);
                             }
                             if let Some(payment_addr) = payment_addr {
                                 return check_activity(payment_addr).await;
                             }
-                            false
+                            Ok(false)
                         }
-                    })
-                    .await;
+                    },
+                )
+                .await;
 
-                if timed_out.get() {
-                    zinc_log_warn!(
-                        target: LOG_TARGET_WASM,
-                        "discover_accounts stopped mid-account scan due to timeout budget (account_index={})",
-                        account_index
-                    );
-                    break;
+                let has_activity = match has_activity {
+                    Ok(active) => active,
+                    Err(AccountDiscoveryProbeError::Deadline) => {
+                        zinc_log_warn!(
+                            target: LOG_TARGET_WASM,
+                            "discover_accounts stopped at deadline (account_index={})",
+                            account_index
+                        );
+                        stop_reason = AccountDiscoveryStopReasonV1::Deadline;
+                        break;
+                    }
+                    #[cfg(test)]
+                    Err(AccountDiscoveryProbeError::Backend) => {
+                        return Err(JsValue::from_str(
+                            "Account discovery backend request failed",
+                        ));
+                    }
+                    Err(AccountDiscoveryProbeError::BackendFailure(failure)) => {
+                        return Err(backend_failure_to_js(&failure));
+                    }
+                };
+
+                if let Some(discovered_count) = tracker.record_probe(account_index, has_activity) {
+                    if let Some(callback) = on_progress.as_ref() {
+                        let progress = AccountDiscoveryProgressV1 {
+                            version: ACCOUNT_DISCOVERY_SCHEMA_V1,
+                            scanned_account_index: account_index,
+                            discovered_count,
+                        };
+                        if let Ok(value) = serde_wasm_bindgen::to_value(&progress) {
+                            if callback.call1(&JsValue::UNDEFINED, &value).is_err() {
+                                zinc_log_warn!(
+                                    target: LOG_TARGET_WASM,
+                                    "discover_accounts progress callback failed"
+                                );
+                            }
+                        }
+                    }
                 }
 
-                if has_activity {
-                    max_active_index = account_index as i32;
-                    current_gap = 0;
-                } else {
-                    current_gap += 1;
-                }
-
-                account_index += 1;
+                account_index = account_index
+                    .checked_add(1)
+                    .ok_or_else(|| JsValue::from_str("Account discovery index overflow"))?;
             }
 
-            let discovered_count = (max_active_index + 1) as u32;
-            let final_count = if discovered_count > 0 {
-                discovered_count
-            } else {
-                1
-            }; // Always show at least 1 (also on timeout)
+            if tracker.gap_reached(account_gap_limit) {
+                stop_reason = AccountDiscoveryStopReasonV1::GapLimit;
+            }
+            let complete = matches!(stop_reason, AccountDiscoveryStopReasonV1::GapLimit);
+            let response = AccountDiscoveryResponseV1 {
+                version: ACCOUNT_DISCOVERY_SCHEMA_V1,
+                discovered_count: tracker.discovered_count(),
+                scanned_accounts: tracker.scanned_accounts,
+                complete,
+                stop_reason,
+            };
 
             zinc_log_debug!(target: LOG_TARGET_WASM,
-                "discover_accounts finished. Found max active = {}, returning discovery count {}",
-                max_active_index,
-                final_count
+                "discover_accounts finished. discovered_count={}, scanned_accounts={}, complete={}",
+                response.discovered_count,
+                response.scanned_accounts,
+                response.complete
             );
 
-            Ok(JsValue::from(final_count))
+            serde_wasm_bindgen::to_value(&response)
+                .map_err(|error| JsValue::from(error.to_string()))
         }))
     }
 
@@ -2455,9 +2913,15 @@ impl ZincWasmWallet {
         let scheme = state.scheme;
         let derivation_mode = state.derivation_mode;
         let payment_address_type = state.payment_address_type;
-        let account_gap_limit = account_gap_limit.max(1);
-        let address_scan_depth = address_scan_depth.unwrap_or(20).max(1);
-        let timeout_ms = timeout_ms.unwrap_or(45_000).max(1);
+        const MAX_IMPORT_ACCOUNT_GAP_LIMIT: u32 = 100;
+        const MAX_IMPORT_ADDRESS_SCAN_DEPTH: u32 = 200;
+        const MAX_IMPORT_ACCOUNTS: u32 = 100;
+        const MAX_IMPORT_TIMEOUT_MS: u32 = 300_000;
+        let account_gap_limit = account_gap_limit.clamp(1, MAX_IMPORT_ACCOUNT_GAP_LIMIT);
+        let address_scan_depth = address_scan_depth
+            .unwrap_or(20)
+            .clamp(1, MAX_IMPORT_ADDRESS_SCAN_DEPTH);
+        let timeout_ms = timeout_ms.unwrap_or(45_000).clamp(1, MAX_IMPORT_TIMEOUT_MS);
         let branch_label = branch_str.to_string();
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
@@ -2475,10 +2939,12 @@ impl ZincWasmWallet {
             let mut active_accounts = Vec::new();
             let mut current_gap = 0;
             let mut account_index: u32 = 0;
+            let mut scanned_accounts: u32 = 0;
             let start_ms = js_sys::Date::now();
             let deadline_ms = start_ms + f64::from(timeout_ms);
+            let mut stop_reason = ImportPathDiscoveryStopReasonV1::MaxAccounts;
 
-            loop {
+            while account_index < MAX_IMPORT_ACCOUNTS {
                 if js_sys::Date::now() >= deadline_ms {
                     zinc_log_warn!(
                         target: LOG_TARGET_WASM,
@@ -2486,10 +2952,12 @@ impl ZincWasmWallet {
                         timeout_ms,
                         active_accounts.len()
                     );
+                    stop_reason = ImportPathDiscoveryStopReasonV1::Deadline;
                     break;
                 }
 
                 if current_gap >= account_gap_limit {
+                    stop_reason = ImportPathDiscoveryStopReasonV1::GapLimit;
                     break;
                 }
 
@@ -2501,39 +2969,15 @@ impl ZincWasmWallet {
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
-                let timed_out = std::cell::Cell::new(false);
-                const ADDRESS_REQUEST_TIMEOUT_MS: u32 = 2_000;
-
                 let check_activity = |addr_str: String| {
                     let client = client.clone();
                     let url = format!("{}/address/{}", esplora_url, addr_str);
-                    async move {
-                        let request = async {
-                            if let Ok(resp) = client.get(&url).send().await {
-                                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                    let chain_txs =
-                                        json["chain_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    let mempool_txs =
-                                        json["mempool_stats"]["tx_count"].as_u64().unwrap_or(0);
-                                    return chain_txs > 0 || mempool_txs > 0;
-                                }
-                            }
-                            false
-                        };
-                        let timeout =
-                            gloo_timers::future::TimeoutFuture::new(ADDRESS_REQUEST_TIMEOUT_MS);
-                        futures_util::pin_mut!(request);
-                        futures_util::pin_mut!(timeout);
-
-                        match futures_util::future::select(request, timeout).await {
-                            futures_util::future::Either::Left((value, _)) => value,
-                            futures_util::future::Either::Right((_timed_out, _)) => false,
-                        }
-                    }
+                    async move { probe_esplora_address_activity(&client, url, deadline_ms).await }
                 };
 
-                let first_active_address_index =
-                    first_active_receive_index_from_scan(address_scan_depth, |address_index| {
+                let first_active_address_index = first_active_receive_index_from_scan_strict(
+                    address_scan_depth,
+                    |address_index| {
                         let branch_address = match branch {
                             ImportDiscoveryBranch::Taproot => {
                                 Some(zwallet.peek_taproot_address(address_index).to_string())
@@ -2551,25 +2995,36 @@ impl ZincWasmWallet {
 
                         async {
                             if js_sys::Date::now() >= deadline_ms {
-                                timed_out.set(true);
-                                return false;
+                                return Err(AccountDiscoveryProbeError::Deadline);
                             }
                             if let Some(address) = branch_address {
                                 return check_activity(address).await;
                             }
-                            false
+                            Ok(false)
                         }
-                    })
-                    .await;
+                    },
+                )
+                .await;
 
-                if timed_out.get() {
-                    zinc_log_warn!(
-                        target: LOG_TARGET_WASM,
-                        "discover_import_path stopped mid-account scan due to timeout budget (account_index={})",
-                        account_index
-                    );
-                    break;
-                }
+                let first_active_address_index = match first_active_address_index {
+                    Ok(index) => index,
+                    Err(AccountDiscoveryProbeError::Deadline) => {
+                        zinc_log_warn!(
+                            target: LOG_TARGET_WASM,
+                            "discover_import_path stopped at deadline (account_index={})",
+                            account_index
+                        );
+                        stop_reason = ImportPathDiscoveryStopReasonV1::Deadline;
+                        break;
+                    }
+                    #[cfg(test)]
+                    Err(AccountDiscoveryProbeError::Backend) => {
+                        return Err(JsValue::from_str("Import discovery backend request failed"));
+                    }
+                    Err(AccountDiscoveryProbeError::BackendFailure(failure)) => {
+                        return Err(backend_failure_to_js(&failure));
+                    }
+                };
 
                 if let Some(first_active_address_index) = first_active_address_index {
                     active_accounts.push(ImportPathAccountHit {
@@ -2581,11 +3036,24 @@ impl ZincWasmWallet {
                     current_gap += 1;
                 }
 
-                account_index += 1;
+                scanned_accounts = scanned_accounts.saturating_add(1);
+                account_index = account_index
+                    .checked_add(1)
+                    .ok_or_else(|| JsValue::from_str("Import discovery index overflow"))?;
             }
 
-            serde_wasm_bindgen::to_value(&ImportPathDiscoveryResponse { active_accounts })
-                .map_err(|e| JsValue::from(e.to_string()))
+            if current_gap >= account_gap_limit {
+                stop_reason = ImportPathDiscoveryStopReasonV1::GapLimit;
+            }
+            let complete = matches!(stop_reason, ImportPathDiscoveryStopReasonV1::GapLimit);
+            serde_wasm_bindgen::to_value(&ImportPathDiscoveryResponse {
+                version: ACCOUNT_DISCOVERY_SCHEMA_V1,
+                active_accounts,
+                scanned_accounts,
+                complete,
+                stop_reason,
+            })
+            .map_err(|e| JsValue::from(e.to_string()))
         }))
     }
 
@@ -2628,11 +3096,12 @@ impl ZincWasmWallet {
     pub fn sync_ordinals(&self, ord_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         let inner_rc = self.inner.clone();
+        let network = self.state_snapshot().network;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
             // 1. Collect info needed for sync (Borrow Read)
-            let (outpoints, wallet_height, sync_generation) = {
+            let (outpoints, wallet_height, sync_generation, chain_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if !inner.try_begin_sync(js_sys::Date::now()) {
@@ -2644,7 +3113,7 @@ impl ZincWasmWallet {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collecting UTXO outpoints...");
                         // Inscriptions/runes are UTXO-bound, so we bulk-query exactly our own outpoints
                         // (POST /outputs) — one request instead of per-address + per-output round-trips.
-                        let ops = inner.collect_utxo_outpoints();
+                        let ops = inner.collect_utxo_snapshots();
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collected {} outpoints", ops.len());
                         // A wallet with zero outpoints but a non-empty inscription list is almost
                         // certainly not chain-synced yet (fresh instance, failed/foreign changeset
@@ -2663,7 +3132,12 @@ impl ZincWasmWallet {
                             ));
                         }
                         let height = inner.vault_wallet.local_chain().tip().height();
-                        (ops, height, inner.account_generation())
+                        (
+                            ops,
+                            height,
+                            inner.account_generation(),
+                            inner.chain_state_generation(),
+                        )
                     }
                     Err(e) => {
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: FAILED TO BORROW INNER: {:?}", e);
@@ -2688,11 +3162,11 @@ impl ZincWasmWallet {
                     ) {
                         return Err(stale);
                     }
-                    return Err(JsValue::from_str(&e.to_string()));
+                    return Err(ord_scan_failure_to_js(e, sync_generation));
                 }
             };
 
-            if ord_height < wallet_height.saturating_sub(1) {
+            if ord_height < wallet_height.saturating_sub(2) {
                 // We need to set verified=false safely
                 zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: Ord lagging, setting verified=false");
                 match inner_rc.try_borrow_mut() {
@@ -2714,10 +3188,18 @@ impl ZincWasmWallet {
                         );
                     }
                 }
-                return Err(JsValue::from_str(&format!(
-                    "Ord Indexer is lagging! Ord: {}, Wallet: {}. Safety lock engaged.",
-                    ord_height, wallet_height
-                )));
+                return Err(backend_scan_failure_to_js(
+                    BackendFailureV1::new(
+                        BackendDependencyV1::Ord,
+                        BackendOperationV1::BlockHeight,
+                        BackendFailureCategoryV1::Unavailable,
+                    )
+                    .with_upstream_code("index_lag"),
+                    None,
+                    sync_generation,
+                    0,
+                    1,
+                ));
             }
 
             // 2b. Restrict the bulk query to outpoints ord is guaranteed to have indexed:
@@ -2730,17 +3212,29 @@ impl ZincWasmWallet {
             // were invisible to ord there too, and they get classified on a later sync once
             // confirmed and indexed.
             let total_outpoints = outpoints.len();
-            let queryable_outpoints: Vec<String> = outpoints
+            let mut pending_protection = std::collections::HashSet::<bitcoin::OutPoint>::new();
+            let queryable_utxos: Vec<(String, u64)> = outpoints
                 .into_iter()
-                .filter_map(|(op, confirmation_height)| match confirmation_height {
-                    Some(height) if height <= ord_height => Some(op),
-                    _ => None,
-                })
+                .filter_map(
+                    |(op, confirmation_height, value_sats)| match confirmation_height {
+                        Some(height) if height <= ord_height => Some((op, value_sats)),
+                        _ => {
+                            if let Ok(outpoint) = op.parse() {
+                                pending_protection.insert(outpoint);
+                            }
+                            None
+                        }
+                    },
+                )
                 .collect();
-            if queryable_outpoints.len() < total_outpoints {
+            let classified_outpoints = queryable_utxos
+                .iter()
+                .filter_map(|(outpoint, _)| outpoint.parse().ok())
+                .collect();
+            if queryable_utxos.len() < total_outpoints {
                 zinc_log_debug!(target: LOG_TARGET_WASM,
                     "sync_ordinals: skipping {} outpoint(s) not yet indexable by ord (unconfirmed or above ord height {})",
-                    total_outpoints - queryable_outpoints.len(),
+                    total_outpoints - queryable_utxos.len(),
                     ord_height
                 );
             }
@@ -2752,10 +3246,7 @@ impl ZincWasmWallet {
             // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
             // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
-            let resolved = match client
-                .resolve_assets_for_outpoints(&queryable_outpoints)
-                .await
-            {
+            let resolved = match client.resolve_assets_for_utxos(&queryable_utxos).await {
                 Ok(r) => r,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);
@@ -2774,11 +3265,13 @@ impl ZincWasmWallet {
                             );
                         }
                     }
-                    return Err(JsValue::from_str(&e.to_string()));
+                    return Err(ord_scan_failure_to_js(e, sync_generation));
                 }
             };
             let all_inscriptions = resolved.inscriptions;
-            let protected_outpoints = resolved.protected_outpoints;
+            let mut protected_outpoints = resolved.protected_outpoints;
+            protected_outpoints.extend(pending_protection);
+            let rare_sat_outpoints = resolved.rare_sat_outpoints;
             let rune_balances = resolved.rune_balances;
             let outpoint_runes = resolved.outpoint_runes;
             let rune_infos = resolved.rune_infos;
@@ -2789,18 +3282,24 @@ impl ZincWasmWallet {
 
             // 3. Apply Update (Borrow Mut)
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: applying update (borrow mut)");
-            let count = {
+            {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
                         if inner.account_generation() != sync_generation {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
-                        let c = inner.apply_verified_ordinals_update(
-                            all_inscriptions,
-                            protected_outpoints,
-                            rune_balances,
-                        );
-                        inner.apply_outpoint_rune_holdings(outpoint_runes, rune_infos);
+                        let c = inner
+                            .apply_complete_verified_ordinals_update_with_rare_sats(
+                                all_inscriptions,
+                                protected_outpoints,
+                                rune_balances,
+                                rare_sat_outpoints,
+                                outpoint_runes,
+                                rune_infos,
+                                classified_outpoints,
+                                chain_generation,
+                            )
+                            .map_err(|error| JsValue::from_str(&error))?;
                         inner.is_syncing = false; // FINISHED
                         c
                     }
@@ -2815,7 +3314,15 @@ impl ZincWasmWallet {
                 }
             };
 
-            Ok(JsValue::from(count as u32))
+            let receipt = BackendSyncReceiptV1::complete(
+                network,
+                BackendDependencyV1::Ord,
+                BackendCapabilityV1::Ord,
+                ord_url,
+                ord_height,
+                sync_generation,
+            );
+            serde_wasm_bindgen::to_value(&receipt).map_err(|error| JsValue::from(error.to_string()))
         }))
     }
     // ========================================================================
@@ -2855,6 +3362,32 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Invalid request: {e}")))?;
 
         self.create_psbt_with_transport(transport, "createPsbt")
+    }
+
+    /// Create an ordinary Bitcoin transfer and return its engine-issued intent.
+    #[wasm_bindgen(js_name = createBitcoinTransfer)]
+    pub fn create_bitcoin_transfer_request(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        let transport: crate::builder::CreatePsbtTransportRequest =
+            serde_wasm_bindgen::from_value(request)
+                .map_err(|error| JsValue::from_str(&format!("Invalid request: {error}")))?;
+        let request = crate::builder::CreatePsbtRequest::try_from(transport)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                let result = inner
+                    .create_bitcoin_transfer(&request)
+                    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+                serde_wasm_bindgen::to_value(&result).map_err(|error| {
+                    JsValue::from_str(&format!(
+                        "Failed to serialize Bitcoin transfer result: {error}"
+                    ))
+                })
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (createBitcoinTransfer): {error}"
+            ))),
+        }
     }
 
     /// Build and fully audit an unsigned Rune transfer.
@@ -2918,6 +3451,41 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&e.to_string())),
             Err(e) => Err(JsValue::from_str(&format!(
                 "Wallet busy (planSalvage): {e}"
+            ))),
+        }
+    }
+
+    /// Build an unsigned rare-sat extraction PSBT. The exact sat positions
+    /// come from the last verified ord sync; a clean confirmed UTXO funds fees.
+    #[wasm_bindgen(js_name = planExtractRareSats)]
+    pub fn plan_extract_rare_sats_request(&self, request: JsValue) -> Result<String, JsValue> {
+        self.check_vitality()?;
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PlanExtractRareSatsRequest {
+            outpoint: String,
+            fee_rate_sat_vb: f64,
+            target_postage: u64,
+            protected_address: String,
+            change_address: String,
+        }
+
+        let req: PlanExtractRareSatsRequest = serde_wasm_bindgen::from_value(request)
+            .map_err(|error| JsValue::from_str(&format!("Invalid extraction request: {error}")))?;
+
+        match self.inner.try_borrow() {
+            Ok(inner) => inner
+                .plan_extract_rare_sats_base64(
+                    &req.outpoint,
+                    req.fee_rate_sat_vb,
+                    req.target_postage,
+                    &req.protected_address,
+                    &req.change_address,
+                )
+                .map_err(|error| JsValue::from_str(&error.to_string())),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (planExtractRareSats): {error}"
             ))),
         }
     }
@@ -3037,6 +3605,169 @@ impl ZincWasmWallet {
                 .sign_psbt(psbt_base64, sign_opts)
                 .map_err(JsValue::from),
             Err(e) => Err(JsValue::from_str(&format!("Wallet busy (sign_psbt): {e}"))),
+        }
+    }
+
+    /// Sign an ordinary Bitcoin transfer only after revalidating its exact intent.
+    #[wasm_bindgen(js_name = signBitcoinTransferPsbt)]
+    pub fn sign_bitcoin_transfer_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+        options: JsValue,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let intent: crate::builder::BitcoinTransferIntent = serde_wasm_bindgen::from_value(intent)
+            .map_err(|error| {
+                JsValue::from_str(&format!("Invalid Bitcoin transfer intent: {error}"))
+            })?;
+        let sign_options: Option<crate::builder::SignOptions> =
+            if options.is_null() || options.is_undefined() {
+                None
+            } else {
+                Some(
+                    serde_wasm_bindgen::from_value(options)
+                        .map_err(|error| JsValue::from_str(&format!("Invalid options: {error}")))?,
+                )
+            };
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .sign_bitcoin_transfer_psbt(psbt_base64, &intent, sign_options)
+                .map_err(JsValue::from),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (signBitcoinTransferPsbt): {error}"
+            ))),
+        }
+    }
+
+    /// Validate an ordinary transfer intent without signing (for browser hardware flows).
+    #[wasm_bindgen(js_name = validateBitcoinTransferPsbt)]
+    pub fn validate_bitcoin_transfer_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+    ) -> Result<(), JsValue> {
+        use base64::Engine;
+
+        self.check_vitality()?;
+        let intent: crate::builder::BitcoinTransferIntent = serde_wasm_bindgen::from_value(intent)
+            .map_err(|error| {
+                JsValue::from_str(&format!("Invalid Bitcoin transfer intent: {error}"))
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| JsValue::from_str(&format!("Invalid base64: {error}")))?;
+        let psbt = bitcoin::Psbt::deserialize(&bytes)
+            .map_err(|error| JsValue::from_str(&format!("Invalid PSBT: {error}")))?;
+        self.inner
+            .try_borrow()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (validateBitcoinTransferPsbt): {error}"
+                ))
+            })?
+            .validate_bitcoin_transfer_psbt(&psbt, &intent)
+            .map_err(|error| JsValue::from_str(&format!("Security Violation: {error}")))
+    }
+
+    /// Create an exact operation-specific intent for a PSBT returned by a
+    /// first-party Zinc/Singularity builder.
+    #[wasm_bindgen(js_name = createConstructedTransactionIntent)]
+    pub fn create_constructed_transaction_intent(
+        &self,
+        psbt_base64: &str,
+        request: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        use base64::Engine;
+
+        self.check_vitality()?;
+        let request: crate::builder::ConstructedTransactionIntentRequest =
+            serde_wasm_bindgen::from_value(request).map_err(|error| {
+                JsValue::from_str(&format!("Invalid constructed transaction request: {error}"))
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| JsValue::from_str(&format!("Invalid base64: {error}")))?;
+        let psbt = bitcoin::Psbt::deserialize(&bytes)
+            .map_err(|error| JsValue::from_str(&format!("Invalid PSBT: {error}")))?;
+        let intent = self
+            .inner
+            .try_borrow()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (createConstructedTransactionIntent): {error}"
+                ))
+            })?
+            .create_constructed_transaction_intent(&psbt, request)
+            .map_err(|error| JsValue::from_str(&format!("Security Violation: {error}")))?;
+        serde_wasm_bindgen::to_value(&intent).map_err(|error| {
+            JsValue::from_str(&format!(
+                "Failed to serialize constructed transaction intent: {error}"
+            ))
+        })
+    }
+
+    /// Validate a first-party constructed transaction without signing. Browser
+    /// hardware flows use this immediately before device preparation.
+    #[wasm_bindgen(js_name = validateConstructedTransactionPsbt)]
+    pub fn validate_constructed_transaction_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+    ) -> Result<(), JsValue> {
+        use base64::Engine;
+
+        self.check_vitality()?;
+        let intent: crate::builder::ConstructedTransactionIntent =
+            serde_wasm_bindgen::from_value(intent).map_err(|error| {
+                JsValue::from_str(&format!("Invalid constructed transaction intent: {error}"))
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(psbt_base64)
+            .map_err(|error| JsValue::from_str(&format!("Invalid base64: {error}")))?;
+        let psbt = bitcoin::Psbt::deserialize(&bytes)
+            .map_err(|error| JsValue::from_str(&format!("Invalid PSBT: {error}")))?;
+        self.inner
+            .try_borrow()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (validateConstructedTransactionPsbt): {error}"
+                ))
+            })?
+            .validate_constructed_transaction_psbt(&psbt, &intent)
+            .map_err(|error| JsValue::from_str(&format!("Security Violation: {error}")))
+    }
+
+    /// Sign a first-party constructed transaction only after revalidating its
+    /// exact template and operation-specific intent.
+    #[wasm_bindgen(js_name = signConstructedTransactionPsbt)]
+    pub fn sign_constructed_transaction_psbt(
+        &self,
+        psbt_base64: &str,
+        intent: JsValue,
+        options: JsValue,
+    ) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        let intent: crate::builder::ConstructedTransactionIntent =
+            serde_wasm_bindgen::from_value(intent).map_err(|error| {
+                JsValue::from_str(&format!("Invalid constructed transaction intent: {error}"))
+            })?;
+        let sign_options: Option<crate::builder::SignOptions> =
+            if options.is_null() || options.is_undefined() {
+                None
+            } else {
+                Some(
+                    serde_wasm_bindgen::from_value(options)
+                        .map_err(|error| JsValue::from_str(&format!("Invalid options: {error}")))?,
+                )
+            };
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .sign_constructed_transaction_psbt(psbt_base64, &intent, sign_options)
+                .map_err(JsValue::from),
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (signConstructedTransactionPsbt): {error}"
+            ))),
         }
     }
 
@@ -3417,12 +4148,16 @@ impl ZincWasmWallet {
                 let secret_hex = inner
                     .get_pairing_secret_key_hex()
                     .map_err(|e| JsValue::from_str(&e))?;
+                let expected_payout_script = inner
+                    .peek_payment_address(0)
+                    .map(|address| address.script_pubkey());
                 let signed_receipt = crate::sign_intent::build_signed_sign_intent_approved_receipt(
                     &signed_intent,
                     &secret_hex,
                     created_at_unix,
                     signed_psbt_base64.as_deref(),
                     artifact_json.as_deref(),
+                    expected_payout_script.as_deref(),
                 )
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
                 serde_json::to_string(&signed_receipt).map_err(|e| {
@@ -3445,9 +4180,23 @@ impl ZincWasmWallet {
         now_unix: i64,
     ) -> Result<String, JsValue> {
         self.check_vitality()?;
-        let plan =
-            crate::sign_intent::verify_sign_seller_input_scope_json(signed_intent_json, now_unix)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let expected_payout_script = self
+            .inner
+            .try_borrow()
+            .map_err(|e| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (verify_sign_seller_input_scope_json): {e}"
+                ))
+            })?
+            .peek_payment_address(0)
+            .ok_or_else(|| JsValue::from_str("Payment wallet missing"))?
+            .script_pubkey();
+        let plan = crate::sign_intent::verify_sign_seller_input_scope_json(
+            signed_intent_json,
+            now_unix,
+            expected_payout_script.as_script(),
+        )
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
         serde_json::to_string(&plan)
             .map_err(|e| JsValue::from_str(&format!("failed to serialize scope plan: {e}")))
     }
@@ -3545,7 +4294,7 @@ impl ZincWasmWallet {
         esplora_url: String,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        use crate::builder::SyncSleeper;
+        use crate::builder::configured_esplora_client;
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             // Decode PSBT - no borrow needed
@@ -3563,16 +4312,17 @@ impl ZincWasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Failed to extract tx: {e}")))?;
 
             // Broadcast via Esplora (no RefCell borrow needed)
-            let client = esplora_client::Builder::new(&esplora_url)
-                .build_async_with_sleeper::<SyncSleeper>()
-                .map_err(|e| JsValue::from_str(&format!("Failed to create client: {e:?}")))?;
+            let client = configured_esplora_client(&esplora_url).map_err(|e| {
+                backend_failure_to_js(&BackendFailureV1::from_esplora(
+                    &e,
+                    BackendOperationV1::Connect,
+                ))
+            })?;
 
-            client
-                .broadcast(&tx)
+            crate::builder::broadcast_esplora_transaction(&client, &tx)
                 .await
-                .map_err(|e| JsValue::from_str(&format!("Broadcast failed: {e}")))?;
-
-            Ok(JsValue::from(tx.compute_txid().to_string()))
+                .map(|txid| JsValue::from(txid.to_string()))
+                .map_err(|failure| backend_failure_to_js(&failure))
         }))
     }
 }

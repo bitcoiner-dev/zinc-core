@@ -157,7 +157,20 @@ fn restored_seed_wallet_signs_and_finalizes_from_persisted_state() {
         .expect("accept persistence")
         .build()
         .expect("restored wallet");
-    restored.apply_verified_ordinals_update(vec![], std::collections::HashSet::new(), vec![]);
+    let classified = restored
+        .collect_utxo_outpoints()
+        .into_iter()
+        .filter_map(|(outpoint, _)| outpoint.parse().ok())
+        .collect();
+    restored
+        .apply_verified_ordinals_update(
+            vec![],
+            std::collections::HashSet::new(),
+            vec![],
+            classified,
+            restored.chain_state_generation(),
+        )
+        .unwrap();
 
     let recipient = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([14u8; 64]))
         .with_scheme(AddressScheme::Dual)

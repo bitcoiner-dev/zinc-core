@@ -335,7 +335,7 @@ fn test_split_transaction_safe() {
 #[test]
 fn test_missing_witness_utxo_error() {
     // Input 0: Value 100,000, but MISSING witness_utxo info in PSBT input
-    // Expectation: Err(OrdError::RequestFailed("...missing witness_utxo..."))
+    // Expectation: diagnostic-only invalid Ord data.
 
     let mut psbt = create_dummy_psbt(&[(100_000, None)], &[99_000]);
     // Sabotage input
@@ -348,12 +348,16 @@ fn test_missing_witness_utxo_error() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
-        crate::ordinals::error::OrdError::RequestFailed(msg) => {
+        crate::ordinals::error::OrdError::InvalidData(msg) => {
             assert!(
                 msg.contains("missing witness_utxo data"),
                 "Error message should mention missing witness_utxo"
             );
         }
+        crate::ordinals::error::OrdError::RareSatProtectionUnverified { .. } => {
+            panic!("missing PSBT data must remain a request failure")
+        }
+        other => panic!("unexpected error: {other:?}"),
     }
 }
 
@@ -556,6 +560,7 @@ fn unverified_asset_data_downgrades_a_clean_verdict() {
     let psbt = create_dummy_psbt(&[(10_000, None)], &[9_000]);
     let known_inscriptions = HashMap::new();
     let known_runes = crate::ordinals::shield::KnownRunes::new();
+    let known_rare_sats = crate::ordinals::shield::KnownRareSats::new();
     let mint_terms = HashMap::new();
 
     let verified = analyze_psbt_with_context(
@@ -563,6 +568,7 @@ fn unverified_asset_data_downgrades_a_clean_verdict() {
         &ShieldContext {
             known_inscriptions: &known_inscriptions,
             known_runes: &known_runes,
+            known_rare_sats: &known_rare_sats,
             input_scope: None,
             network: bitcoin::Network::Regtest,
             mint_terms: &mint_terms,
@@ -578,6 +584,7 @@ fn unverified_asset_data_downgrades_a_clean_verdict() {
         &ShieldContext {
             known_inscriptions: &known_inscriptions,
             known_runes: &known_runes,
+            known_rare_sats: &known_rare_sats,
             input_scope: None,
             network: bitcoin::Network::Regtest,
             mint_terms: &mint_terms,

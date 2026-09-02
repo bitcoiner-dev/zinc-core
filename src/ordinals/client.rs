@@ -1,9 +1,64 @@
+use crate::backend_error::{BackendDependencyV1, BackendFailureV1, BackendOperationV1};
 use crate::ordinals::error::OrdError;
 use crate::ordinals::types::{Inscription, RuneBalance, RuneInfo};
 use bitcoin::OutPoint;
+use futures_util::{stream, StreamExt, TryStreamExt};
+use ordinals::{Epoch, Rarity, Sat};
 use reqwest::Client;
 use serde::{Deserialize, Deserializer};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+const OUTPUTS_BATCH: usize = 100;
+const OUTPUTS_MAX_CONCURRENCY: usize = 4;
+
+async fn send_ord_request(
+    request: reqwest::RequestBuilder,
+    operation: BackendOperationV1,
+) -> Result<reqwest::Response, OrdError> {
+    request.send().await.map_err(|error| {
+        BackendFailureV1::from_reqwest(&error, BackendDependencyV1::Ord, operation).into()
+    })
+}
+
+fn ensure_ord_success(
+    response: &reqwest::Response,
+    operation: BackendOperationV1,
+) -> Result<(), OrdError> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok());
+    Err(BackendFailureV1::from_http_status(
+        BackendDependencyV1::Ord,
+        operation,
+        response.status().as_u16(),
+        retry_after,
+    )
+    .into())
+}
+
+async fn parse_ord_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: BackendOperationV1,
+) -> Result<T, OrdError> {
+    response
+        .json::<T>()
+        .await
+        .map_err(|_| OrdError::invalid_response(operation))
+}
+
+async fn parse_ord_text(
+    response: reqwest::Response,
+    operation: BackendOperationV1,
+) -> Result<String, OrdError> {
+    response
+        .text()
+        .await
+        .map_err(|_| OrdError::invalid_response(operation))
+}
 
 #[derive(Clone, Debug)]
 /// Lightweight client for ord-compatible REST APIs.
@@ -36,15 +91,45 @@ pub struct AddressAssetSnapshot {
 #[derive(Deserialize)]
 struct OutputResponse {
     #[serde(default)]
+    indexed: Option<bool>,
+    #[serde(default)]
     address: Option<String>,
     #[serde(default)]
     outpoint: Option<String>,
     #[serde(default)]
+    transaction: Option<String>,
+    #[serde(default)]
     value: Option<u64>,
+    #[serde(default)]
+    sat_ranges: Option<Vec<(u64, u64)>>,
     #[serde(default, deserialize_with = "deserialize_string_vec_or_default")]
     inscriptions: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_json_value_or_default")]
     runes: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Exact non-common sat position within one wallet output.
+pub struct RareSatLocation {
+    /// Absolute ordinal sat number.
+    pub number: u64,
+    /// Zero-based sat offset inside the output.
+    pub offset: u64,
+    /// Ordinal rarity (`uncommon` through `mythic`).
+    pub rarity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Non-common sat summary for one wallet output.
+pub struct RareSatSummary {
+    /// Number of non-common sats in the output.
+    pub count: u64,
+    /// Highest Ordinal rarity present (`uncommon` through `mythic`).
+    pub highest_rarity: String,
+    /// Exact positions used by sat-aware builders and Ordinal Shield.
+    pub sats: Vec<RareSatLocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +163,8 @@ pub struct ResolvedAssets {
     pub inscriptions: Vec<Inscription>,
     /// Outpoints holding an inscription or rune — the shield's protected (unspendable) set.
     pub protected_outpoints: HashSet<OutPoint>,
+    /// Non-common sat summaries keyed by their protected outpoint.
+    pub rare_sat_outpoints: HashMap<OutPoint, RareSatSummary>,
     /// Aggregated rune balances.
     pub rune_balances: Vec<RuneBalance>,
     /// Per-outpoint rune holdings keyed by rune ID `"block:tx"` (base units).
@@ -148,23 +235,23 @@ enum OffersResponse {
 
 impl OutputResponse {
     fn has_protected_assets(&self) -> bool {
-        !self.inscriptions.is_empty() || value_has_entries(&self.runes)
+        !self.inscriptions.is_empty()
+            || value_has_entries(&self.runes)
+            || self
+                .sat_ranges
+                .as_deref()
+                .and_then(classify_rare_sats)
+                .is_some()
     }
 
     fn into_output_details(self, requested_outpoint: &str) -> Result<OutputDetails, OrdError> {
         let address = self
             .address
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                OrdError::RequestFailed(format!(
-                    "Output {requested_outpoint} is missing required address field"
-                ))
-            })?;
-        let value = self.value.ok_or_else(|| {
-            OrdError::RequestFailed(format!(
-                "Output {requested_outpoint} is missing required value field"
-            ))
-        })?;
+            .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
+        let value = self
+            .value
+            .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
         let outpoint = self
             .outpoint
             .filter(|value| !value.trim().is_empty())
@@ -178,6 +265,149 @@ impl OutputResponse {
             runes: self.runes,
         })
     }
+}
+
+fn checked_ceil_div(value: u64, divisor: u64) -> Option<u64> {
+    value
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
+}
+
+fn first_multiple_at_or_after(value: u64, period: u64) -> Option<u64> {
+    checked_ceil_div(value, period)?.checked_mul(period)
+}
+
+/// Classify non-common sats without iterating over every sat in an output.
+/// A non-common sat is the first sat of a block, so each epoch can be reduced
+/// to a closed interval of block heights and checked arithmetically.
+fn classify_rare_sats(ranges: &[(u64, u64)]) -> Option<RareSatSummary> {
+    let mut count = 0u64;
+    let mut highest = Rarity::Common;
+    let mut sats = Vec::new();
+    let mut range_base_offset = 0u64;
+
+    for &(range_start, range_end) in ranges {
+        for epoch_number in 0..33u32 {
+            let epoch = Epoch(epoch_number);
+            let epoch_start = epoch.starting_sat().n();
+            let epoch_end = Epoch(epoch_number + 1).starting_sat().n();
+            let start = range_start.max(epoch_start);
+            let end = range_end.min(epoch_end);
+            if start >= end {
+                continue;
+            }
+
+            let subsidy = epoch.subsidy();
+            if subsidy == 0 {
+                continue;
+            }
+            let first_index = checked_ceil_div(start - epoch_start, subsidy)?;
+            let last_index = (end - 1 - epoch_start) / subsidy;
+            if first_index > last_index {
+                continue;
+            }
+            count = count.checked_add(last_index - first_index + 1)?;
+
+            let first_height = u64::from(epoch.starting_height().n()) + first_index;
+            let last_height = u64::from(epoch.starting_height().n()) + last_index;
+            let candidate_rarity = if first_height == 0 {
+                Rarity::Mythic
+            } else if first_multiple_at_or_after(first_height, 1_260_000)? <= last_height {
+                Rarity::Legendary
+            } else if first_multiple_at_or_after(first_height, 210_000)? <= last_height {
+                Rarity::Epic
+            } else if first_multiple_at_or_after(first_height, 2_016)? <= last_height {
+                Rarity::Rare
+            } else {
+                Rarity::Uncommon
+            };
+            if candidate_rarity > highest {
+                highest = candidate_rarity;
+            }
+
+            for index in first_index..=last_index {
+                let number = epoch_start.checked_add(index.checked_mul(subsidy)?)?;
+                let offset = range_base_offset.checked_add(number.checked_sub(range_start)?)?;
+                let rarity = Sat(number).rarity();
+                sats.push(RareSatLocation {
+                    number,
+                    offset,
+                    rarity: rarity.to_string(),
+                });
+            }
+        }
+        range_base_offset = range_base_offset.checked_add(range_end.checked_sub(range_start)?)?;
+    }
+
+    (count > 0).then(|| RareSatSummary {
+        count,
+        highest_rarity: highest.to_string(),
+        sats,
+    })
+}
+
+pub(crate) fn validate_sat_ranges(
+    outpoint: &str,
+    ranges: Option<&[(u64, u64)]>,
+    returned_value: Option<u64>,
+    trusted_value: u64,
+) -> Result<RareSatSummary, OrdError> {
+    let value = returned_value.ok_or_else(|| {
+        let _ = outpoint;
+        OrdError::RareSatProtectionUnverified {
+            reason: "missing-output-value",
+        }
+    })?;
+    if value != trusted_value {
+        return Err(OrdError::RareSatProtectionUnverified {
+            reason: "wallet-value-mismatch",
+        });
+    }
+    let ranges = ranges.ok_or(OrdError::RareSatProtectionUnverified {
+        reason: "sat-ranges-missing",
+    })?;
+    if trusted_value > 0 && ranges.is_empty() {
+        return Err(OrdError::RareSatProtectionUnverified {
+            reason: "sat-ranges-empty",
+        });
+    }
+
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|range| range.0);
+    let mut total = 0u64;
+    let mut previous_end = None;
+    for &(start, end) in &sorted {
+        if start >= end || end > Sat::SUPPLY {
+            return Err(OrdError::RareSatProtectionUnverified {
+                reason: "sat-range-invalid",
+            });
+        }
+        if previous_end.is_some_and(|previous| start < previous) {
+            return Err(OrdError::RareSatProtectionUnverified {
+                reason: "sat-ranges-overlap",
+            });
+        }
+        total = total
+            .checked_add(end - start)
+            .ok_or(OrdError::RareSatProtectionUnverified {
+                reason: "sat-range-size-overflow",
+            })?;
+        previous_end = Some(end);
+    }
+    if total != trusted_value {
+        return Err(OrdError::RareSatProtectionUnverified {
+            reason: "sat-range-coverage-mismatch",
+        });
+    }
+
+    // `sat_ranges` are ordered by their position in the output's sat stream.
+    // The sorted copy above is only for overlap validation; classification
+    // must retain the source order so every reported offset stays exact.
+    Ok(classify_rare_sats(ranges).unwrap_or(RareSatSummary {
+        count: 0,
+        highest_rarity: Rarity::Common.to_string(),
+        sats: Vec::new(),
+    }))
 }
 
 fn deserialize_string_vec_or_default<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -207,7 +437,7 @@ fn value_has_entries(value: &serde_json::Value) -> bool {
 
 fn parse_offers_payload(body: &str) -> Result<Vec<String>, OrdError> {
     let parsed: OffersResponse = serde_json::from_str(body)
-        .map_err(|e| OrdError::RequestFailed(format!("Failed to parse offers JSON: {e}")))?;
+        .map_err(|_| OrdError::invalid_response(BackendOperationV1::Offers))?;
 
     Ok(match parsed {
         OffersResponse::Wrapped { offers } | OffersResponse::Bare(offers) => offers,
@@ -419,13 +649,13 @@ impl OrdClient {
     ) -> Result<AddressAssetSnapshot, OrdError> {
         let url = format!("{}/address/{}", self.base_url, address);
 
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
+        let response = send_ord_request(
+            self.http_client
+                .get(&url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::AddressAssets,
+        )
+        .await?;
 
         if !response.status().is_success() {
             // 404 is fine, just empty
@@ -436,16 +666,11 @@ impl OrdClient {
                     rune_balances: Vec::new(),
                 });
             }
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Address): {}",
-                response.status()
-            )));
+            ensure_ord_success(&response, BackendOperationV1::AddressAssets)?;
         }
 
-        let data: AddressResponse = response
-            .json()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Failed to parse Address JSON: {e}")))?;
+        let data: AddressResponse =
+            parse_ord_json(response, BackendOperationV1::AddressAssets).await?;
 
         Ok(AddressAssetSnapshot {
             inscription_ids: data.inscriptions,
@@ -457,43 +682,26 @@ impl OrdClient {
     /// Fetch full inscription details for a single inscription id.
     pub async fn get_inscription_details(&self, id: &str) -> Result<Inscription, OrdError> {
         let details_url = format!("{}/inscription/{}", self.base_url, id);
-        let details_resp = self
-            .http_client
-            .get(&details_url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                OrdError::RequestFailed(format!("Failed to fetch details for {id}: {e}"))
-            })?;
-
-        if !details_resp.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Details {}): {}",
-                id,
-                details_resp.status()
-            )));
-        }
-
-        details_resp.json().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to parse Details JSON for {id}: {e}"))
-        })
+        let details_resp = send_ord_request(
+            self.http_client
+                .get(&details_url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::InscriptionDetails,
+        )
+        .await?;
+        ensure_ord_success(&details_resp, BackendOperationV1::InscriptionDetails)?;
+        parse_ord_json(details_resp, BackendOperationV1::InscriptionDetails).await
     }
 
     /// Fetch raw inscription content bytes for one inscription id.
     pub async fn get_inscription_content(&self, id: &str) -> Result<InscriptionContent, OrdError> {
         let url = format!("{}/content/{}", self.base_url, id);
-        let response = self.http_client.get(&url).send().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to fetch content for {id}: {e}"))
-        })?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Content {}): {}",
-                id,
-                response.status()
-            )));
-        }
+        let response = send_ord_request(
+            self.http_client.get(&url),
+            BackendOperationV1::InscriptionContent,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::InscriptionContent)?;
 
         let content_type = response
             .headers()
@@ -501,9 +709,10 @@ impl OrdClient {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let bytes = response.bytes().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to read content body for {id}: {e}"))
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| OrdError::invalid_response(BackendOperationV1::InscriptionContent))?;
 
         Ok(InscriptionContent {
             content_type,
@@ -570,35 +779,21 @@ impl OrdClient {
     /// ID-less metadata cannot be joined to runestone edicts.
     pub async fn get_rune_info(&self, id_or_name: &str) -> Result<RuneInfo, OrdError> {
         let url = format!("{}/rune/{}", self.base_url, id_or_name);
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Rune info request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Rune {id_or_name}): {}",
-                response.status()
-            )));
-        }
-
-        let parsed = response.json::<RuneInfoResponse>().await.map_err(|e| {
-            OrdError::RequestFailed(format!(
-                "Failed to parse rune info JSON for {id_or_name}: {e}"
-            ))
-        })?;
+        let response = send_ord_request(
+            self.http_client
+                .get(&url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::RuneInfo,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::RuneInfo)?;
+        let parsed: RuneInfoResponse =
+            parse_ord_json(response, BackendOperationV1::RuneInfo).await?;
 
         let id = parsed
             .id
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                OrdError::RequestFailed(format!(
-                    "Rune info for {id_or_name} is missing the rune id"
-                ))
-            })?;
+            .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::RuneInfo))?;
         let entry = parsed.entry;
         let spaced_rune = entry
             .as_ref()
@@ -630,26 +825,16 @@ impl OrdClient {
             return Ok(Vec::new());
         }
         let url = format!("{}/outputs", self.base_url);
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Accept", "application/json")
-            .json(outpoints)
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Bulk outputs request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Outputs bulk): {}",
-                response.status()
-            )));
-        }
-
-        response
-            .json::<Vec<OutputResponse>>()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Failed to parse Outputs bulk JSON: {e}")))
+        let response = send_ord_request(
+            self.http_client
+                .post(&url)
+                .header("Accept", "application/json")
+                .json(outpoints),
+            BackendOperationV1::Outputs,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::Outputs)?;
+        parse_ord_json(response, BackendOperationV1::Outputs).await
     }
 
     /// Resolve all ordinal assets for the given wallet outpoints in as few requests as possible:
@@ -664,19 +849,59 @@ impl OrdClient {
         &self,
         outpoints: &[String],
     ) -> Result<ResolvedAssets, OrdError> {
+        self.resolve_assets_for_outpoints_inner(outpoints, None)
+            .await
+    }
+
+    /// Resolve assets and rare-sat protection for wallet-owned UTXOs.
+    ///
+    /// Unlike the legacy outpoint-only API, this compares ord's output value
+    /// and sat ranges with the wallet engine's trusted BDK value. Missing,
+    /// duplicate, unexpected, or malformed results fail closed.
+    pub async fn resolve_assets_for_utxos(
+        &self,
+        utxos: &[(String, u64)],
+    ) -> Result<ResolvedAssets, OrdError> {
+        let mut expected = HashMap::with_capacity(utxos.len());
+        for (outpoint, value) in utxos {
+            if expected.insert(outpoint.clone(), *value).is_some() {
+                return Err(OrdError::RareSatProtectionUnverified {
+                    reason: "duplicate-wallet-outpoint",
+                });
+            }
+        }
+        let outpoints: Vec<String> = utxos.iter().map(|(outpoint, _)| outpoint.clone()).collect();
+        self.resolve_assets_for_outpoints_inner(&outpoints, Some(&expected))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)] // One cohesive bulk-resolution pass.
+    async fn resolve_assets_for_outpoints_inner(
+        &self,
+        outpoints: &[String],
+        expected_values: Option<&HashMap<String, u64>>,
+    ) -> Result<ResolvedAssets, OrdError> {
         if outpoints.is_empty() {
             return Ok(ResolvedAssets::default());
         }
 
         // 1. Bulk outputs, batched + concurrent.
-        const OUTPUTS_BATCH: usize = 100;
-        let chunk_futures = outpoints
+        // Own each small request batch so the bounded stream's future remains
+        // `Send` for native Tauri commands (borrowed slice futures are not
+        // higher-ranked over every input lifetime).
+        let batches: Vec<Vec<String>> = outpoints
             .chunks(OUTPUTS_BATCH)
-            .map(|chunk| self.get_outputs_bulk(chunk));
-        let mut entries: Vec<OutputResponse> = Vec::new();
-        for result in futures_util::future::join_all(chunk_futures).await {
-            entries.extend(result?);
-        }
+            .map(<[String]>::to_vec)
+            .collect();
+        let chunks: Vec<Vec<OutputResponse>> = stream::iter(
+            batches
+                .into_iter()
+                .map(|batch| async move { self.get_outputs_bulk(&batch).await }),
+        )
+        .buffer_unordered(OUTPUTS_MAX_CONCURRENCY)
+        .try_collect()
+        .await?;
+        let entries: Vec<OutputResponse> = chunks.into_iter().flatten().collect();
 
         // Coverage check (fail closed): every requested outpoint must be present in the response.
         let returned: HashSet<&str> = entries
@@ -685,14 +910,61 @@ impl OrdClient {
             .collect();
         for requested in outpoints {
             if !returned.contains(requested.as_str()) {
-                return Err(OrdError::RequestFailed(format!(
-                    "Bulk outputs response missing {requested}; refusing partial ordinals state"
-                )));
+                if expected_values.is_some() {
+                    return Err(OrdError::RareSatProtectionUnverified {
+                        reason: "bulk-result-outpoint-missing",
+                    });
+                }
+                return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
+            }
+        }
+        if expected_values.is_some() {
+            if entries.len() != outpoints.len() || returned.len() != outpoints.len() {
+                return Err(OrdError::RareSatProtectionUnverified {
+                    reason: "bulk-result-cardinality-mismatch",
+                });
+            }
+            for entry in &entries {
+                let outpoint =
+                    entry
+                        .outpoint
+                        .as_deref()
+                        .ok_or(OrdError::RareSatProtectionUnverified {
+                            reason: "bulk-result-outpoint-missing",
+                        })?;
+                let expected_value = expected_values
+                    .and_then(|values| values.get(outpoint))
+                    .copied()
+                    .ok_or(OrdError::RareSatProtectionUnverified {
+                        reason: "bulk-result-outpoint-unexpected",
+                    })?;
+                if entry.indexed != Some(true) {
+                    return Err(OrdError::RareSatProtectionUnverified {
+                        reason: "output-not-indexed",
+                    });
+                }
+                let parsed = outpoint.parse::<OutPoint>().map_err(|_| {
+                    OrdError::RareSatProtectionUnverified {
+                        reason: "output-outpoint-invalid",
+                    }
+                })?;
+                if entry.transaction.as_deref() != Some(&parsed.txid.to_string()) {
+                    return Err(OrdError::RareSatProtectionUnverified {
+                        reason: "output-transaction-mismatch",
+                    });
+                }
+                validate_sat_ranges(
+                    outpoint,
+                    entry.sat_ranges.as_deref(),
+                    entry.value,
+                    expected_value,
+                )?;
             }
         }
 
         // 2. Derive protected set + inscription ids + rune balances from the bulk entries.
         let mut protected_outpoints = HashSet::new();
+        let mut rare_sat_outpoints = HashMap::new();
         let mut inscription_ids: Vec<String> = Vec::new();
         let mut rune_balances: Vec<RuneBalance> = Vec::new();
         // Per-outpoint rune amounts, still keyed by NAME (ord's /outputs shape).
@@ -707,16 +979,32 @@ impl OrdClient {
                     protected_outpoints.insert(op);
                 }
             }
+            if let (Some(values), Some(op), Some(outpoint_str)) =
+                (expected_values, outpoint, e.outpoint.as_deref())
+            {
+                let expected_value = values.get(outpoint_str).copied().ok_or(
+                    OrdError::RareSatProtectionUnverified {
+                        reason: "trusted-wallet-value-missing",
+                    },
+                )?;
+                let summary = validate_sat_ranges(
+                    outpoint_str,
+                    e.sat_ranges.as_deref(),
+                    e.value,
+                    expected_value,
+                )?;
+                if summary.count > 0 {
+                    protected_outpoints.insert(op);
+                    rare_sat_outpoints.insert(op, summary);
+                }
+            }
             inscription_ids.extend(e.inscriptions.iter().cloned());
             let entry_balances = parse_runes_balances_value(&e.runes);
             if let Some(op) = outpoint {
                 let mut held: Vec<(String, u128)> = Vec::new();
                 for balance in &entry_balances {
                     let Ok(amount) = balance.amount.parse::<u128>() else {
-                        return Err(OrdError::RequestFailed(format!(
-                            "Unparseable rune amount '{}' for {} on {op}; refusing partial rune state",
-                            balance.amount, balance.rune
-                        )));
+                        return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
                     };
                     held.push((balance.rune.clone(), amount));
                 }
@@ -770,9 +1058,7 @@ impl OrdClient {
                         .map(|(_, id)| id.clone())
                 });
                 let Some(id) = id else {
-                    return Err(OrdError::RequestFailed(format!(
-                        "Could not resolve rune id for '{name}' on {op}; refusing partial rune state"
-                    )));
+                    return Err(OrdError::invalid_response(BackendOperationV1::RuneInfo));
                 };
                 resolved.push((id, amount));
             }
@@ -802,6 +1088,7 @@ impl OrdClient {
         Ok(ResolvedAssets {
             inscriptions,
             protected_outpoints,
+            rare_sat_outpoints,
             rune_balances: merged_balances,
             outpoint_runes,
             rune_infos,
@@ -832,9 +1119,10 @@ impl OrdClient {
                 continue;
             }
 
-            let outpoint = outpoint_str.as_str().parse::<OutPoint>().map_err(|e| {
-                OrdError::RequestFailed(format!("Invalid outpoint {outpoint_str}: {e}"))
-            })?;
+            let outpoint = outpoint_str
+                .as_str()
+                .parse::<OutPoint>()
+                .map_err(|_| OrdError::invalid_response(BackendOperationV1::Outputs))?;
             protected.insert(outpoint);
         }
 
@@ -851,53 +1139,28 @@ impl OrdClient {
     /// Query ord server indexing height via `/blockheight`.
     pub async fn get_indexing_height(&self) -> Result<u32, OrdError> {
         let url = format!("{}/blockheight", self.base_url);
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "Status API Error: {}",
-                response.status()
-            )));
-        }
-
-        let text = response
-            .text()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
+        let response =
+            send_ord_request(self.http_client.get(&url), BackendOperationV1::BlockHeight).await?;
+        ensure_ord_success(&response, BackendOperationV1::BlockHeight)?;
+        let text = parse_ord_text(response, BackendOperationV1::BlockHeight).await?;
         text.trim()
             .parse::<u32>()
-            .map_err(|e| OrdError::RequestFailed(format!("Invalid blockheight: {e}")))
+            .map_err(|_| OrdError::invalid_response(BackendOperationV1::BlockHeight))
     }
 
     /// Submit an offer PSBT to an ord-compatible `/offer` endpoint.
     pub async fn submit_offer_psbt(&self, psbt_base64: &str) -> Result<(), OrdError> {
         if psbt_base64.trim().is_empty() {
-            return Err(OrdError::RequestFailed(
-                "Offer PSBT payload cannot be empty".to_string(),
-            ));
+            return Err(OrdError::InvalidRequest);
         }
 
         let url = format!("{}/offer", self.base_url);
-        let response = self
-            .http_client
-            .post(&url)
-            .body(psbt_base64.to_string())
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(OrdError::RequestFailed(format!(
-                "Offer submission failed: {status} {text}"
-            )));
-        }
+        let response = send_ord_request(
+            self.http_client.post(&url).body(psbt_base64.to_string()),
+            BackendOperationV1::Offers,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::Offers)?;
 
         Ok(())
     }
@@ -905,54 +1168,30 @@ impl OrdClient {
     /// Fetch submitted offer PSBTs from an ord-compatible `/offers` endpoint.
     pub async fn get_offer_psbts(&self) -> Result<Vec<String>, OrdError> {
         let url = format!("{}/offers", self.base_url);
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| OrdError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "Offers API Error: {}",
-                response.status()
-            )));
-        }
-
-        let text = response
-            .text()
-            .await
-            .map_err(|e| OrdError::RequestFailed(format!("Failed to read offers body: {e}")))?;
+        let response = send_ord_request(
+            self.http_client
+                .get(&url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::Offers,
+        )
+        .await?;
+        ensure_ord_success(&response, BackendOperationV1::Offers)?;
+        let text = parse_ord_text(response, BackendOperationV1::Offers).await?;
 
         parse_offers_payload(&text)
     }
 
     async fn get_output_response(&self, outpoint: &str) -> Result<OutputResponse, OrdError> {
         let details_url = format!("{}/output/{}", self.base_url, outpoint);
-        let details_resp = self
-            .http_client
-            .get(&details_url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                OrdError::RequestFailed(format!(
-                    "Failed to fetch output details for {outpoint}: {e}"
-                ))
-            })?;
-
-        if !details_resp.status().is_success() {
-            return Err(OrdError::RequestFailed(format!(
-                "API Error (Output {}): {}",
-                outpoint,
-                details_resp.status()
-            )));
-        }
-
-        details_resp.json().await.map_err(|e| {
-            OrdError::RequestFailed(format!("Failed to parse Output JSON for {outpoint}: {e}"))
-        })
+        let details_resp = send_ord_request(
+            self.http_client
+                .get(&details_url)
+                .header("Accept", "application/json"),
+            BackendOperationV1::Outputs,
+        )
+        .await?;
+        ensure_ord_success(&details_resp, BackendOperationV1::Outputs)?;
+        parse_ord_json(details_resp, BackendOperationV1::Outputs).await
     }
 }
 
@@ -960,7 +1199,288 @@ impl OrdClient {
 // test build so `wasm-pack test --node` can compile the crate.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::{parse_offers_payload, parse_runes_balances_value, OrdClient, OutputResponse};
+    use super::{
+        classify_rare_sats, parse_offers_payload, parse_runes_balances_value, validate_sat_ranges,
+        OrdClient, OrdError, OutputResponse, OUTPUTS_MAX_CONCURRENCY,
+    };
+    use crate::backend_error::{BackendFailureCategoryV1, BackendOperationV1};
+    use futures_util::{StreamExt, TryStreamExt};
+
+    async fn try_collect_bounded<I, F, Fut, T, E>(
+        items: I,
+        max_concurrency: usize,
+        fetch: F,
+    ) -> Result<Vec<T>, E>
+    where
+        I: IntoIterator,
+        F: FnMut(I::Item) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        futures_util::stream::iter(items)
+            .map(fetch)
+            .buffer_unordered(max_concurrency.max(1))
+            .try_collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn outputs_scheduler_never_exceeds_its_request_bound() {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            try_collect_bounded(0_u8..10, OUTPUTS_MAX_CONCURRENCY, move |item| {
+                let started_tx = started_tx.clone();
+                async move {
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                    started_tx.send(release_tx).expect("observer remains alive");
+                    release_rx.await.expect("request released");
+                    Ok::<u8, ()>(item)
+                }
+            })
+            .await
+        });
+
+        let mut active = Vec::new();
+        for _ in 0..OUTPUTS_MAX_CONCURRENCY {
+            active.push(started_rx.recv().await.expect("initial request starts"));
+        }
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        for _ in OUTPUTS_MAX_CONCURRENCY..10 {
+            active
+                .pop()
+                .expect("active request")
+                .send(())
+                .expect("release succeeds");
+            active.push(started_rx.recv().await.expect("one replacement starts"));
+            assert!(active.len() <= OUTPUTS_MAX_CONCURRENCY);
+        }
+        for release in active {
+            release.send(()).expect("release succeeds");
+        }
+
+        let mut values = collector
+            .await
+            .expect("collector task joins")
+            .expect("requests succeed");
+        values.sort_unstable();
+        assert_eq!(values, (0_u8..10).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn address_404_is_characterized_as_an_empty_asset_snapshot() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/address/bc1ptest")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let snapshot = OrdClient::new(server.url())
+            .get_address_asset_snapshot("bc1ptest")
+            .await
+            .expect("address 404 is currently treated as empty");
+
+        assert!(snapshot.inscription_ids.is_empty());
+        assert!(snapshot.outputs.is_empty());
+        assert!(snapshot.rune_balances.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ord_rate_limit_preserves_status_and_bounded_retry_after() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blockheight")
+            .with_status(429)
+            .with_header("retry-after", "90")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_indexing_height()
+            .await
+            .expect_err("429 must fail");
+
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::RateLimited);
+        assert_eq!(failure.operation, BackendOperationV1::BlockHeight);
+        assert_eq!(failure.upstream_status, Some(429));
+        assert_eq!(failure.retry_after_ms, Some(90_000));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ord_service_unavailable_is_not_retried_by_the_client() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blockheight")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_indexing_height()
+            .await
+            .expect_err("503 must fail");
+
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::Unavailable);
+        assert_eq!(failure.upstream_status, Some(503));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_blockheight_is_typed_invalid_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blockheight")
+            .with_status(200)
+            .with_body("not-a-height")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_indexing_height()
+            .await
+            .expect_err("invalid height must fail");
+
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_address_json_is_typed_invalid_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/address/bc1ptest")
+            .with_status(200)
+            .with_body("not-json")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .get_address_asset_snapshot("bc1ptest")
+            .await
+            .expect_err("malformed JSON must fail");
+
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_bulk_outputs_fail_closed() {
+        let outpoint = "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0";
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/outputs")
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let error = OrdClient::new(server.url())
+            .resolve_assets_for_outpoints(&[outpoint.to_string()])
+            .await
+            .expect_err("missing requested output must fail closed");
+
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ord_transport_failure_is_typed_offline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        drop(listener);
+        let base_url = format!("http://{address}");
+
+        let error = OrdClient::new(base_url)
+            .get_indexing_height()
+            .await
+            .expect_err("closed server must fail");
+
+        let OrdError::Backend(failure) = error else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::Offline);
+    }
+
+    #[test]
+    fn classifies_non_common_sats_without_scanning_the_range() {
+        let uncommon = classify_rare_sats(&[(5_000_000_000, 10_000_000_000)])
+            .expect("block-one first sat is uncommon");
+        assert_eq!(uncommon.count, 1);
+        assert_eq!(uncommon.highest_rarity, "uncommon");
+
+        let mixed = classify_rare_sats(&[(0, 10_000_000_001)])
+            .expect("genesis and later block boundaries are protected");
+        assert_eq!(mixed.count, 3);
+        assert_eq!(mixed.highest_rarity, "mythic");
+
+        assert!(classify_rare_sats(&[(1, 5_000_000_000)]).is_none());
+    }
+
+    #[test]
+    fn strict_sat_range_validation_matches_the_wallet_value() {
+        let summary = validate_sat_ranges(
+            "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098:0",
+            Some(&[(5_000_000_000, 10_000_000_000)]),
+            Some(5_000_000_000),
+            5_000_000_000,
+        )
+        .expect("complete ranges");
+        assert_eq!(summary.highest_rarity, "uncommon");
+
+        for (ranges, returned, trusted, expected_reason) in [
+            (None, Some(330), 330, "sat-ranges-missing"),
+            (Some(&[][..]), Some(330), 330, "sat-ranges-empty"),
+            (Some(&[(10, 20)][..]), Some(9), 10, "wallet-value-mismatch"),
+            (
+                Some(&[(10, 19)][..]),
+                Some(10),
+                10,
+                "sat-range-coverage-mismatch",
+            ),
+            (
+                Some(&[(10, 20), (19, 21)][..]),
+                Some(12),
+                12,
+                "sat-ranges-overlap",
+            ),
+        ] {
+            let error = validate_sat_ranges("00:0", ranges, returned, trusted)
+                .expect_err("unsafe response must fail closed");
+            assert_eq!(error.to_string(), "ORD_RARE_SAT_PROTECTION_UNVERIFIED");
+            match error {
+                OrdError::RareSatProtectionUnverified { reason } => {
+                    assert_eq!(reason, expected_reason);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn output_response_accepts_null_asset_fields() {
@@ -998,7 +1518,11 @@ mod tests {
     #[test]
     fn offers_payload_rejects_non_string_entries() {
         let err = parse_offers_payload(r#"{"offers":["ok", 1]}"#).expect_err("must fail");
-        assert!(err.to_string().contains("Failed to parse offers JSON"));
+        let OrdError::Backend(failure) = err else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
+        assert_eq!(failure.operation, BackendOperationV1::Offers);
     }
 
     #[test]
@@ -1040,7 +1564,11 @@ mod tests {
                 "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0",
             )
             .expect_err("must fail");
-        assert!(err.to_string().contains("missing required address field"));
+        let OrdError::Backend(failure) = err else {
+            panic!("expected typed backend failure");
+        };
+        assert_eq!(failure.category, BackendFailureCategoryV1::InvalidResponse);
+        assert_eq!(failure.operation, BackendOperationV1::Outputs);
     }
 
     #[test]
