@@ -2,7 +2,8 @@
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::builder::{
-        AddressScheme, CreateRuneTransferRequest, Seed64, SignOptions, WalletBuilder, ZincWallet,
+        AddressScheme, CreateRuneTransferRequest, Seed64, SignOptions, WalletBuilder, WalletKind,
+        ZincWallet,
     };
     use crate::error::ZincError;
     use base64::Engine;
@@ -158,6 +159,32 @@ mod tests {
                 }),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn companion_watch_wallet_can_construct_but_not_sign_a_rune_transfer() {
+        let (mut wallet, _, outpoints) = funded_wallet(&[10_000]);
+        wallet
+            .outpoint_runes
+            .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
+        wallet.inscribed_utxos.insert(outpoints[0]);
+        wallet.kind = WalletKind::Hardware {
+            fingerprint: [0; 4],
+            taproot_external: "test-companion-descriptor".to_string(),
+            payment_external: None,
+        };
+
+        let request = request("100", &foreign_address());
+        assert!(matches!(
+            wallet.create_rune_transfer(&request),
+            Err(ZincError::CapabilityMissing)
+        ));
+
+        let result = wallet.create_companion_rune_transfer(&request).unwrap();
+        let signing_error = wallet
+            .sign_rune_transfer_psbt(&result.psbt, &result.intent, None)
+            .unwrap_err();
+        assert_eq!(signing_error, ZincError::CapabilityMissing.to_string());
     }
 
     #[test]
