@@ -1925,7 +1925,7 @@ fn sign_nostr_event_id_hex(
 fn hex_to_digest32(hex: &str) -> Result<[u8; 32], ZincError> {
     validate_hex64("digest", hex)?;
     let mut bytes = [0u8; 32];
-    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (idx, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let part = std::str::from_utf8(chunk)
             .map_err(|e| ZincError::OfferError(format!("invalid digest hex utf8: {e}")))?;
         bytes[idx] = u8::from_str_radix(part, 16)

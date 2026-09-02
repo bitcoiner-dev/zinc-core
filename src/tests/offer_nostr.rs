@@ -133,7 +133,9 @@ fn nostr_offer_event_decode_rejects_expiration_tag_mismatch() {
     .to_string();
     let digest: [u8; 32] = event_id
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| std::str::from_utf8(chunk).expect("hex utf8"))
         .map(|part| u8::from_str_radix(part, 16).expect("hex byte"))
         .collect::<Vec<u8>>()

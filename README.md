@@ -1,7 +1,11 @@
 # zinc-core
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/bitcoiner-dev/zinc-core/main/assets/zinc-marquee.jpg" alt="Zinc" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/zinc-mark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/zinc-mark-light.svg">
+    <img src="./assets/zinc-mark-light.svg" alt="Zinc" width="180">
+  </picture>
 </p>
 
 `zinc-core` is a Rust wallet engine for Bitcoin + Ordinals use cases.
@@ -18,7 +22,7 @@ Key capabilities:
 
 ```toml
 [dependencies]
-zinc-core = "0.11.0"
+zinc-core = "0.12.0"
 ```
 
 ## What You Get
