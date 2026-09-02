@@ -711,7 +711,8 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        // SECURITY: Avoid panic on malformed script bytes which could crash WASM runtime (DoS)
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -752,7 +753,8 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        // SECURITY: Avoid panic on malformed script bytes which could crash WASM runtime (DoS)
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
@@ -787,7 +789,8 @@ pub fn analyze_psbt_with_scope(
                             if cursor + 3 <= script_bytes.len() {
                                 (
                                     u16::from_le_bytes(
-                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap(),
+                                        // SECURITY: Avoid panic on malformed script bytes which could crash WASM runtime (DoS)
+                                        script_bytes[cursor + 1..cursor + 3].try_into().unwrap_or([0, 0]),
                                     ) as usize,
                                     3,
                                 )
