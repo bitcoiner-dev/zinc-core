@@ -4931,6 +4931,28 @@ impl ZincWallet {
         &self,
         request: &CreateRuneTransferRequest,
     ) -> Result<RuneTransferResult, ZincError> {
+        self.create_rune_transfer_with_watch_policy(request, false)
+    }
+
+    /// Construct a Rune transfer from an authenticated Companion descriptor.
+    ///
+    /// Companion wallets are watch-only on desktop, but unlike legacy watch
+    /// imports they carry the complete wallet descriptors and verified Ordinals
+    /// state required to build and independently validate an unsigned PSBT. The
+    /// resulting transaction must still be reviewed and signed on the paired
+    /// phone through the Companion protocol.
+    pub fn create_companion_rune_transfer(
+        &self,
+        request: &CreateRuneTransferRequest,
+    ) -> Result<RuneTransferResult, ZincError> {
+        self.create_rune_transfer_with_watch_policy(request, true)
+    }
+
+    fn create_rune_transfer_with_watch_policy(
+        &self,
+        request: &CreateRuneTransferRequest,
+        allow_watch: bool,
+    ) -> Result<RuneTransferResult, ZincError> {
         use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
         use ordinals::{Artifact, Edict, RuneId, Runestone};
         use std::collections::{BTreeMap, BTreeSet};
@@ -4941,7 +4963,7 @@ impl ZincWallet {
                     .to_string(),
             ));
         }
-        if self.kind.is_watch() {
+        if self.kind.is_watch() && !allow_watch {
             return Err(ZincError::CapabilityMissing);
         }
 
