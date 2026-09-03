@@ -1387,8 +1387,61 @@ pub struct ZincWasmWallet {
     vitality: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifiedCleanCpfpAnchorTransport {
+    outpoint: String,
+    value: u64,
+    sat_ranges: Vec<(u64, u64)>,
+}
+
 #[wasm_bindgen]
 impl ZincWasmWallet {
+    /// Snapshot the chain generation before a trusted asynchronous transaction build.
+    #[wasm_bindgen(js_name = chainStateGeneration)]
+    pub fn chain_state_generation_for_host(&self) -> Result<String, JsValue> {
+        self.check_vitality()?;
+        self.inner
+            .try_borrow()
+            .map(|inner| inner.chain_state_generation().to_string())
+            .map_err(|error| {
+                JsValue::from_str(&format!("Wallet busy (chainStateGeneration): {error}"))
+            })
+    }
+
+    /// Apply Singularity's clean-anchor proof before minting a CPFP signing intent.
+    #[wasm_bindgen(js_name = applyVerifiedCleanCpfpAnchor)]
+    pub fn apply_verified_clean_cpfp_anchor_for_host(
+        &self,
+        proof: JsValue,
+        expected_chain_generation: String,
+    ) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        let proof: VerifiedCleanCpfpAnchorTransport = serde_wasm_bindgen::from_value(proof)
+            .map_err(|_| JsValue::from_str("Invalid CPFP anchor proof"))?;
+        let outpoint = proof
+            .outpoint
+            .parse()
+            .map_err(|_| JsValue::from_str("Invalid CPFP anchor outpoint"))?;
+        let expected_chain_generation = expected_chain_generation
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid CPFP chain generation"))?;
+        self.inner
+            .try_borrow_mut()
+            .map_err(|error| {
+                JsValue::from_str(&format!(
+                    "Wallet busy (applyVerifiedCleanCpfpAnchor): {error}"
+                ))
+            })?
+            .apply_verified_clean_cpfp_anchor(
+                outpoint,
+                proof.value,
+                &proof.sat_ranges,
+                expected_chain_generation,
+            )
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     /// Irreversibly remove live private material from this handle.
     ///
     /// Unlike dropping the JavaScript wrapper, this also scrubs the shared core wallet retained by

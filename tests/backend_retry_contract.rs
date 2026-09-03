@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::{future, time::Duration};
 
 use esplora_client::{Error, Sleeper};

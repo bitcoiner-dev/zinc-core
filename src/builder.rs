@@ -3008,6 +3008,77 @@ impl ZincWallet {
         outpoints
     }
 
+    /// Publish a clean classification for an unconfirmed CPFP anchor whose sat ranges were
+    /// derived by the trusted native transaction engine from fully verified ancestors.
+    ///
+    /// Ord cannot classify this output until it is mined, so the host must bind the proof to
+    /// the exact current chain generation and wallet-owned value. The proof may only remove
+    /// the conservative "unknown/protected" placeholder when no independently known
+    /// inscription, rune, or rare-sat state conflicts with it.
+    pub fn apply_verified_clean_cpfp_anchor(
+        &mut self,
+        outpoint: bitcoin::OutPoint,
+        trusted_value: u64,
+        sat_ranges: &[(u64, u64)],
+        expected_chain_generation: u64,
+    ) -> Result<(), String> {
+        if expected_chain_generation != self.chain_state_generation {
+            return Err(format!(
+                "Stale CPFP anchor proof: expected chain generation {expected_chain_generation}, current generation is {}",
+                self.chain_state_generation
+            ));
+        }
+        if !self.asset_state_is_current() {
+            return Err(
+                "Cannot apply a CPFP anchor proof to a missing or stale asset snapshot".to_string(),
+            );
+        }
+
+        let snapshot = self
+            .collect_utxo_snapshots()
+            .into_iter()
+            .find(|(candidate, _, _)| candidate == &outpoint.to_string())
+            .ok_or_else(|| "CPFP anchor is not a current wallet output".to_string())?;
+        if snapshot.1.is_some() {
+            return Err("CPFP derived anchor proof is only valid while unconfirmed".to_string());
+        }
+        if snapshot.2 != trusted_value {
+            return Err("CPFP anchor proof value does not match the wallet".to_string());
+        }
+
+        let rare_summary = crate::ordinals::client::validate_sat_ranges(
+            &outpoint.to_string(),
+            Some(sat_ranges),
+            Some(trusted_value),
+            trusted_value,
+        )
+        .map_err(|error| format!("Invalid CPFP anchor sat proof: {error}"))?;
+        if rare_summary.count != 0 {
+            return Err("CPFP clean-anchor proof contains protected rare sats".to_string());
+        }
+        if self
+            .inscriptions
+            .iter()
+            .any(|inscription| inscription.satpoint.outpoint == outpoint)
+            || self
+                .outpoint_runes
+                .get(&outpoint)
+                .is_some_and(|runes| !runes.is_empty())
+            || self.rare_sat_outpoints.contains_key(&outpoint)
+        {
+            return Err(
+                "CPFP clean-anchor proof conflicts with known protected assets".to_string(),
+            );
+        }
+
+        let classification_changed = self.classified_outpoints.insert(outpoint);
+        let protection_changed = self.inscribed_utxos.remove(&outpoint);
+        if classification_changed || protection_changed {
+            self.asset_data_generation = self.asset_data_generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
     /// Update the wallet's internal inscription state.
     /// Call this AFTER fetching inscriptions successfully.
     pub fn apply_verified_ordinals_update(
@@ -4978,6 +5049,28 @@ impl ZincWallet {
         &self,
         request: &CreateRuneTransferRequest,
     ) -> Result<RuneTransferResult, ZincError> {
+        self.create_rune_transfer_with_watch_policy(request, false)
+    }
+
+    /// Construct a Rune transfer from an authenticated Companion descriptor.
+    ///
+    /// Companion wallets are watch-only on desktop, but unlike legacy watch
+    /// imports they carry the complete wallet descriptors and verified Ordinals
+    /// state required to build and independently validate an unsigned PSBT. The
+    /// resulting transaction must still be reviewed and signed on the paired
+    /// phone through the Companion protocol.
+    pub fn create_companion_rune_transfer(
+        &self,
+        request: &CreateRuneTransferRequest,
+    ) -> Result<RuneTransferResult, ZincError> {
+        self.create_rune_transfer_with_watch_policy(request, true)
+    }
+
+    fn create_rune_transfer_with_watch_policy(
+        &self,
+        request: &CreateRuneTransferRequest,
+        allow_watch: bool,
+    ) -> Result<RuneTransferResult, ZincError> {
         use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness};
         use ordinals::{Artifact, Edict, RuneId, Runestone};
         use std::collections::{BTreeMap, BTreeSet};
@@ -4988,7 +5081,7 @@ impl ZincWallet {
                     .to_string(),
             ));
         }
-        if self.kind.is_watch() {
+        if self.kind.is_watch() && !allow_watch {
             return Err(ZincError::CapabilityMissing);
         }
 
@@ -8838,11 +8931,11 @@ pub struct ZincPersistence {
     pub payment: Option<bdk_wallet::ChangeSet>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "tests/address_ownership.rs"]
 mod address_ownership_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use bitcoin::Network;

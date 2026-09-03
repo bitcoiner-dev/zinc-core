@@ -346,7 +346,7 @@ fn classify_rare_sats(ranges: &[(u64, u64)]) -> Option<RareSatSummary> {
     })
 }
 
-fn validate_sat_ranges(
+pub(crate) fn validate_sat_ranges(
     outpoint: &str,
     ranges: Option<&[(u64, u64)]>,
     returned_value: Option<u64>,
