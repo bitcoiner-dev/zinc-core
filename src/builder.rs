@@ -3713,23 +3713,57 @@ impl ZincWallet {
     }
 
     fn find_owned_address(&self, address: &str, scan_depth: u32) -> Option<OwnedAddressMatch> {
-        self.find_owned_address_in_wallet(&self.vault_wallet, address, 86, scan_depth)
-            .or_else(|| {
-                self.payment_wallet.as_ref().and_then(|wallet| {
-                    self.find_owned_address_in_wallet(
-                        wallet,
-                        address,
-                        self.dual_payment_purpose(),
-                        scan_depth,
-                    )
-                })
-            })
+        self.find_owned_address_with_fallback(address, |wallet, script, purpose| {
+            self.scan_owned_address_in_wallet(wallet, script, purpose, scan_depth)
+        })
     }
 
-    fn find_owned_address_in_wallet(
+    /// Resolve ownership from this wallet's descriptor index before deriving anything.
+    /// Keep the fallback explicit so tests can enforce zero scans for indexed addresses
+    /// without machine-dependent timing assertions. No caller-supplied path is trusted.
+    fn find_owned_address_with_fallback(
+        &self,
+        address: &str,
+        fallback: impl FnOnce(&Wallet, &bitcoin::ScriptBuf, u32) -> Option<OwnedAddressMatch>,
+    ) -> Option<OwnedAddressMatch> {
+        let address = Address::<NetworkUnchecked>::from_str(address)
+            .ok()?
+            .require_network(self.vault_wallet.network())
+            .ok()?;
+        let (wallet, purpose) = match address.address_type()? {
+            AddressType::P2tr => (&self.vault_wallet, 86),
+            AddressType::P2wpkh
+                if self.payment_address_type == PaymentAddressType::NativeSegwit =>
+            {
+                (self.payment_wallet.as_ref()?, self.dual_payment_purpose())
+            }
+            AddressType::P2sh if self.payment_address_type == PaymentAddressType::NestedSegwit => {
+                (self.payment_wallet.as_ref()?, self.dual_payment_purpose())
+            }
+            AddressType::P2pkh if self.payment_address_type == PaymentAddressType::Legacy => {
+                (self.payment_wallet.as_ref()?, self.dual_payment_purpose())
+            }
+            _ => return None,
+        };
+        let script = address.script_pubkey();
+        if let Some((keychain, absolute_index)) = wallet.derivation_of_spk(script.clone()) {
+            return Some(OwnedAddressMatch {
+                purpose,
+                keychain,
+                absolute_index,
+            });
+        }
+        fallback(wallet, &script, purpose)
+    }
+
+    /// Compatibility for valid addresses that have only been peeked or not yet
+    /// discovered. Preserve the old receive/change ranges and known UTXO indices,
+    /// but search only the matching script-type branch. Reuse each descriptor
+    /// iterator and compare scripts instead of constructing address strings.
+    fn scan_owned_address_in_wallet(
         &self,
         wallet: &Wallet,
-        address: &str,
+        script: &bitcoin::ScriptBuf,
         purpose: u32,
         scan_depth: u32,
     ) -> Option<OwnedAddressMatch> {
@@ -3748,14 +3782,27 @@ impl ZincWallet {
             indexed_keychains.insert((utxo.keychain, utxo.derivation_index));
         }
 
+        let mut external = wallet
+            .spk_index()
+            .unbounded_spk_iter(KeychainKind::External)?;
+        let mut internal = wallet
+            .spk_index()
+            .unbounded_spk_iter(KeychainKind::Internal)?;
+        let mut external_next = 0;
+        let mut internal_next = 0;
         indexed_keychains
             .into_iter()
             .find_map(|(keychain, absolute_index)| {
-                let candidate = wallet
-                    .peek_address(keychain, absolute_index)
-                    .address
-                    .to_string();
-                if candidate == address {
+                let (iter, next) = match keychain {
+                    KeychainKind::External => (&mut external, &mut external_next),
+                    KeychainKind::Internal => (&mut internal, &mut internal_next),
+                };
+                // BDK's nth skips directly to the requested child. Candidate
+                // indices are sorted within each keychain by the BTreeSet.
+                let (derived_index, candidate) =
+                    iter.nth(absolute_index.saturating_sub(*next) as usize)?;
+                *next = derived_index.saturating_add(1);
+                if candidate == *script {
                     Some(OwnedAddressMatch {
                         purpose,
                         keychain,
@@ -8790,6 +8837,10 @@ pub struct ZincPersistence {
     /// Merged changeset for the optional payment wallet.
     pub payment: Option<bdk_wallet::ChangeSet>,
 }
+
+#[cfg(test)]
+#[path = "tests/address_ownership.rs"]
+mod address_ownership_tests;
 
 #[cfg(test)]
 mod tests {
