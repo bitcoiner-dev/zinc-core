@@ -755,16 +755,48 @@ mod tests {
             .unwrap();
         let wallet_key = wallet_taproot_x_only(&builder);
 
-        // Positive control: a real commit-shaped taptree rooted at our own key
-        // with a leaf that requires our signature. This is the legitimate
-        // inscription-reveal shape and must still be signed.
-        let (spk, leaf, control_block) = single_leaf_taptree(wallet_key, wallet_key);
+        // Positive control: an actual inscription envelope committed by the
+        // prevout. An arbitrary OP_CHECKSIG leaf is not a reveal authorization.
+        use bitcoin::opcodes::all::{OP_CHECKSIG, OP_ENDIF, OP_IF};
+        use bitcoin::opcodes::OP_FALSE;
+        use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+        let leaf = bitcoin::script::Builder::new()
+            .push_x_only_key(&wallet_key)
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF)
+            .push_slice(b"ord")
+            .push_opcode(OP_ENDIF)
+            .into_script();
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let spend = TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .unwrap()
+            .finalize(&secp, wallet_key)
+            .unwrap();
+        let spk = ScriptBuf::new_p2tr_tweaked(spend.output_key());
+        let control_block = spend
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .unwrap();
         let psbt = reveal_shaped_psbt(wallet_key, spk, leaf, control_block, wallet_key);
         assert_eq!(
             sign_and_count_script_sigs(&mut builder, &psbt),
             Ok(1),
             "a genuine commit-shaped reveal input must still be signed"
         );
+    }
+
+    #[test]
+    fn script_path_signer_rejects_unclassified_owned_key_with_empty_origin() {
+        let mut builder = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0; 64]))
+            .with_scheme(AddressScheme::Unified)
+            .build()
+            .unwrap();
+        let key = wallet_taproot_x_only(&builder);
+        let (spk, leaf, control) = single_leaf_taptree(key, key);
+        let psbt = reveal_shaped_psbt(key, spk, leaf, control, key);
+        let error = sign_and_count_script_sigs(&mut builder, &psbt).unwrap_err();
+        assert!(error.contains("Asset classification"), "{error}");
     }
 
     #[test]
@@ -963,16 +995,20 @@ mod pairing_identity {
             .insert(control_block, (leaf.clone(), LeafVersion::TapScript));
 
         let b64 = STANDARD.encode(psbt.serialize());
-        let signed_b64 = wallet
-            .sign_psbt(
-                &b64,
-                Some(SignOptions {
-                    sign_inputs: None,
-                    sighash: None,
-                    finalize: false,
-                }),
-            )
-            .expect("sign_psbt returns Ok (refusing the leaf, not erroring)");
+        let signed_b64 = match wallet.sign_psbt(
+            &b64,
+            Some(SignOptions {
+                sign_inputs: None,
+                sighash: None,
+                finalize: false,
+            }),
+        ) {
+            Ok(signed) => signed,
+            Err(error) => {
+                assert!(error.contains("Asset classification"), "{error}");
+                return; // Refused by the earlier unclassified-owned-input gate.
+            }
+        };
         let signed = Psbt::deserialize(&STANDARD.decode(signed_b64).unwrap()).unwrap();
 
         assert!(

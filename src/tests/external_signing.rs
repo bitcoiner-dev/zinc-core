@@ -121,6 +121,106 @@ mod tests {
         Psbt::deserialize(&raw).unwrap()
     }
 
+    #[test]
+    fn rejects_unknown_owned_outpoints_on_both_signing_boundaries() {
+        use bdk_wallet::miniscript::psbt::PsbtExt;
+        for index in [0, 100_000] {
+            for selected in [None, Some(vec![0])] {
+                let (mut wallet, encoded) = setup();
+                let mut psbt = decode(&encoded);
+                let descriptor = wallet
+                    .vault_wallet
+                    .public_descriptor(KeychainKind::External)
+                    .at_derivation_index(index)
+                    .unwrap();
+                let script = descriptor
+                    .derived_descriptor(wallet.vault_wallet.secp_ctx())
+                    .unwrap()
+                    .script_pubkey();
+                psbt.unsigned_tx.input[0].previous_output.txid = Txid::from_byte_array([42; 32]);
+                psbt.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey = script;
+                psbt.update_input_with_descriptor(0, &descriptor).unwrap();
+                let unknown = b64(&psbt.serialize());
+                let options = Some(SignOptions {
+                    sign_inputs: selected,
+                    sighash: None,
+                    finalize: false,
+                });
+                let native = wallet.sign_psbt(&unknown, options.clone()).unwrap_err();
+                let external = wallet
+                    .prepare_external_sign_psbt(&unknown, options)
+                    .unwrap_err();
+                assert!(native.contains("not classified"), "{native}");
+                assert!(external.contains("not classified"), "{external}");
+                // The same current snapshot still permits the classified input.
+                assert!(wallet.sign_psbt(&encoded, None).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_owned_key_with_caller_supplied_taproot_tree() {
+        use bdk_wallet::miniscript::psbt::PsbtExt;
+        let (mut wallet, encoded) = setup();
+        let mut psbt = decode(&encoded);
+        let descriptor = wallet
+            .vault_wallet
+            .public_descriptor(KeychainKind::External)
+            .at_derivation_index(100_000)
+            .unwrap();
+        psbt.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey = descriptor
+            .derived_descriptor(wallet.vault_wallet.secp_ctx())
+            .unwrap()
+            .script_pubkey();
+        psbt.update_input_with_descriptor(0, &descriptor).unwrap();
+        let root = bitcoin::taproot::TapNodeHash::from_byte_array([1; 32]);
+        psbt.inputs[0].tap_merkle_root = Some(root);
+        psbt.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey = ScriptBuf::new_p2tr(
+            wallet.vault_wallet.secp_ctx(),
+            psbt.inputs[0].tap_internal_key.unwrap(),
+            Some(root),
+        );
+        psbt.unsigned_tx.input[0].previous_output.txid = Txid::from_byte_array([42; 32]);
+        let unknown = b64(&psbt.serialize());
+        assert!(wallet
+            .sign_psbt(&unknown, None)
+            .unwrap_err()
+            .contains("not classified"));
+        assert!(wallet
+            .prepare_external_sign_psbt(&unknown, None)
+            .unwrap_err()
+            .contains("not classified"));
+    }
+
+    #[test]
+    fn rejects_selected_unknown_owned_input_in_mixed_psbt_but_allows_known_only_selection() {
+        let (mut wallet, encoded) = setup();
+        let mut psbt = decode(&encoded);
+        let mut unknown = psbt.unsigned_tx.input[0].clone();
+        unknown.previous_output.txid = Txid::from_byte_array([42; 32]);
+        psbt.unsigned_tx.input.push(unknown);
+        psbt.inputs.push(psbt.inputs[0].clone());
+        psbt.unsigned_tx.output[0].value = Amount::from_sat(99_000);
+        let mixed = b64(&psbt.serialize());
+        assert!(wallet
+            .sign_psbt(&mixed, None)
+            .unwrap_err()
+            .contains("not classified"));
+        assert!(wallet
+            .prepare_external_sign_psbt(&mixed, None)
+            .unwrap_err()
+            .contains("not classified"));
+        let options = Some(SignOptions {
+            sign_inputs: Some(vec![0]),
+            sighash: None,
+            finalize: false,
+        });
+        let signed = decode(&wallet.sign_psbt(&mixed, options.clone()).unwrap());
+        assert!(signed.inputs[0].tap_key_sig.is_some());
+        assert!(signed.inputs[1].tap_key_sig.is_none());
+        assert!(wallet.prepare_external_sign_psbt(&mixed, options).is_ok());
+    }
+
     // ---------- prepare_external_sign_psbt ----------
 
     #[test]

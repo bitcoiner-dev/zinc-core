@@ -6304,6 +6304,89 @@ impl ZincWallet {
             .and_then(|prev| prev.output.get(vout))
     }
 
+    /// Resolve ownership independently of the synchronized UTXO set. BDK can
+    /// sign a newly received output (including an unrevealed address supplied
+    /// with key origins) before that outpoint has appeared in our asset snapshot.
+    /// Also recognize descriptor keys used in caller-supplied scripts/taptrees:
+    /// BDK signs those keys even when the complete script differs from ours.
+    /// Empty-origin inscription reveals use the separately validated reveal
+    /// signer below; they must remain usable before their commit is broadcast.
+    fn owns_psbt_prevout(&self, psbt: &Psbt, index: usize) -> bool {
+        use bdk_wallet::miniscript::ForEachKey;
+        let Some(prevout) = Self::declared_prevout(psbt, index) else {
+            return false;
+        };
+        let input = &psbt.inputs[index];
+        let mut indices = std::collections::BTreeSet::from([0]);
+        for (_, path) in input
+            .bip32_derivation
+            .values()
+            .chain(input.tap_key_origins.values().map(|(_, origin)| origin))
+        {
+            if let Some(bitcoin::bip32::ChildNumber::Normal { index }) = path.as_ref().last() {
+                indices.insert(*index);
+            }
+        }
+        std::iter::once(&self.vault_wallet)
+            .chain(self.payment_wallet.iter())
+            .any(|wallet| {
+                wallet.is_mine(prevout.script_pubkey.clone())
+                    || [KeychainKind::External, KeychainKind::Internal]
+                        .iter()
+                        .any(|keychain| {
+                            indices.iter().any(|index| {
+                                wallet
+                                    .public_descriptor(*keychain)
+                                    .at_derivation_index(*index)
+                                    .ok()
+                                    .and_then(|descriptor| {
+                                        descriptor.derived_descriptor(wallet.secp_ctx()).ok()
+                                    })
+                                    .is_some_and(|descriptor| {
+                                        descriptor.script_pubkey() == prevout.script_pubkey
+                                            || descriptor.for_any_key(|key| {
+                                                input.bip32_derivation.contains_key(&key.inner)
+                                                    || input
+                                                        .tap_key_origins
+                                                        .get(&key.inner.x_only_public_key().0)
+                                                        .is_some_and(|(_, origin)| {
+                                                            // A zero fingerprint is caller controlled. Only a
+                                                            // committed inscription envelope gets the existing
+                                                            // unbroadcast-reveal exception, never an arbitrary
+                                                            // owned-key taptree using that marker.
+                                                            *origin.0.as_bytes() != [0; 4]
+                                                            || !Self::is_committed_reveal_for_key(
+                                                                input, &prevout.script_pubkey,
+                                                                key.inner.x_only_public_key().0,
+                                                            )
+                                                        })
+                                            })
+                                    })
+                            })
+                        })
+            })
+    }
+
+    fn is_committed_reveal_for_key(
+        input: &bitcoin::psbt::Input,
+        script_pubkey: &bitcoin::ScriptBuf,
+        key: bitcoin::secp256k1::XOnlyPublicKey,
+    ) -> bool {
+        let Some(output_key) = Self::p2tr_output_key(script_pubkey) else {
+            return false;
+        };
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        input
+            .tap_scripts
+            .iter()
+            .any(|(control, (script, version))| {
+                control.leaf_version == *version
+                    && Self::tapscript_pushes_x_only_key(script, key)
+                    && Self::tapscript_has_ord_envelope(script)
+                    && control.verify_taproot_commitment(&secp, output_key, script)
+            })
+    }
+
     fn exact_psbt_fee_sats(psbt: &Psbt) -> Result<u64, String> {
         let total_input_sats = (0..psbt.inputs.len()).try_fold(0_u64, |total, index| {
             let value = Self::declared_prevout(psbt, index)
@@ -6479,11 +6562,7 @@ impl ZincWallet {
             // Only our own inputs can cost us money here; a foreign input we
             // cannot sign is not our problem, and rejecting it would break
             // legitimate multi-party PSBTs.
-            let is_ours = self.vault_wallet.is_mine(prevout.script_pubkey.clone())
-                || self
-                    .payment_wallet
-                    .as_ref()
-                    .is_some_and(|w| w.is_mine(prevout.script_pubkey.clone()));
+            let is_ours = self.owns_psbt_prevout(psbt, i);
             if !is_ours {
                 continue;
             }
@@ -6600,7 +6679,9 @@ impl ZincWallet {
             .iter()
             .enumerate()
             .filter(|(index, input)| {
-                selected(*index) && wallet_outpoints.contains(&input.previous_output)
+                selected(*index)
+                    && (wallet_outpoints.contains(&input.previous_output)
+                        || self.owns_psbt_prevout(psbt, *index))
             })
             .map(|(_, input)| input.previous_output)
             .collect();
@@ -8148,8 +8229,8 @@ impl ZincWallet {
 
         // Outpoints the wallet can actually see as its own. An inscription
         // commit that has not been broadcast yet will NOT be in here, which is
-        // exactly why the ownership gate below also accepts a taptree whose
-        // internal key is ours or a genuine ordinals reveal envelope.
+        // exactly why the ownership gate below also accepts a genuine
+        // ordinals reveal envelope.
         let mut wallet_outpoints: std::collections::HashSet<bitcoin::OutPoint> =
             std::collections::HashSet::new();
         for utxo in self.vault_wallet.list_unspent() {
@@ -8241,12 +8322,11 @@ impl ZincWallet {
 
                     // (c) Ownership. A confirmed wallet UTXO proves it outright;
                     // an un-broadcast commit does not appear in list_unspent, so
-                    // accept a taptree rooted at our own internal key or a real
-                    // ordinals reveal envelope — the flow this signer exists for.
-                    let internal_key_is_ours =
-                        control_block.internal_key.to_string() == derived_pubkey_hex;
+                    // accept only a real ordinals reveal envelope — the flow
+                    // this signer exists for. An owned internal key alone must
+                    // not bypass classification for an arbitrary taptree.
                     let looks_like_reveal = Self::tapscript_has_ord_envelope(script);
-                    if !(outpoint_is_wallet_utxo || internal_key_is_ours || looks_like_reveal) {
+                    if !(outpoint_is_wallet_utxo || looks_like_reveal) {
                         zinc_log_debug!(
                             target: LOG_TARGET_BUILDER,
                             "Reveal signer: input #{i} is not a wallet-owned or reveal-shaped input, skipping"
