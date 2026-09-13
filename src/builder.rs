@@ -5249,6 +5249,12 @@ impl ZincWallet {
 
         let mut selected_inputs = rune_inputs.clone();
         let mut cardinal_inputs = Vec::new();
+        let rune_input_value = rune_inputs
+            .iter()
+            .try_fold(0_u64, |total, (_, txout)| {
+                total.checked_add(txout.value.to_sat())
+            })
+            .ok_or_else(|| ZincError::WalletError("Rune postage overflow".to_string()))?;
         let base_output_value = postage
             .checked_mul(if needs_rune_change { 2 } else { 1 })
             .ok_or_else(|| ZincError::WalletError("Postage overflow".to_string()))?;
@@ -5287,6 +5293,9 @@ impl ZincWallet {
             });
             let total_input = total_input
                 .ok_or_else(|| ZincError::WalletError("Input value overflow".to_string()))?;
+            let cardinal_value = total_input
+                .checked_sub(rune_input_value)
+                .ok_or_else(|| ZincError::WalletError("Rune postage exceeds inputs".to_string()))?;
             let no_change_vsize = estimate_vsize(&selected_inputs, &base_outputs);
             let no_change_fee = fee_rate
                 .fee_vb(no_change_vsize)
@@ -5306,16 +5315,22 @@ impl ZincWallet {
                     .ok_or_else(|| ZincError::WalletError("Fee overflow".to_string()))?;
                 let btc_change =
                     total_input.saturating_sub(base_output_value.saturating_add(with_change_fee));
-                if btc_change >= btc_change_script.minimal_non_dust().to_sat() {
+                if btc_change >= btc_change_script.minimal_non_dust().to_sat()
+                    && cardinal_value >= with_change_fee
+                {
                     if let Some(output) = with_change.last_mut() {
                         output.value = Amount::from_sat(btc_change);
                     }
                     break (with_change, with_change_fee, with_change_vsize);
                 }
 
-                // Any sub-dust remainder is fee, matching Core's funding behavior.
+                // Rune inputs precede cardinal inputs. Preserve their complete
+                // sat ranges before the fee boundary, including when a small
+                // remainder would otherwise be donated as additional fee.
                 let actual_fee = total_input.saturating_sub(base_output_value);
-                break (base_outputs.clone(), actual_fee, no_change_vsize);
+                if cardinal_value >= actual_fee {
+                    break (base_outputs.clone(), actual_fee, no_change_vsize);
+                }
             }
 
             let Some(next) = cardinal_candidates.first().cloned() else {
@@ -5471,6 +5486,26 @@ impl ZincWallet {
                 "Rune transfers cannot spend inscription-bearing inputs or burn inscriptions"
                     .to_string(),
             );
+        }
+        // Independently check actual input order and values at the signing
+        // boundary. An input reorder can put Rune postage into the fee tail
+        // even when aggregate cardinal value is greater than the fee.
+        let output_value = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .try_fold(0_u64, |total, output| {
+                total.checked_add(output.value.to_sat())
+            })
+            .ok_or_else(|| "Rune output value overflow".to_string())?;
+        let mut input_end = 0_u64;
+        for input in &analysis.inputs {
+            input_end = input_end
+                .checked_add(input.value)
+                .ok_or_else(|| "Rune input value overflow".to_string())?;
+            if !input.runes.is_empty() && input_end > output_value {
+                return Err("Rune postage cannot fund transaction fees".to_string());
+            }
         }
         let actions = analysis
             .rune_actions

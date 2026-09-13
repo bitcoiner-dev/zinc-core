@@ -108,6 +108,105 @@ mod tests {
     }
 
     #[test]
+    fn postage_without_sufficient_cardinal_fees_is_refused() {
+        for amount in ["60", "100"] {
+            for values in [&[10_000][..], &[10_000, 100][..]] {
+                let (mut wallet, _, outpoints) = funded_wallet(values);
+                wallet
+                    .outpoint_runes
+                    .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
+                wallet.inscribed_utxos.insert(outpoints[0]);
+                let result = wallet.create_rune_transfer(&request(amount, &foreign_address()));
+                assert!(
+                    matches!(result, Err(ZincError::WalletError(message))
+                    if message.contains("cardinal BTC")),
+                    "Rune postage must not make up a fee shortfall"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn postage_is_preserved_before_the_fee_boundary_for_full_and_partial_sends() {
+        for amount in ["60", "100"] {
+            let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
+            wallet
+                .outpoint_runes
+                .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
+            wallet.inscribed_utxos.insert(outpoints[0]);
+            let result = wallet
+                .create_rune_transfer(&request(amount, &foreign_address()))
+                .unwrap();
+            let psbt = decode_psbt(&result.psbt);
+            assert!(psbt.unsigned_tx.input.iter().any(|input| input.previous_output == outpoints[1]),
+                "A classified cardinal input funds fees even when the Rune input has excess postage");
+            let output_sats: u64 = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .map(|output| output.value.to_sat())
+                .sum();
+            let mut end = 0;
+            for (input, prevout) in psbt.unsigned_tx.input.iter().zip(&psbt.inputs) {
+                end += prevout.witness_utxo.as_ref().unwrap().value.to_sat();
+                if input.previous_output == outpoints[0] {
+                    assert!(
+                        end <= output_sats,
+                        "Every sat from the Rune input reaches an output before fees"
+                    );
+                }
+            }
+            wallet
+                .validate_rune_transfer_psbt(&psbt, &result.intent)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn postage_fee_and_input_order_tampering_are_refused_at_signing() {
+        for amount in ["60", "100"] {
+            let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
+            wallet
+                .outpoint_runes
+                .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
+            wallet.inscribed_utxos.insert(outpoints[0]);
+            // Force a cardinal input even in the old constructor so this
+            // regression reaches the independent signing validator before
+            // the construction policy is fixed.
+            let mut transfer = request(amount, &foreign_address());
+            transfer.postage_sats = Some(10_000);
+            let result = wallet.create_rune_transfer(&transfer).unwrap();
+            let original = decode_psbt(&result.psbt);
+            assert_eq!(original.unsigned_tx.input.len(), 2);
+            let mut fee_theft = original.clone();
+            for output in &mut fee_theft.unsigned_tx.output {
+                if !output.script_pubkey.is_op_return() {
+                    output.value = Amount::from_sat(546);
+                }
+            }
+            let mut reordered = original;
+            reordered.unsigned_tx.input.swap(0, 1);
+            reordered.inputs.swap(0, 1);
+            for altered in [fee_theft, reordered] {
+                let error = wallet
+                    .validate_rune_transfer_psbt(&altered, &result.intent)
+                    .unwrap_err();
+                assert!(error.contains("postage"), "{error}");
+                let encoded = base64::engine::general_purpose::STANDARD.encode(altered.serialize());
+                assert!(wallet
+                    .sign_rune_transfer_psbt(&encoded, &result.intent, None)
+                    .unwrap_err()
+                    .contains("postage"));
+                assert!(wallet
+                    .prepare_companion_rune_transfer_psbt(&encoded, &result.intent)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("postage"));
+            }
+        }
+    }
+
+    #[test]
     fn exact_single_rune_send_uses_ord_default_transfer_shape() {
         let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
         wallet
@@ -163,7 +262,7 @@ mod tests {
 
     #[test]
     fn companion_watch_wallet_can_construct_but_not_sign_a_rune_transfer() {
-        let (mut wallet, _, outpoints) = funded_wallet(&[10_000]);
+        let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
         wallet
             .outpoint_runes
             .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
@@ -189,7 +288,7 @@ mod tests {
 
     #[test]
     fn partial_send_uses_ord_runestone_change_recipient_order() {
-        let (mut wallet, _, outpoints) = funded_wallet(&[10_000]);
+        let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
         wallet
             .outpoint_runes
             .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
@@ -224,7 +323,7 @@ mod tests {
 
     #[test]
     fn co_located_non_target_rune_returns_to_owned_change() {
-        let (mut wallet, _, outpoints) = funded_wallet(&[12_000]);
+        let (mut wallet, _, outpoints) = funded_wallet(&[12_000, 20_000]);
         wallet.outpoint_runes.insert(
             outpoints[0],
             vec![(DOG.to_string(), 100), (CAT.to_string(), 7)],
@@ -281,7 +380,7 @@ mod tests {
 
     #[test]
     fn signing_validation_rejects_recipient_mutation() {
-        let (mut wallet, _, outpoints) = funded_wallet(&[10_000]);
+        let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
         wallet
             .outpoint_runes
             .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
@@ -329,7 +428,7 @@ mod tests {
 
     #[test]
     fn signing_validation_rejects_wrong_allocation_and_missing_owned_change() {
-        let (mut wallet, _, outpoints) = funded_wallet(&[10_000]);
+        let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
         wallet
             .outpoint_runes
             .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
@@ -363,7 +462,7 @@ mod tests {
 
     #[test]
     fn signing_validation_rejects_cenotaph() {
-        let (mut wallet, _, outpoints) = funded_wallet(&[10_000]);
+        let (mut wallet, _, outpoints) = funded_wallet(&[10_000, 20_000]);
         wallet
             .outpoint_runes
             .insert(outpoints[0], vec![(DOG.to_string(), 100)]);
