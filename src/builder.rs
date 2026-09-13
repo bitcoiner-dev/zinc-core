@@ -1050,6 +1050,11 @@ pub(crate) fn configured_esplora_client(
     esplora_url: &str,
 ) -> Result<esplora_client::AsyncClient<SyncSleeper>, esplora_client::Error> {
     esplora_client::Builder::new(esplora_url.trim_end_matches('/'))
+        // A completed wallet refresh must consult the backend even when a
+        // browser cached an empty history moments earlier. Revalidation keeps
+        // conditional HTTP responses available without accepting fresh cached
+        // chain state as a new synchronization result.
+        .header("Cache-Control", "no-cache")
         .max_retries(ESPLORA_INTERNAL_MAX_RETRIES)
         .timeout(ESPLORA_REQUEST_TIMEOUT_SECS)
         .build_async_with_sleeper::<SyncSleeper>()
@@ -9258,6 +9263,33 @@ mod tests {
         assert_eq!(wallet.account_generation(), generation_before + 1);
         assert!(!wallet.is_syncing());
         assert!(wallet.try_begin_sync(1_001.0));
+    }
+
+    #[tokio::test]
+    async fn configured_esplora_client_revalidates_chain_reads() {
+        let mut server = mockito::Server::new_async().await;
+        let client = configured_esplora_client(&server.url()).expect("client");
+        let first = server
+            .mock("GET", "/blocks/tip/height")
+            .match_header("cache-control", "no-cache")
+            .with_header("cache-control", "public, max-age=3600")
+            .with_body("100")
+            .expect(1)
+            .create_async()
+            .await;
+        assert_eq!(client.get_height().await.unwrap(), 100);
+        first.assert_async().await;
+        first.remove_async().await;
+        let changed = server
+            .mock("GET", "/blocks/tip/height")
+            .match_header("cache-control", "no-cache")
+            .with_header("cache-control", "public, max-age=3600")
+            .with_body("101")
+            .expect(1)
+            .create_async()
+            .await;
+        assert_eq!(client.get_height().await.unwrap(), 101);
+        changed.assert_async().await;
     }
 
     #[tokio::test]
