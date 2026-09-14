@@ -22,12 +22,22 @@ mod tests {
     use bitcoin::psbt::Psbt;
 
     fn setup(inscribed: bool, external_recipient: bool) -> (ZincWallet, String, OutPoint, String) {
+        setup_with_scheme(inscribed, external_recipient, AddressScheme::Unified)
+    }
+
+    fn setup_with_scheme(
+        inscribed: bool,
+        external_recipient: bool,
+        scheme: AddressScheme,
+    ) -> (ZincWallet, String, OutPoint, String) {
         let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([31; 64]))
-            .with_scheme(AddressScheme::Unified)
+            .with_scheme(scheme)
             .build()
             .unwrap();
         let own = wallet
-            .vault_wallet
+            .payment_wallet
+            .as_mut()
+            .unwrap_or(&mut wallet.vault_wallet)
             .reveal_next_address(KeychainKind::External)
             .address;
         let recipient = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([32; 64]))
@@ -63,7 +73,9 @@ mod tests {
             },
         );
         wallet
-            .vault_wallet
+            .payment_wallet
+            .as_mut()
+            .unwrap_or(&mut wallet.vault_wallet)
             .apply_update(bdk_wallet::Update {
                 tx_update: graph.into(),
                 chain: Default::default(),
@@ -155,10 +167,6 @@ mod tests {
                 requested_txid: outpoint.txid.to_string(),
                 parent_txid: outpoint.txid.to_string(),
                 anchor_outpoint: outpoint.to_string(),
-            }),
-            ConstructedTransactionIntentRequest::Cancel(CancelIntentRequest {
-                original_txid: Txid::from_byte_array([44; 32]).to_string(),
-                conflict_outpoints: vec![outpoint.to_string()],
             }),
             ConstructedTransactionIntentRequest::CoinControl(CoinControlIntentRequest {
                 action: CoinControlAction::Split,
@@ -341,6 +349,538 @@ mod tests {
         }
     }
 
+    fn pending_cancellation(scheme: AddressScheme) -> (ZincWallet, Psbt, Txid, OutPoint) {
+        let (mut wallet, encoded, funding_outpoint, _) = setup_with_scheme(false, true, scheme);
+        let original = decode(&encoded);
+        let original_txid = original.unsigned_tx.compute_txid();
+        let mut graph = TxGraph::<ConfirmationBlockTime>::default();
+        let _ = graph.insert_tx(original.unsigned_tx.clone());
+        let _ = graph.insert_seen_at(original_txid, 2_000);
+        wallet
+            .payment_wallet
+            .as_mut()
+            .unwrap_or(&mut wallet.vault_wallet)
+            .apply_update(bdk_wallet::Update {
+                tx_update: graph.into(),
+                chain: Default::default(),
+                last_active_indices: Default::default(),
+            })
+            .unwrap();
+        wallet.mark_current_wallet_outpoints_classified_for_test();
+        assert!(!wallet
+            .collect_utxo_outpoints()
+            .iter()
+            .any(|(outpoint, _)| *outpoint == funding_outpoint.to_string()));
+        let mut cancellation = original.clone();
+        cancellation.unsigned_tx.output = vec![TxOut {
+            value: Amount::from_sat(98_000),
+            script_pubkey: original.unsigned_tx.output[1].script_pubkey.clone(),
+        }];
+        cancellation.outputs = vec![Default::default()];
+        (wallet, cancellation, original_txid, funding_outpoint)
+    }
+
+    fn cancel_intent(
+        wallet: &ZincWallet,
+        psbt: &Psbt,
+        original: Txid,
+        input: OutPoint,
+    ) -> ConstructedTransactionIntent {
+        wallet
+            .create_constructed_transaction_intent(
+                psbt,
+                ConstructedTransactionIntentRequest::Cancel(CancelIntentRequest {
+                    original_txid: original.to_string(),
+                    conflict_outpoints: vec![input.to_string()],
+                }),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn cancel_after_pending_parent_sync_keeps_original_inputs_signable() {
+        for scheme in [AddressScheme::Unified, AddressScheme::Dual] {
+            let (mut wallet, cancellation, original, input) = pending_cancellation(scheme);
+            let intent = cancel_intent(&wallet, &cancellation, original, input);
+            assert!(wallet
+                .sign_constructed_transaction_psbt(&encode(&cancellation), &intent, None)
+                .is_err());
+            let before = wallet.get_balance().total;
+            let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+            assert_eq!(snapshot.ord_queries(), vec![(input.to_string(), 100_000)]);
+            wallet
+                .apply_verified_cancellation_inputs(snapshot.test_with_assets(Default::default()))
+                .unwrap();
+            let signed = wallet
+                .sign_constructed_transaction_psbt(
+                    &encode(&cancellation),
+                    &intent,
+                    Some(SignOptions {
+                        finalize: true,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            assert!(decode(&signed).inputs[0].final_script_witness.is_some());
+            assert_eq!(wallet.get_balance().total, before);
+            if scheme == AddressScheme::Unified {
+                wallet
+                    .prepare_external_constructed_transaction_signing_request(
+                        &encode(&cancellation),
+                        &intent,
+                        None,
+                        &capabilities(),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_evidence_is_retired_by_every_wallet_generation() {
+        for generation in 0..3 {
+            let (mut wallet, cancellation, original, input) =
+                pending_cancellation(AddressScheme::Unified);
+            let intent = cancel_intent(&wallet, &cancellation, original, input);
+            let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+            wallet
+                .apply_verified_cancellation_inputs(
+                    snapshot.clone().test_with_assets(Default::default()),
+                )
+                .unwrap();
+            match generation {
+                0 => wallet.chain_state_generation += 1,
+                1 => wallet.account_generation += 1,
+                _ => wallet.asset_data_generation += 1,
+            }
+            assert!(wallet
+                .apply_verified_cancellation_inputs(snapshot.test_with_assets(Default::default()))
+                .is_err());
+            assert!(wallet
+                .sign_constructed_transaction_psbt(&encode(&cancellation), &intent, None)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn pending_input_inscriptions_are_analyzed_but_never_added_to_wallet_holdings() {
+        for offset in [0, 99_000] {
+            let (mut wallet, cancellation, original, input) =
+                pending_cancellation(AddressScheme::Unified);
+            let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+            let id = format!("{}i0", "ab".repeat(32));
+            let mut assets = crate::ordinals::client::ResolvedAssets::default();
+            assets.inscriptions.push(Inscription {
+                id: id.clone(),
+                number: 1,
+                satpoint: Satpoint {
+                    outpoint: input,
+                    offset,
+                },
+                value: Some(100_000),
+                content_type: Some("text/plain".into()),
+                content_length: Some(1),
+                timestamp: Some(1),
+            });
+            assets.protected_outpoints.insert(input);
+            wallet
+                .apply_verified_cancellation_inputs(snapshot.test_with_assets(assets))
+                .unwrap();
+            assert!(wallet.inscriptions.is_empty());
+            let analysis: serde_json::Value =
+                serde_json::from_str(&wallet.analyze_psbt(&encode(&cancellation)).unwrap())
+                    .unwrap();
+            assert!(analysis["inscription_destinations"].get(&id).is_some());
+            let intent = cancel_intent(&wallet, &cancellation, original, input);
+            let result =
+                wallet.sign_constructed_transaction_psbt(&encode(&cancellation), &intent, None);
+            if offset == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().contains("burn inscription"));
+            }
+        }
+    }
+
+    #[test]
+    fn pending_input_rare_sats_cannot_enter_the_fee_tail() {
+        let (mut wallet, cancellation, original, input) =
+            pending_cancellation(AddressScheme::Unified);
+        let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+        let mut assets = crate::ordinals::client::ResolvedAssets::default();
+        let summary = crate::ordinals::client::validate_sat_ranges(
+            &input.to_string(),
+            Some(&[(5_000_000_000 - 99_000, 5_000_000_000 + 1_000)]),
+            Some(100_000),
+            100_000,
+        )
+        .unwrap();
+        assert!(summary.count > 0);
+        assets.rare_sat_outpoints.insert(input, summary);
+        assets.protected_outpoints.insert(input);
+        wallet
+            .apply_verified_cancellation_inputs(snapshot.test_with_assets(assets))
+            .unwrap();
+        assert!(wallet.rare_sat_outpoints.is_empty());
+        let intent = cancel_intent(&wallet, &cancellation, original, input);
+        let error = wallet
+            .sign_constructed_transaction_psbt(&encode(&cancellation), &intent, None)
+            .unwrap_err();
+        assert!(error.contains("protected rare sat"), "{error}");
+    }
+
+    #[test]
+    fn cancellation_publication_rejects_unrelated_asset_evidence() {
+        let (mut wallet, _, original, _) = pending_cancellation(AddressScheme::Unified);
+        let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+        let mut assets = crate::ordinals::client::ResolvedAssets::default();
+        assets.protected_outpoints.insert(OutPoint::null());
+        assert!(wallet
+            .apply_verified_cancellation_inputs(snapshot.test_with_assets(assets))
+            .is_err());
+        assert!(wallet
+            .cancellation_input_snapshot(Txid::all_zeros())
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_proof_requires_complete_validated_ord_responses() {
+        for fault in 0..9 {
+            let (mut wallet, cancellation, original, input) =
+                pending_cancellation(AddressScheme::Dual);
+            let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+            let mut output = serde_json::json!({ "outpoint": input.to_string(), "transaction": input.txid.to_string(),
+                "indexed": true, "value": 100_000, "inscriptions": [], "runes": {},
+                "sat_ranges": [[5_000_010_000_u64, 5_000_110_000_u64]] });
+            match fault {
+                1 => output["indexed"] = false.into(),
+                2 => output["value"] = 99_999.into(),
+                3 => output["transaction"] = Txid::all_zeros().to_string().into(),
+                4 => output["sat_ranges"] = serde_json::Value::Null,
+                5 => {
+                    output.as_object_mut().unwrap().remove("inscriptions");
+                }
+                6 => output["runes"] = serde_json::Value::Null,
+                7 => output["runes"] = serde_json::json!({"RUNE": {"amount":"not-an-amount"}}),
+                _ => {}
+            }
+            let response = if fault == 8 {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([output])
+            };
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock("POST", "/outputs")
+                .match_body(mockito::Matcher::Json(serde_json::json!([
+                    input.to_string()
+                ])))
+                .with_status(200)
+                .with_body(response.to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let proof = snapshot.verify(&server.url()).await;
+            if fault == 0 {
+                wallet
+                    .apply_verified_cancellation_inputs(proof.unwrap())
+                    .unwrap();
+                let intent = cancel_intent(&wallet, &cancellation, original, input);
+                wallet
+                    .sign_constructed_transaction_psbt(
+                        &encode(&cancellation),
+                        &intent,
+                        Some(SignOptions {
+                            finalize: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+            } else {
+                assert!(
+                    proof.is_err(),
+                    "malformed evidence case {fault} was accepted"
+                );
+                assert!(wallet.cancellation_assets().is_none());
+            }
+            request.assert_async().await;
+        }
+    }
+
+    #[test]
+    fn pending_input_runes_are_protected_without_inflating_holdings() {
+        let (mut wallet, mut cancellation, original, input) =
+            pending_cancellation(AddressScheme::Unified);
+        // The whole Rune input must be returned. A distinct classified cardinal
+        // input comes last and pays the fee without touching that input's sats.
+        let cardinal = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([78; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: cancellation.unsigned_tx.output[0].script_pubkey.clone(),
+            }],
+        };
+        let mut graph = TxGraph::<ConfirmationBlockTime>::default();
+        let _ = graph.insert_tx(cardinal.clone());
+        let _ = graph.insert_seen_at(cardinal.compute_txid(), 3_000);
+        wallet
+            .vault_wallet
+            .apply_update(bdk_wallet::Update {
+                tx_update: graph.into(),
+                chain: Default::default(),
+                last_active_indices: Default::default(),
+            })
+            .unwrap();
+        wallet.mark_current_wallet_outpoints_classified_for_test();
+        let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+        let mut assets = crate::ordinals::client::ResolvedAssets::default();
+        assets
+            .outpoint_runes
+            .insert(input, vec![("100:1".into(), 25)]);
+        assets.protected_outpoints.insert(input);
+        wallet
+            .apply_verified_cancellation_inputs(snapshot.test_with_assets(assets))
+            .unwrap();
+        assert!(wallet.rune_balances.is_empty());
+        assert!(wallet.outpoint_runes.is_empty());
+        // The original one-input cancellation would consume Rune postage.
+        let unsafe_intent = cancel_intent(&wallet, &cancellation, original, input);
+        assert!(wallet
+            .sign_constructed_transaction_psbt(&encode(&cancellation), &unsafe_intent, None)
+            .unwrap_err()
+            .contains("Rune postage"));
+        assert!(wallet
+            .prepare_external_constructed_transaction_signing_request(
+                &encode(&cancellation),
+                &unsafe_intent,
+                None,
+                &capabilities()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Rune postage"));
+        cancellation.unsigned_tx.input.push(TxIn {
+            previous_output: OutPoint::new(cardinal.compute_txid(), 0),
+            ..cancellation.unsigned_tx.input[0].clone()
+        });
+        cancellation.inputs.push(bitcoin::psbt::Input {
+            witness_utxo: Some(cardinal.output[0].clone()),
+            ..Default::default()
+        });
+        cancellation.unsigned_tx.output[0].value = Amount::from_sat(108_000);
+        let analysis: serde_json::Value =
+            serde_json::from_str(&wallet.analyze_psbt(&encode(&cancellation)).unwrap()).unwrap();
+        assert!(
+            analysis["rune_actions"]["default_transfer_without_runestone"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            analysis["outputs"][0]["is_change"], false,
+            "Receive ownership must not depend on change labeling"
+        );
+        let intent = cancel_intent(&wallet, &cancellation, original, input);
+        wallet
+            .sign_constructed_transaction_psbt(&encode(&cancellation), &intent, None)
+            .unwrap();
+        wallet
+            .prepare_external_constructed_transaction_signing_request(
+                &encode(&cancellation),
+                &intent,
+                None,
+                &capabilities(),
+            )
+            .unwrap();
+        let mut reordered = cancellation.clone();
+        reordered.unsigned_tx.input.swap(0, 1);
+        reordered.inputs.swap(0, 1);
+        let reordered_intent = cancel_intent(&wallet, &reordered, original, input);
+        assert!(wallet
+            .sign_constructed_transaction_psbt(&encode(&reordered), &reordered_intent, None)
+            .unwrap_err()
+            .contains("Rune postage"));
+        let mut foreign = cancellation;
+        foreign.unsigned_tx.output[0].script_pubkey =
+            WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([77; 64]))
+                .build()
+                .unwrap()
+                .peek_taproot_address(0)
+                .script_pubkey();
+        assert!(wallet
+            .sign_psbt(&encode(&foreign), None)
+            .unwrap_err()
+            .contains("Runes would default-transfer"));
+    }
+
+    #[test]
+    fn pending_asset_evidence_cannot_be_disguised_as_cardinal_coin_control() {
+        for kind in ["inscription", "rune", "rare-sat"] {
+            let (mut wallet, cancellation, original, input) =
+                pending_cancellation(AddressScheme::Unified);
+            let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+            let mut assets = crate::ordinals::client::ResolvedAssets::default();
+            assets.protected_outpoints.insert(input);
+            if kind == "inscription" {
+                assets.inscriptions.push(Inscription {
+                    id: format!("{}i0", "ab".repeat(32)),
+                    number: 1,
+                    satpoint: Satpoint {
+                        outpoint: input,
+                        offset: 0,
+                    },
+                    value: Some(100_000),
+                    content_type: None,
+                    content_length: None,
+                    timestamp: None,
+                });
+            } else if kind == "rune" {
+                assets
+                    .outpoint_runes
+                    .insert(input, vec![("100:1".into(), 25)]);
+            } else {
+                assets.rare_sat_outpoints.insert(
+                    input,
+                    crate::ordinals::client::validate_sat_ranges(
+                        &input.to_string(),
+                        Some(&[(5_000_000_000, 5_000_100_000)]),
+                        Some(100_000),
+                        100_000,
+                    )
+                    .unwrap(),
+                );
+            }
+            wallet
+                .apply_verified_cancellation_inputs(snapshot.test_with_assets(assets))
+                .unwrap();
+            for action in [CoinControlAction::Split, CoinControlAction::Consolidate] {
+                let intent = wallet.create_constructed_transaction_intent(
+                    &cancellation,
+                    ConstructedTransactionIntentRequest::CoinControl(CoinControlIntentRequest {
+                        action,
+                        selected_outpoints: vec![input.to_string()],
+                    }),
+                );
+                assert!(
+                    intent.is_err(),
+                    "{kind} was accepted as a cardinal coin-control input"
+                );
+            }
+            assert!(wallet.inscriptions.is_empty());
+            assert!(wallet.outpoint_runes.is_empty());
+            assert!(wallet.rare_sat_outpoints.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancellation_target_confirmation_retires_verification_and_intent() {
+        let (mut wallet, cancellation, original, input) =
+            pending_cancellation(AddressScheme::Unified);
+        let intent = cancel_intent(&wallet, &cancellation, original, input);
+        let proof = wallet
+            .cancellation_input_snapshot(original)
+            .unwrap()
+            .test_with_assets(Default::default());
+        let block = BlockId {
+            height: 101,
+            hash: BlockHash::from_byte_array([93; 32]),
+        };
+        let checkpoint = wallet.vault_wallet.local_chain().tip().insert(block);
+        let mut graph = TxGraph::<ConfirmationBlockTime>::default();
+        let _ = graph.insert_anchor(
+            original,
+            ConfirmationBlockTime {
+                block_id: block,
+                confirmation_time: 4_000,
+            },
+        );
+        wallet
+            .vault_wallet
+            .apply_update(bdk_wallet::Update {
+                tx_update: graph.into(),
+                chain: Some(checkpoint),
+                last_active_indices: Default::default(),
+            })
+            .unwrap();
+        // Even if a host forgets to advance its generation, the canonical
+        // transaction position invalidates evidence captured before confirmation.
+        assert!(wallet
+            .cancellation_input_snapshot(original)
+            .unwrap_err()
+            .contains("already confirmed"));
+        assert!(wallet.apply_verified_cancellation_inputs(proof).is_err());
+        assert!(wallet
+            .sign_constructed_transaction_psbt(&encode(&cancellation), &intent, None)
+            .is_err());
+        assert!(wallet
+            .prepare_external_constructed_transaction_signing_request(
+                &encode(&cancellation),
+                &intent,
+                None,
+                &capabilities()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn cancellation_intent_rejects_a_substituted_target() {
+        let (wallet, cancellation, original, input) = pending_cancellation(AddressScheme::Unified);
+        let ConstructedTransactionIntent::Cancel(mut details) =
+            cancel_intent(&wallet, &cancellation, original, input)
+        else {
+            unreachable!()
+        };
+        details.original_txid = input.txid.to_string();
+        assert!(wallet
+            .validate_constructed_transaction_psbt(
+                &cancellation,
+                &ConstructedTransactionIntent::Cancel(details)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn verified_pending_inputs_never_trust_psbt_value_or_script_claims() {
+        for scheme in [AddressScheme::Unified, AddressScheme::Dual] {
+            let (mut wallet, cancellation, original, input) = pending_cancellation(scheme);
+            let snapshot = wallet.cancellation_input_snapshot(original).unwrap();
+            wallet
+                .apply_verified_cancellation_inputs(snapshot.test_with_assets(Default::default()))
+                .unwrap();
+            let intent = cancel_intent(&wallet, &cancellation, original, input);
+            for change_script in [false, true] {
+                let mut mutation = cancellation.clone();
+                let prevout = mutation.inputs[0].witness_utxo.as_mut().unwrap();
+                if change_script {
+                    prevout.script_pubkey = ScriptBuf::new();
+                } else {
+                    prevout.value = Amount::from_sat(100_001);
+                }
+                assert!(wallet
+                    .sign_psbt(&encode(&mutation), None)
+                    .unwrap_err()
+                    .contains("different value or script"));
+                assert!(wallet
+                    .sign_constructed_transaction_psbt(&encode(&mutation), &intent, None)
+                    .is_err());
+                assert!(wallet
+                    .prepare_external_constructed_transaction_signing_request(
+                        &encode(&mutation),
+                        &intent,
+                        None,
+                        &capabilities()
+                    )
+                    .is_err());
+            }
+        }
+    }
+
     #[test]
     fn operation_specific_fields_cannot_be_substituted() {
         let (wallet, psbt_base64, outpoint, _) = setup(false, false);
@@ -377,15 +917,8 @@ mod tests {
             .unwrap_err()
             .contains("approved anchor"));
 
-        let cancel = wallet
-            .create_constructed_transaction_intent(
-                &psbt,
-                ConstructedTransactionIntentRequest::Cancel(CancelIntentRequest {
-                    original_txid: Txid::from_byte_array([55; 32]).to_string(),
-                    conflict_outpoints: vec![outpoint.to_string()],
-                }),
-            )
-            .unwrap();
+        let (wallet, psbt, original, outpoint) = pending_cancellation(AddressScheme::Unified);
+        let cancel = cancel_intent(&wallet, &psbt, original, outpoint);
         let ConstructedTransactionIntent::Cancel(mut details) = cancel else {
             unreachable!();
         };

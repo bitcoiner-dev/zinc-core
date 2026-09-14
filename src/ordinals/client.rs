@@ -820,6 +820,7 @@ impl OrdClient {
     async fn get_outputs_bulk(
         &self,
         outpoints: &[String],
+        require_complete_assets: bool,
     ) -> Result<Vec<OutputResponse>, OrdError> {
         if outpoints.is_empty() {
             return Ok(Vec::new());
@@ -834,7 +835,37 @@ impl OrdClient {
         )
         .await?;
         ensure_ord_success(&response, BackendOperationV1::Outputs)?;
-        parse_ord_json(response, BackendOperationV1::Outputs).await
+        let raw: serde_json::Value = parse_ord_json(response, BackendOperationV1::Outputs).await?;
+        if require_complete_assets {
+            let entries = raw
+                .as_array()
+                .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
+            for entry in entries {
+                let inscriptions = entry
+                    .get("inscriptions")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
+                if inscriptions
+                    .iter()
+                    .any(|id| !id.as_str().is_some_and(|id| !id.is_empty()))
+                {
+                    return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
+                }
+                let runes = entry
+                    .get("runes")
+                    .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
+                let count = match runes {
+                    serde_json::Value::Object(entries) => entries.len(),
+                    serde_json::Value::Array(entries) => entries.len(),
+                    _ => return Err(OrdError::invalid_response(BackendOperationV1::Outputs)),
+                };
+                if parse_runes_balances_value(runes).len() != count {
+                    return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
+                }
+            }
+        }
+        serde_json::from_value(raw)
+            .map_err(|_| OrdError::invalid_response(BackendOperationV1::Outputs))
     }
 
     /// Resolve all ordinal assets for the given wallet outpoints in as few requests as possible:
@@ -893,14 +924,14 @@ impl OrdClient {
             .chunks(OUTPUTS_BATCH)
             .map(<[String]>::to_vec)
             .collect();
-        let chunks: Vec<Vec<OutputResponse>> = stream::iter(
-            batches
-                .into_iter()
-                .map(|batch| async move { self.get_outputs_bulk(&batch).await }),
-        )
-        .buffer_unordered(OUTPUTS_MAX_CONCURRENCY)
-        .try_collect()
-        .await?;
+        let chunks: Vec<Vec<OutputResponse>> =
+            stream::iter(batches.into_iter().map(|batch| async move {
+                self.get_outputs_bulk(&batch, expected_values.is_some())
+                    .await
+            }))
+            .buffer_unordered(OUTPUTS_MAX_CONCURRENCY)
+            .try_collect()
+            .await?;
         let entries: Vec<OutputResponse> = chunks.into_iter().flatten().collect();
 
         // Coverage check (fail closed): every requested outpoint must be present in the response.

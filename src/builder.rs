@@ -1306,6 +1306,7 @@ pub struct ZincWallet {
     pub(crate) ordinals_observed_at_unix: Option<u64>,
     /// Wallet outpoints explicitly covered by the verified Ord response.
     pub(crate) classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
+    pub(crate) cancellation_input_assets: Option<crate::cancellation::VerifiedCancellationInputs>,
     /// Cryptographic identity of this wallet (Seed or Hardware).
     pub(crate) kind: WalletKind,
     /// Public derivation metadata used to create short-lived BDK signers for seed wallets.
@@ -2321,13 +2322,14 @@ impl ZincWallet {
         self.asset_data_generation
     }
 
-    fn asset_state_is_current(&self) -> bool {
+    pub(crate) fn asset_state_is_current(&self) -> bool {
         self.ordinals_verified
             && self.ordinals_metadata_complete
             && self.ordinals_verified_generation == Some(self.chain_state_generation)
     }
 
     fn invalidate_asset_state(&mut self) {
+        self.cancellation_input_assets = None;
         let changed = self.ordinals_verified
             || self.ordinals_metadata_complete
             || self.ordinals_verified_generation.is_some()
@@ -5941,14 +5943,13 @@ impl ZincWallet {
     ) -> Result<std::collections::BTreeSet<String>, String> {
         let inputs = Self::input_outpoint_set(psbt);
         let ids: std::collections::BTreeSet<_> = self
-            .inscriptions
-            .iter()
+            .signing_inscriptions()
             .filter(|inscription| inputs.contains(&inscription.satpoint.outpoint))
             .map(|inscription| inscription.id.clone())
             .collect();
         if inputs
             .iter()
-            .any(|outpoint| self.inscribed_utxos.contains(outpoint))
+            .any(|outpoint| self.signing_input_is_protected(outpoint))
             && ids.is_empty()
         {
             return Err(
@@ -6129,7 +6130,7 @@ impl ZincWallet {
                 self.require_wallet_owned_outputs(psbt, "CPFP transaction")?;
             }
             ConstructedTransactionIntent::Cancel(details) => {
-                details
+                let original_txid = details
                     .original_txid
                     .parse::<bitcoin::Txid>()
                     .map_err(|error| format!("Invalid cancellation txid: {error}"))?;
@@ -6154,6 +6155,19 @@ impl ZincWallet {
                             .to_string(),
                     );
                 }
+                let target = self.cancellation_input_snapshot(original_txid)?;
+                let target_inputs: std::collections::BTreeSet<_> = target
+                    .ord_queries()
+                    .into_iter()
+                    .map(|(outpoint, _)| outpoint)
+                    .collect();
+                let approved_inputs: std::collections::BTreeSet<_> =
+                    conflicts.iter().map(ToString::to_string).collect();
+                if target_inputs != approved_inputs {
+                    return Err(
+                        "Cancellation conflicts do not match the approved pending payment".into(),
+                    );
+                }
                 self.require_wallet_owned_outputs(psbt, "Cancellation transaction")?;
             }
             ConstructedTransactionIntent::CoinControl(details) => {
@@ -6165,10 +6179,10 @@ impl ZincWallet {
                 let inputs = Self::input_outpoint_set(psbt);
                 let has_inscription = inputs
                     .iter()
-                    .any(|outpoint| self.inscribed_utxos.contains(outpoint));
+                    .any(|outpoint| self.signing_input_is_protected(outpoint));
                 let has_runes = inputs
                     .iter()
-                    .any(|outpoint| self.outpoint_runes.contains_key(outpoint));
+                    .any(|outpoint| self.signing_input_has_runes(outpoint));
                 match details.action {
                     CoinControlAction::Consolidate | CoinControlAction::Split => {
                         if has_inscription || has_runes {
@@ -6276,7 +6290,7 @@ impl ZincWallet {
                 let inputs = Self::input_outpoint_set(psbt);
                 if inputs
                     .iter()
-                    .any(|outpoint| self.outpoint_runes.contains_key(outpoint))
+                    .any(|outpoint| self.signing_input_has_runes(outpoint))
                 {
                     return Err("Smart-send salvage cannot spend Rune inputs".to_string());
                 }
@@ -6478,6 +6492,8 @@ impl ZincWallet {
             collect_utxos(w, &mut known_utxos);
         }
 
+        known_utxos.extend(self.cancellation_txouts().cloned());
+
         for i in 0..psbt.inputs.len() {
             let outpoint = psbt.unsigned_tx.input[i].previous_output;
             let Some(ours) = known_utxos.get(&outpoint) else {
@@ -6548,7 +6564,9 @@ impl ZincWallet {
                 })?
                 .value
                 .to_sat();
-            if let Some(summary) = self.rare_sat_outpoints.get(&txin.previous_output) {
+            if let Some(summary) = self.signing_rare_sats().find_map(|(outpoint, summary)| {
+                (*outpoint == txin.previous_output).then_some(summary)
+            }) {
                 for sat in &summary.sats {
                     if sat.offset >= value {
                         return Err(
@@ -6646,7 +6664,7 @@ impl ZincWallet {
 
         let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
             HashMap::with_capacity(self.inscriptions.len());
-        for inscription in &self.inscriptions {
+        for inscription in self.signing_inscriptions() {
             known_inscriptions
                 .entry((
                     inscription.satpoint.outpoint.txid,
@@ -6660,12 +6678,11 @@ impl ZincWallet {
         }
 
         let mut known_runes = KnownRunes::new();
-        for (outpoint, held) in &self.outpoint_runes {
+        for (outpoint, held) in self.signing_runes() {
             known_runes.insert((outpoint.txid, outpoint.vout), held.clone());
         }
         let known_rare_sats: KnownRareSats = self
-            .rare_sat_outpoints
-            .iter()
+            .signing_rare_sats()
             .map(|(outpoint, summary)| ((outpoint.txid, outpoint.vout), summary.sats.clone()))
             .collect();
         let mut mint_terms = HashMap::new();
@@ -6735,7 +6752,7 @@ impl ZincWallet {
             }
             if let Some(outpoint) = selected_wallet_outpoints
                 .iter()
-                .find(|outpoint| !self.classified_outpoints.contains(outpoint))
+                .find(|outpoint| !self.signing_input_is_classified(outpoint))
             {
                 return Err(format!(
                     "Security Violation: Wallet input {outpoint} was not classified by the current Ord snapshot"
@@ -6774,13 +6791,40 @@ impl ZincWallet {
 
         let spends_protected_input = psbt.unsigned_tx.input.iter().any(|input| {
             self.inscribed_utxos.contains(&input.previous_output)
-                || self.outpoint_runes.contains_key(&input.previous_output)
+                || self
+                    .signing_runes()
+                    .any(|(outpoint, _)| *outpoint == input.previous_output)
+                || self.cancellation_assets().is_some_and(|assets| {
+                    assets.protected_outpoints.contains(&input.previous_output)
+                })
         });
         if spends_protected_input && !analysis.sat_flow_reliable {
             return Err(
                 "Security Violation: Sat flow is incomplete for a protected wallet input"
                     .to_string(),
             );
+        }
+
+        // Apply the same postage boundary to every signer, including generic
+        // requests and cancellation of inputs no longer listed as unspent.
+        // Having enough cardinal value in aggregate is insufficient: input
+        // order determines which sat ranges enter the miner-fee tail.
+        let output_value = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .try_fold(0_u64, |total, output| {
+                total.checked_add(output.value.to_sat())
+            })
+            .ok_or("Rune output value overflow")?;
+        let mut input_end = 0_u64;
+        for input in &analysis.inputs {
+            input_end = input_end
+                .checked_add(input.value)
+                .ok_or("Rune input value overflow")?;
+            if !input.runes.is_empty() && input_end > output_value {
+                return Err("Security Violation: Rune postage cannot fund transaction fees".into());
+            }
         }
 
         if let Some(actions) = &analysis.rune_actions {
@@ -6792,11 +6836,12 @@ impl ZincWallet {
             }
             if actions.default_transfer_without_runestone && !allow_validated_rune_default_transfer
             {
-                let default_target_is_mine = analysis
-                    .outputs
+                let default_target_is_mine = psbt
+                    .unsigned_tx
+                    .output
                     .iter()
-                    .find(|output| !output.is_op_return)
-                    .is_some_and(|output| output.is_change);
+                    .find(|output| !output.script_pubkey.is_op_return())
+                    .is_some_and(|output| self.owns_output_script(&output.script_pubkey));
                 if !default_target_is_mine {
                     return Err(
                         "Security Violation: Runes would default-transfer to a non-wallet output"
@@ -7798,7 +7843,7 @@ impl ZincWallet {
     /// from the wallet's rune metadata cache.
     fn enrich_rune_amount(&self, id: &str, amount: u128) -> crate::ordinals::runes::RuneAmount {
         let mut rune_amount = crate::ordinals::runes::RuneAmount::new(id.to_string(), amount);
-        if let Some(info) = self.rune_info_cache.get(id) {
+        if let Some(info) = self.signing_rune_info(id) {
             rune_amount.name = Some(info.spaced_rune.clone());
             rune_amount.divisibility = Some(info.divisibility);
             rune_amount.symbol.clone_from(&info.symbol);
@@ -7808,7 +7853,7 @@ impl ZincWallet {
 
     fn enrich_rune_amounts(&self, amounts: &mut [crate::ordinals::runes::RuneAmount]) {
         for rune_amount in amounts {
-            if let Some(info) = self.rune_info_cache.get(&rune_amount.rune_id) {
+            if let Some(info) = self.signing_rune_info(&rune_amount.rune_id) {
                 rune_amount.name = Some(info.spaced_rune.clone());
                 rune_amount.divisibility = Some(info.divisibility);
                 rune_amount.symbol.clone_from(&info.symbol);
@@ -7879,7 +7924,6 @@ impl ZincWallet {
     /// descriptor ownership) and return the analysis as JSON.
     pub fn analyze_psbt(&self, psbt_base64: &str) -> Result<String, String> {
         // Use explicit path to avoid re-export issues if any
-        use crate::ordinals::shield::{analyze_psbt_with_context, KnownRareSats, ShieldContext};
         use base64::Engine;
         use std::collections::HashMap;
 
@@ -7919,88 +7963,7 @@ impl ZincWallet {
             }
         }
 
-        // Build Known Inscriptions Map from internal state
-        // Map: (Txid, Vout) -> Vec<(InscriptionID, Offset)>
-        let mut known_inscriptions: HashMap<(bitcoin::Txid, u32), Vec<(String, u64)>> =
-            HashMap::with_capacity(self.inscriptions.len());
-
-        // We also need a way to map offsets back to Inscription IDs for the result?
-        // The `analyze_psbt` function currently generates keys like "Inscription {N}".
-        // Wait, I should probably pass the IDs or handle the mapping better.
-        // My implementation in `shield.rs` generates keys.
-        // Ideally, `analyze_psbt` should take `HashMap<(Txid, u32), Vec<(u64, String)>>` so it knows the IDs!
-        // But for now, let's look at `shield.rs`. It iterates and pushes to `active_inscriptions`.
-        // The `known_inscriptions` map is just `Vec<u66>`.
-        // This is a limitation of my current `shield.rs` implementation.
-        // I should update `shield.rs` to take IDs if I want the frontend to know *which* inscription is being burned.
-        // BUT, `shield.rs` is already tested and working with the simplified map.
-        // PROPOSAL: Since `shield.rs` generates opaque keys, I should stick to that for V1 reliability.
-        // Actually, if I pass a map of `(Txid, Vout) -> Vec<u64>`, I lose the ID association.
-        // BUT `self.inscriptions` has the ID.
-
-        // Optimization: Let's rely on the assumption that mapping order is consistent.
-        // However, `shield.rs` uses `known_inscriptions.get(...)` which returns a Vec of offsets.
-        // If I want the frontend to show specific inscription images, I need the IDs.
-
-        // Let's stick to the current implementation for now. The frontend can re-derive or we just warn "An inscription".
-        // Actually, for TDD I implemented it simply.
-        // Real user needs to know WHICH inscription.
-
-        for ins in &self.inscriptions {
-            known_inscriptions
-                .entry((ins.satpoint.outpoint.txid, ins.satpoint.outpoint.vout))
-                .or_default()
-                .push((ins.id.clone(), ins.satpoint.offset));
-        }
-
-        // Sort offsets for deterministic behavior
-        for items in known_inscriptions.values_mut() {
-            items.sort_by_key(|(_, offset)| *offset);
-        }
-
-        let known_rare_sats: KnownRareSats = self
-            .rare_sat_outpoints
-            .iter()
-            .map(|(outpoint, summary)| ((outpoint.txid, outpoint.vout), summary.sats.clone()))
-            .collect();
-
-        // Rune context, entirely from the verified sync caches (no network).
-        let mut known_runes: crate::ordinals::shield::KnownRunes = HashMap::new();
-        for (outpoint, held) in &self.outpoint_runes {
-            known_runes.insert((outpoint.txid, outpoint.vout), held.clone());
-        }
-        let mut mint_terms: HashMap<String, u128> = HashMap::new();
-        for (id, info) in &self.rune_info_cache {
-            if let Some(amount) = info
-                .terms_amount
-                .as_ref()
-                .and_then(|value| value.parse::<u128>().ok())
-            {
-                mint_terms.insert(id.clone(), amount);
-            }
-        }
-
-        let ctx = ShieldContext {
-            known_inscriptions: &known_inscriptions,
-            known_runes: &known_runes,
-            known_rare_sats: &known_rare_sats,
-            input_scope: None,
-            network: self.vault_wallet.network(),
-            mint_terms: &mint_terms,
-            // Every tx-building path guards on this ("safety lock engaged").
-            // The dapp-facing analyze path cannot refuse, so it reports the
-            // state instead: without it an empty or stale cache looks exactly
-            // like a verified-clean transaction.
-            assets_verified: self.ordinals_verified && self.ordinals_metadata_complete,
-        };
-        let mut result = match analyze_psbt_with_context(&psbt, &ctx) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
-
-        self.apply_wallet_context_to_analysis(&mut result);
+        let result = self.analyze_psbt_with_wallet_context(&psbt)?;
 
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
@@ -8876,6 +8839,7 @@ impl WalletBuilder {
             ordinals_verified_generation: None,
             ordinals_observed_at_unix: None,
             classified_outpoints: std::collections::HashSet::new(),
+            cancellation_input_assets: None,
             kind,
             signing_layout,
             is_syncing: false,
@@ -9026,6 +8990,7 @@ impl WalletBuilder {
             ordinals_verified_generation: None,
             ordinals_observed_at_unix: None,
             classified_outpoints: std::collections::HashSet::new(),
+            cancellation_input_assets: None,
             kind: WalletKind::Hardware {
                 fingerprint,
                 taproot_external: taproot_external_desc,

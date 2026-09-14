@@ -39,6 +39,7 @@ mod logging;
 pub mod backend_error;
 pub mod backend_receipt;
 pub mod builder;
+pub mod cancellation;
 pub mod crypto;
 pub mod error;
 /// Vendor-neutral capability negotiation for hardware and other external signers.
@@ -3328,6 +3329,45 @@ impl ZincWasmWallet {
     // ========================================================================
     // Send Flow
     // ========================================================================
+
+    /// Refresh original pending-payment inputs without publishing them as holdings.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = refreshCancellationInputs)]
+    pub fn refresh_cancellation_inputs(
+        &self,
+        original_txid: String,
+        ord_url: String,
+    ) -> Result<js_sys::Promise, JsValue> {
+        self.check_vitality()?;
+        let original_txid = original_txid
+            .parse::<bitcoin::Txid>()
+            .map_err(|_| JsValue::from_str("Invalid cancellation target"))?;
+        let inner_rc = self.inner.clone();
+        Ok(wasm_bindgen_futures::future_to_promise(async move {
+            let (snapshot, generation) = {
+                let inner = inner_rc.try_borrow().map_err(|_| {
+                    JsValue::from_str("Wallet busy during cancellation verification")
+                })?;
+                (
+                    inner
+                        .cancellation_input_snapshot(original_txid)
+                        .map_err(|error| JsValue::from_str(&error))?,
+                    inner.account_generation(),
+                )
+            };
+            let proof = snapshot
+                .verify(&ord_url)
+                .await
+                .map_err(|error| ord_scan_failure_to_js(error, generation))?;
+            let mut inner = inner_rc.try_borrow_mut().map_err(|_| {
+                JsValue::from_str("Wallet busy publishing cancellation verification")
+            })?;
+            inner
+                .apply_verified_cancellation_inputs(proof)
+                .map_err(|error| JsValue::from_str(&error))?;
+            Ok(JsValue::UNDEFINED)
+        }))
+    }
 
     fn create_psbt_with_transport(
         &self,
