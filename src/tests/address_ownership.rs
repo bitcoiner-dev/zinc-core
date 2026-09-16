@@ -181,18 +181,22 @@ fn index_mode_preserves_the_active_offset_search_above_the_base_range() {
         1500,
         PaymentAddressType::NativeSegwit,
     );
+    // The selected index is revealed for sync; choose beyond its BDK lookahead
+    // so this still exercises the bounded active-offset fallback.
     for payment in [false, true] {
         let address = branch(&wallet, payment)
-            .peek_address(KeychainKind::External, 1506)
+            .peek_address(KeychainKind::External, 1580)
             .address;
         assert!(branch(&wallet, payment)
             .derivation_of_spk(address.script_pubkey())
             .is_none());
         assert_match(
-            wallet.find_owned_address(&address.to_string(), 10).unwrap(),
+            wallet
+                .find_owned_address(&address.to_string(), 100)
+                .unwrap(),
             if payment { 84 } else { 86 },
             KeychainKind::External,
-            1506,
+            1580,
         );
     }
 }

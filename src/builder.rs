@@ -2421,19 +2421,21 @@ impl ZincWallet {
         self.payment_address_type.purpose()
     }
 
-    /// Ensure the wallet's primary receive paths (external index 0) are in BDK's REVEALED
-    /// set. The wallet's UX pins receiving to index 0 via `peek_*` helpers — and peeking
-    /// does NOT reveal — so without this no incremental sync
-    /// (`start_sync_with_revealed_spks`) ever queries the primary address, and anything
-    /// received there (e.g. a dapp inscribe's reveal postage) stays undiscovered until a
-    /// full rescan. Idempotent: revealing up to an already-revealed index is a no-op.
+    /// Reveal the selected receive paths for incremental sync. Account-mode
+    /// profiles receive at index zero; index-mode profiles receive at the
+    /// selected logical account index. The peek helpers do not reveal scripts,
+    /// so registering only zero misses later payments to a selected empty index.
+    /// Revealing through the selected index also retains earlier receive paths.
     pub(crate) fn ensure_primary_spks_revealed(&mut self) {
+        let receive_index = self.active_receive_index();
         let _: Vec<_> = self
             .vault_wallet
-            .reveal_addresses_to(KeychainKind::External, 0)
+            .reveal_addresses_to(KeychainKind::External, receive_index)
             .collect();
         if let Some(w) = &mut self.payment_wallet {
-            let _: Vec<_> = w.reveal_addresses_to(KeychainKind::External, 0).collect();
+            let _: Vec<_> = w
+                .reveal_addresses_to(KeychainKind::External, receive_index)
+                .collect();
         }
     }
 
@@ -2822,7 +2824,7 @@ impl ZincWallet {
         // the latch, so release it here or the new account could never sync.
         self.is_syncing = false;
         // The rebuilt wallets start with nothing revealed; restore the primary-receive
-        // invariant so incremental syncs keep covering index 0.
+        // invariant so incremental syncs keep covering the selected receive index.
         self.ensure_primary_spks_revealed();
 
         Ok(())

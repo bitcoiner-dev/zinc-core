@@ -102,6 +102,89 @@ mod tests {
     }
 
     #[test]
+    fn selected_index_receive_spks_are_queried_by_incremental_sync() {
+        // A UI-selected index may have no history during the initial scan. A
+        // later payment must still be queried without requiring a full rescan.
+        for scheme in [AddressScheme::Dual, AddressScheme::Unified] {
+            let mut wallet =
+                WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0u8; 64]))
+                    .with_scheme(scheme)
+                    .with_derivation_mode(DerivationMode::Index)
+                    .with_account_index(7)
+                    .build()
+                    .unwrap();
+            for reset in [false, true] {
+                if reset {
+                    wallet.reset_sync_state().unwrap();
+                }
+                let mut branches = vec![(
+                    &wallet.vault_wallet,
+                    wallet.peek_taproot_address(0).script_pubkey(),
+                )];
+                if let Some(payment) = &wallet.payment_wallet {
+                    branches.push((
+                        payment,
+                        wallet.peek_payment_address(0).unwrap().script_pubkey(),
+                    ));
+                }
+                for (branch, selected) in branches {
+                    let mut request = branch.start_sync_with_revealed_spks_at(123).build();
+                    let scripts: Vec<_> = request
+                        .iter_spks_with_expected_txids()
+                        .map(|entry| entry.spk)
+                        .collect();
+                    assert!(scripts.contains(&selected), "selected receive address absent from incremental request after reset={reset}");
+                    assert!(scripts.contains(
+                        &branch
+                            .peek_address(KeychainKind::External, 0)
+                            .script_pubkey()
+                    ));
+                    assert_eq!(branch.derivation_index(KeychainKind::External), Some(7));
+                }
+            }
+            let persisted = serde_json::to_string(&wallet.export_changeset().unwrap()).unwrap();
+            let restored =
+                WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0u8; 64]))
+                    .with_scheme(scheme)
+                    .with_derivation_mode(DerivationMode::Index)
+                    .with_account_index(7)
+                    .with_persistence(&persisted)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+            assert_eq!(
+                restored
+                    .vault_wallet
+                    .derivation_index(KeychainKind::External),
+                Some(7)
+            );
+            if let Some(payment) = &restored.payment_wallet {
+                assert_eq!(payment.derivation_index(KeychainKind::External), Some(7));
+            }
+        }
+        // Account mode uses index zero inside a separate hardened account.
+        let account = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([0u8; 64]))
+            .with_scheme(AddressScheme::Dual)
+            .with_account_index(7)
+            .build()
+            .unwrap();
+        assert_eq!(
+            account
+                .vault_wallet
+                .derivation_index(KeychainKind::External),
+            Some(0)
+        );
+        assert_eq!(
+            account
+                .payment_wallet
+                .as_ref()
+                .unwrap()
+                .derivation_index(KeychainKind::External),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn verified_clean_cpfp_anchor_reclassifies_only_the_current_unconfirmed_output() {
         let mut wallet = unified();
         let outpoint = fund(&mut wallet, &[(10_000, false)])[0];
