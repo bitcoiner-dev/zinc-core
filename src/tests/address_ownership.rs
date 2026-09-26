@@ -94,8 +94,13 @@ fn indexed_receive_and_change_sign_without_scanning_in_both_account_modes() {
             for chain in [KeychainKind::External, KeychainKind::Internal] {
                 for index in [0, 7, 37] {
                     let address = reveal(&mut wallet, payment, chain, index);
-                    assert_match(indexed(&wallet, &address), purpose, chain, index);
-                    verify_signature(&wallet, &address, purpose, chain, index);
+                    let key_index = if mode == DerivationMode::Index {
+                        7
+                    } else {
+                        index
+                    };
+                    assert_match(indexed(&wallet, &address), purpose, chain, key_index);
+                    verify_signature(&wallet, &address, purpose, chain, key_index);
                 }
             }
         }
@@ -140,7 +145,7 @@ fn primary_payment_address_never_scans_taproot() {
 
 #[test]
 fn unindexed_receive_and_change_keep_the_compatibility_search() {
-    for mode in [DerivationMode::Account, DerivationMode::Index] {
+    for mode in [DerivationMode::Account] {
         let wallet = wallet(mode, 7, PaymentAddressType::NativeSegwit);
         for payment in [false, true] {
             let purpose = if payment { 84 } else { 86 };
@@ -175,29 +180,37 @@ fn unindexed_receive_and_change_keep_the_compatibility_search() {
 }
 
 #[test]
-fn index_mode_preserves_the_active_offset_search_above_the_base_range() {
-    let wallet = wallet(
+fn index_mode_rejects_sibling_receive_and_change_keys() {
+    let selected = wallet(
         DerivationMode::Index,
         1500,
         PaymentAddressType::NativeSegwit,
     );
-    // The selected index is revealed for sync; choose beyond its BDK lookahead
-    // so this still exercises the bounded active-offset fallback.
+    let siblings = wallet(DerivationMode::Account, 0, PaymentAddressType::NativeSegwit);
     for payment in [false, true] {
-        let address = branch(&wallet, payment)
-            .peek_address(KeychainKind::External, 1580)
-            .address;
-        assert!(branch(&wallet, payment)
-            .derivation_of_spk(address.script_pubkey())
-            .is_none());
-        assert_match(
-            wallet
-                .find_owned_address(&address.to_string(), 100)
-                .unwrap(),
-            if payment { 84 } else { 86 },
-            KeychainKind::External,
-            1580,
-        );
+        for chain in [KeychainKind::External, KeychainKind::Internal] {
+            for index in [0, 1499, 1500, 1501, 1580] {
+                let address = branch(&siblings, payment)
+                    .peek_address(chain, index)
+                    .address;
+                let found = selected.find_owned_address(&address.to_string(), 2000);
+                if index == 1500 {
+                    assert_match(found.unwrap(), if payment { 84 } else { 86 }, chain, index);
+                    verify_signature(
+                        &selected,
+                        &address,
+                        if payment { 84 } else { 86 },
+                        chain,
+                        index,
+                    );
+                } else {
+                    assert!(found.is_none(), "sibling {index} must not be owned");
+                    assert!(selected
+                        .sign_message(&address.to_string(), "sibling")
+                        .is_err());
+                }
+            }
+        }
     }
 }
 

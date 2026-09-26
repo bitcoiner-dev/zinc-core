@@ -898,6 +898,7 @@ struct AccountDiscoveryResponseV1 {
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy)]
 enum ImportDiscoveryBranch {
+    Both,
     Taproot,
     Payment,
 }
@@ -2901,6 +2902,7 @@ impl ZincWasmWallet {
         self.check_vitality()?;
 
         let branch = match branch_str {
+            "both" => ImportDiscoveryBranch::Both,
             "taproot" => ImportDiscoveryBranch::Taproot,
             "payment" => ImportDiscoveryBranch::Payment,
             _ => return Err(JsValue::from_str("Invalid import discovery branch")),
@@ -2976,36 +2978,46 @@ impl ZincWasmWallet {
                     async move { probe_esplora_address_activity(&client, url, deadline_ms).await }
                 };
 
-                let first_active_address_index = first_active_receive_index_from_scan_strict(
-                    address_scan_depth,
-                    |address_index| {
-                        let branch_address = match branch {
-                            ImportDiscoveryBranch::Taproot => {
-                                Some(zwallet.peek_taproot_address(address_index).to_string())
+                let scan_depth = if derivation_mode == DerivationMode::Index {
+                    1
+                } else {
+                    address_scan_depth
+                };
+                let first_active_address_index =
+                    first_active_receive_index_from_scan_strict(scan_depth, |address_index| {
+                        let mut addresses = Vec::new();
+                        if matches!(
+                            branch,
+                            ImportDiscoveryBranch::Taproot | ImportDiscoveryBranch::Both
+                        ) {
+                            addresses.push(zwallet.peek_taproot_address(address_index).to_string());
+                        }
+                        if matches!(
+                            branch,
+                            ImportDiscoveryBranch::Payment | ImportDiscoveryBranch::Both
+                        ) && scheme == AddressScheme::Dual
+                        {
+                            if let Some(address) = zwallet.peek_payment_address(address_index) {
+                                addresses.push(address.to_string());
                             }
-                            ImportDiscoveryBranch::Payment => {
-                                if scheme == AddressScheme::Dual {
-                                    zwallet
-                                        .peek_payment_address(address_index)
-                                        .map(|addr| addr.to_string())
-                                } else {
-                                    None
+                        }
+                        let check_activity = &check_activity;
+                        async move {
+                            let mut failure = None;
+                            for address in addresses {
+                                if js_sys::Date::now() >= deadline_ms {
+                                    return Err(AccountDiscoveryProbeError::Deadline);
+                                }
+                                match check_activity(address).await {
+                                    Ok(true) => return Ok(true),
+                                    Ok(false) => {}
+                                    Err(error) => failure = Some(error),
                                 }
                             }
-                        };
-
-                        async {
-                            if js_sys::Date::now() >= deadline_ms {
-                                return Err(AccountDiscoveryProbeError::Deadline);
-                            }
-                            if let Some(address) = branch_address {
-                                return check_activity(address).await;
-                            }
-                            Ok(false)
+                            failure.map_or(Ok(false), Err)
                         }
-                    },
-                )
-                .await;
+                    })
+                    .await;
 
                 let first_active_address_index = match first_active_address_index {
                     Ok(index) => index,

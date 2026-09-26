@@ -1156,6 +1156,7 @@ impl WalletKind {
         payment_type: PaymentAddressType,
         network: Network,
         account: u32,
+        fixed_index: Option<u32>,
     ) -> Result<(String, String, Option<String>, Option<String>), String> {
         let coin_type = u32::from(network != Network::Bitcoin);
 
@@ -1163,40 +1164,29 @@ impl WalletKind {
             Self::Seed {
                 master_xprv: master,
             } => {
-                let vault_ext = public_descriptor_from_secret(
-                    Zeroizing::new(format!("tr({master}/86'/{coin_type}'/{account}'/0/*)")),
-                    network,
-                )?;
-                let vault_int = public_descriptor_from_secret(
-                    Zeroizing::new(format!("tr({master}/86'/{coin_type}'/{account}'/1/*)")),
-                    network,
-                )?;
-
-                if scheme == AddressScheme::Dual {
-                    let pay_ext = public_descriptor_from_secret(
-                        Zeroizing::new(payment_descriptor_for_xprv(
-                            master,
-                            payment_type,
-                            coin_type,
-                            account,
-                            0,
+                let layout = standard_signing_layout(scheme, DerivationMode::Account, payment_type);
+                let descriptor = |branch: crate::layout::BranchSpec, chain| {
+                    let path = Zeroizing::new(format!(
+                        "{master}/{}'/{coin_type}'/{account}'",
+                        branch.purpose
+                    ));
+                    public_descriptor_from_secret(
+                        Zeroizing::new(branch.script.descriptor_at(
+                            path.as_str(),
+                            chain,
+                            fixed_index,
                         )),
                         network,
-                    )?;
-                    let pay_int = public_descriptor_from_secret(
-                        Zeroizing::new(payment_descriptor_for_xprv(
-                            master,
-                            payment_type,
-                            coin_type,
-                            account,
-                            1,
-                        )),
-                        network,
-                    )?;
-                    Ok((vault_ext, vault_int, Some(pay_ext), Some(pay_int)))
+                    )
+                };
+                let vault_ext = descriptor(layout.vault, 0)?;
+                let vault_int = descriptor(layout.vault, 1)?;
+                let (pay_ext, pay_int) = if let Some(branch) = layout.payment {
+                    (Some(descriptor(branch, 0)?), Some(descriptor(branch, 1)?))
                 } else {
-                    Ok((vault_ext, vault_int, None, None))
-                }
+                    (None, None)
+                };
+                Ok((vault_ext, vault_int, pay_ext, pay_int))
             }
             Self::Hardware {
                 taproot_external,
@@ -1519,28 +1509,6 @@ pub struct DiscoveryContext {
     pub is_syncing: bool,
     /// Monotonic generation used to invalidate stale async operations.
     pub account_generation: u64,
-}
-
-fn payment_descriptor_for_xprv(
-    xprv: &bdk_wallet::bitcoin::bip32::Xpriv,
-    address_type: PaymentAddressType,
-    coin_type: u32,
-    account: u32,
-    chain: u32,
-) -> String {
-    let pay_purpose = address_type.purpose();
-
-    match address_type {
-        PaymentAddressType::NativeSegwit => {
-            format!("wpkh({xprv}/{pay_purpose}'/{coin_type}'/{account}'/{chain}/*)")
-        }
-        PaymentAddressType::NestedSegwit => {
-            format!("sh(wpkh({xprv}/{pay_purpose}'/{coin_type}'/{account}'/{chain}/*))")
-        }
-        PaymentAddressType::Legacy => {
-            format!("pkh({xprv}/{pay_purpose}'/{coin_type}'/{account}'/{chain}/*)")
-        }
-    }
 }
 
 fn payment_descriptor_for_xpub(
@@ -1983,8 +1951,11 @@ impl ZincWallet {
         let secp = wallet.secp_ctx();
 
         let build = |keychain: KeychainKind, chain: u32| -> Result<SignersContainer, String> {
-            let secret_descriptor =
-                Zeroizing::new(branch.script.descriptor(account_path.as_str(), chain));
+            let secret_descriptor = Zeroizing::new(branch.script.descriptor_at(
+                account_path.as_str(),
+                chain,
+                self.fixed_index(),
+            ));
             let (public_descriptor, keymap) = secret_descriptor
                 .as_str()
                 .into_wallet_descriptor(secp, wallet.network().into())
@@ -2413,6 +2384,19 @@ impl ZincWallet {
         self.logical_account_path(self.account_index).1
     }
 
+    /// BDK numbers the only script in a fixed descriptor zero. BIP32 origins
+    /// still carry the selected logical account index; never confuse the two.
+    fn key_index(&self, descriptor_index: u32) -> u32 {
+        match self.derivation_mode {
+            DerivationMode::Account => descriptor_index,
+            DerivationMode::Index => self.account_index,
+        }
+    }
+
+    fn fixed_index(&self) -> Option<u32> {
+        (self.derivation_mode == DerivationMode::Index).then_some(self.account_index)
+    }
+
     fn active_derivation_account(&self) -> u32 {
         self.logical_account_path(self.account_index).0
     }
@@ -2422,12 +2406,10 @@ impl ZincWallet {
     }
 
     /// Reveal the selected receive paths for incremental sync. Account-mode
-    /// profiles receive at index zero; index-mode profiles receive at the
-    /// selected logical account index. The peek helpers do not reveal scripts,
-    /// so registering only zero misses later payments to a selected empty index.
-    /// Revealing through the selected index also retains earlier receive paths.
+    /// profiles receive at child zero; index-mode descriptors already contain
+    /// the selected child. In both cases BDK's primary script is index zero.
     pub(crate) fn ensure_primary_spks_revealed(&mut self) {
-        let receive_index = self.active_receive_index();
+        let receive_index = 0;
         let _: Vec<_> = self
             .vault_wallet
             .reveal_addresses_to(KeychainKind::External, receive_index)
@@ -2483,7 +2465,11 @@ impl ZincWallet {
             return address.clone();
         }
 
-        let resolved_index = self.active_receive_index().saturating_add(index);
+        let resolved_index = if self.fixed_index().is_some() {
+            0
+        } else {
+            index
+        };
         self.vault_wallet
             .peek_address(KeychainKind::External, resolved_index)
             .address
@@ -2514,7 +2500,11 @@ impl ZincWallet {
     /// In unified mode this resolves to the taproot branch.
     pub fn peek_payment_address(&self, index: u32) -> Option<Address> {
         if self.scheme == AddressScheme::Dual {
-            let resolved_index = self.active_receive_index().saturating_add(index);
+            let resolved_index = if self.fixed_index().is_some() {
+                0
+            } else {
+                index
+            };
             self.payment_wallet.as_ref().map(|w| {
                 w.peek_address(KeychainKind::External, resolved_index)
                     .address
@@ -3658,15 +3648,14 @@ impl ZincWallet {
         scan_depth: u32,
         out: &mut Vec<DappAddressCandidate>,
     ) {
-        let active_receive_index = self.active_receive_index();
+        let scan_depth = if self.fixed_index().is_some() {
+            1
+        } else {
+            scan_depth
+        };
         let mut indexed_keychains: std::collections::BTreeSet<(KeychainKind, u32)> = (0
             ..scan_depth)
-            .map(|offset| {
-                (
-                    KeychainKind::External,
-                    active_receive_index.saturating_add(offset),
-                )
-            })
+            .map(|offset| (KeychainKind::External, offset))
             .collect();
         for utxo in wallet.list_unspent() {
             indexed_keychains.insert((utxo.keychain, utxo.derivation_index));
@@ -3690,7 +3679,12 @@ impl ZincWallet {
                 KeychainKind::Internal => "internal",
             };
             let public_key = self
-                .derive_public_key_for_chain_internal(purpose, account, chain, absolute_index)
+                .derive_public_key_for_chain_internal(
+                    purpose,
+                    account,
+                    chain,
+                    self.key_index(absolute_index),
+                )
                 .ok();
             let mut clean_btc_sats = 0u64;
             let mut clean_confirmed_btc_sats = 0u64;
@@ -3770,7 +3764,7 @@ impl ZincWallet {
                 address_type: address_type.to_string(),
                 wallet_role: wallet_role.to_string(),
                 keychain: keychain_label.to_string(),
-                derivation_index: absolute_index,
+                derivation_index: self.key_index(absolute_index),
                 clean_btc_sats,
                 clean_confirmed_btc_sats,
                 protected_asset_count,
@@ -3830,7 +3824,7 @@ impl ZincWallet {
             return Some(OwnedAddressMatch {
                 purpose,
                 keychain,
-                absolute_index,
+                absolute_index: self.key_index(absolute_index),
             });
         }
         fallback(wallet, &script, purpose)
@@ -3847,16 +3841,16 @@ impl ZincWallet {
         purpose: u32,
         scan_depth: u32,
     ) -> Option<OwnedAddressMatch> {
-        let active_receive_index = self.active_receive_index();
+        let scan_depth = if self.fixed_index().is_some() {
+            1
+        } else {
+            scan_depth
+        };
         let mut indexed_keychains: std::collections::BTreeSet<(KeychainKind, u32)> =
             std::collections::BTreeSet::new();
         for offset in 0..scan_depth.max(1) {
             indexed_keychains.insert((KeychainKind::External, offset));
             indexed_keychains.insert((KeychainKind::Internal, offset));
-            indexed_keychains.insert((
-                KeychainKind::External,
-                active_receive_index.saturating_add(offset),
-            ));
         }
         for utxo in wallet.list_unspent() {
             indexed_keychains.insert((utxo.keychain, utxo.derivation_index));
@@ -3886,7 +3880,7 @@ impl ZincWallet {
                     Some(OwnedAddressMatch {
                         purpose,
                         keychain,
-                        absolute_index,
+                        absolute_index: self.key_index(absolute_index),
                     })
                 } else {
                     None
@@ -3917,7 +3911,11 @@ impl ZincWallet {
     }
 
     fn reveal_address_match(&mut self, address_match: OwnedAddressMatch) -> Result<(), String> {
-        let absolute_index = address_match.absolute_index;
+        let absolute_index = if self.fixed_index().is_some() {
+            0
+        } else {
+            address_match.absolute_index
+        };
 
         if address_match.purpose == 86 {
             let _revealed: Vec<_> = self
@@ -5192,10 +5190,9 @@ impl ZincWallet {
         }
         let needs_rune_change = selected_target > amount || input_rune_balances.len() > 1;
 
-        let active_index = self.active_receive_index();
-        let rune_change_address = self.peek_taproot_address(active_index);
+        let rune_change_address = self.peek_taproot_address(0);
         let btc_change_address = self
-            .peek_payment_address(active_index)
+            .peek_payment_address(0)
             .unwrap_or_else(|| rune_change_address.clone());
         let recipient_script = recipient.script_pubkey();
         let rune_change_script = rune_change_address.script_pubkey();
@@ -8103,7 +8100,7 @@ impl ZincWallet {
 
     fn derive_public_key(&self, purpose: u32, index: u32) -> Result<String, String> {
         let account = self.active_derivation_account();
-        let effective_index = self.active_receive_index().saturating_add(index);
+        let effective_index = self.key_index(index);
         self.derive_public_key_internal(
             purpose,
             self.vault_wallet.network(),
@@ -8119,7 +8116,7 @@ impl ZincWallet {
         index: u32,
     ) -> Result<bitcoin::secp256k1::SecretKey, String> {
         let account = self.active_derivation_account();
-        let effective_index = self.active_receive_index().saturating_add(index);
+        let effective_index = self.key_index(index);
         self.derive_private_key_internal(purpose, account, chain, effective_index)
     }
 
@@ -8670,6 +8667,8 @@ impl WalletBuilder {
             })
         });
 
+        let fixed_index =
+            (self.derivation_mode == DerivationMode::Index).then_some(self.account_index);
         let (vault_ext, vault_int, payment_ext, payment_int) = match &self.custom_layout {
             Some(layout) => {
                 let WalletKind::Seed { master_xprv } = &kind else {
@@ -8681,11 +8680,19 @@ impl WalletBuilder {
                     layout.vault.purpose
                 ));
                 let vault_ext = public_descriptor_from_secret(
-                    Zeroizing::new(layout.vault.script.descriptor(vault_path.as_str(), 0)),
+                    Zeroizing::new(layout.vault.script.descriptor_at(
+                        vault_path.as_str(),
+                        0,
+                        fixed_index,
+                    )),
                     self.network,
                 )?;
                 let vault_int = public_descriptor_from_secret(
-                    Zeroizing::new(layout.vault.script.descriptor(vault_path.as_str(), 1)),
+                    Zeroizing::new(layout.vault.script.descriptor_at(
+                        vault_path.as_str(),
+                        1,
+                        fixed_index,
+                    )),
                     self.network,
                 )?;
                 let (payment_ext, payment_int) = match &layout.payment {
@@ -8696,11 +8703,19 @@ impl WalletBuilder {
                         ));
                         (
                             Some(public_descriptor_from_secret(
-                                Zeroizing::new(branch.script.descriptor(path.as_str(), 0)),
+                                Zeroizing::new(branch.script.descriptor_at(
+                                    path.as_str(),
+                                    0,
+                                    fixed_index,
+                                )),
                                 self.network,
                             )?),
                             Some(public_descriptor_from_secret(
-                                Zeroizing::new(branch.script.descriptor(path.as_str(), 1)),
+                                Zeroizing::new(branch.script.descriptor_at(
+                                    path.as_str(),
+                                    1,
+                                    fixed_index,
+                                )),
                                 self.network,
                             )?),
                         )
@@ -8714,6 +8729,7 @@ impl WalletBuilder {
                 self.payment_address_type,
                 self.network,
                 derivation_account,
+                fixed_index,
             )?,
         };
 

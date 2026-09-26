@@ -139,7 +139,7 @@ mod tests {
                             .peek_address(KeychainKind::External, 0)
                             .script_pubkey()
                     ));
-                    assert_eq!(branch.derivation_index(KeychainKind::External), Some(7));
+                    assert_eq!(branch.derivation_index(KeychainKind::External), Some(0));
                 }
             }
             let persisted = serde_json::to_string(&wallet.export_changeset().unwrap()).unwrap();
@@ -156,10 +156,10 @@ mod tests {
                 restored
                     .vault_wallet
                     .derivation_index(KeychainKind::External),
-                Some(7)
+                Some(0)
             );
             if let Some(payment) = &restored.payment_wallet {
-                assert_eq!(payment.derivation_index(KeychainKind::External), Some(7));
+                assert_eq!(payment.derivation_index(KeychainKind::External), Some(0));
             }
         }
         // Account mode uses index zero inside a separate hardened account.
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn dapp_candidates_include_known_utxos_before_active_index() {
+    fn dapp_candidates_use_the_fixed_account_key() {
         let mut w = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([9u8; 64]))
             .with_scheme(AddressScheme::Unified)
             .with_derivation_mode(DerivationMode::Index)
@@ -442,9 +442,9 @@ mod tests {
             .dapp_address_candidates(Some(3))
             .into_iter()
             .find(|candidate| candidate.address == funded_address)
-            .expect("funded older address should be selectable");
+            .expect("funded account address should be selectable");
 
-        assert_eq!(funded.derivation_index, 2);
+        assert_eq!(funded.derivation_index, 5);
         assert_eq!(funded.clean_btc_sats, 42_000);
         assert!(funded.eligible_payment);
         assert!(w.sign_message(&funded.address, "connect").is_ok());

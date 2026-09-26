@@ -35,11 +35,23 @@ pub enum ScriptKind {
 
 impl ScriptKind {
     pub(crate) fn descriptor(self, account_path: &str, chain: u32) -> String {
+        self.descriptor_at(account_path, chain, None)
+    }
+
+    /// Index-style logical accounts own one key per chain. A wildcard here
+    /// would also own every sibling account, regardless of discovery limits.
+    pub(crate) fn descriptor_at(
+        self,
+        account_path: &str,
+        chain: u32,
+        index: Option<u32>,
+    ) -> String {
+        let child = index.map_or_else(|| "*".to_string(), |index| index.to_string());
         match self {
-            ScriptKind::Tr => format!("tr({account_path}/{chain}/*)"),
-            ScriptKind::Wpkh => format!("wpkh({account_path}/{chain}/*)"),
-            ScriptKind::ShWpkh => format!("sh(wpkh({account_path}/{chain}/*))"),
-            ScriptKind::Pkh => format!("pkh({account_path}/{chain}/*)"),
+            ScriptKind::Tr => format!("tr({account_path}/{chain}/{child})"),
+            ScriptKind::Wpkh => format!("wpkh({account_path}/{chain}/{child})"),
+            ScriptKind::ShWpkh => format!("sh(wpkh({account_path}/{chain}/{child}))"),
+            ScriptKind::Pkh => format!("pkh({account_path}/{chain}/{child})"),
         }
     }
 }

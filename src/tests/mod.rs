@@ -34,3 +34,5 @@ pub mod utxo_list;
 pub mod vault_keystore;
 pub mod wasm_wallet_state;
 pub mod watch_and_xpub;
+
+pub mod index_account_scope;
