@@ -63,7 +63,7 @@ pub(crate) async fn broadcast_esplora_transaction<S: esplora_client::Sleeper>(
 /// `wasm32-unknown-unknown` with "time not implemented on this platform".
 /// This helper provides the same value via `js_sys::Date::now()` on WASM
 /// and the standard library on native targets.
-fn wasm_now_secs() -> u64 {
+pub(crate) fn wasm_now_secs() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
         (js_sys::Date::now() / 1000.0) as u64
@@ -8434,7 +8434,26 @@ impl ZincWallet {
     /// full scan (it doesn't walk the gap), so it's the default for routine syncs. Uses the explicit
     /// `start_time` variant to avoid the std-time panic on wasm32-unknown-unknown.
     fn flexible_sync_request(wallet: &Wallet, now: u64) -> SyncRequest<(KeychainKind, u32)> {
-        wallet.start_sync_with_revealed_spks_at(now).build()
+        // BDK remains the owner of pending/confirmed state. Reconcile only
+        // locally known pending and shallow-confirmed transactions, not every
+        // historical payment. Deeper records remain in BDK for reorg recovery.
+        let height = wallet.latest_checkpoint().height();
+        let monitored = wallet
+            .transactions()
+            .filter_map(|tx| {
+                let track = match tx.chain_position {
+                    bdk_chain::ChainPosition::Unconfirmed { .. } => true,
+                    bdk_chain::ChainPosition::Confirmed { anchor, .. } => {
+                        height.saturating_sub(anchor.block_id.height) < 5
+                    }
+                };
+                track.then_some(tx.tx_node.txid)
+            })
+            .collect::<Vec<_>>();
+        wallet
+            .start_sync_with_revealed_spks_at(now)
+            .txids(monitored)
+            .build()
     }
 }
 

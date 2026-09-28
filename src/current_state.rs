@@ -151,6 +151,40 @@ impl ZincWallet {
             None
         };
         let events = self.apply_sync(vault.update, payment_update)?;
+        // A fresh complete UTXO response can contradict an old pending spend
+        // retained in BDK (eviction, replacement, or a reorg). Tell BDK about
+        // the eviction; never implement our own conflict winner or delete its
+        // history. A still-confirmed spender is NOT evicted: validation below
+        // rejects that inconsistent provider response instead.
+        let observed_at = crate::builder::wasm_now_secs();
+        for wallet in std::iter::once(&mut self.vault_wallet).chain(self.payment_wallet.iter_mut())
+        {
+            let evicted: BTreeSet<_> = outputs
+                .keys()
+                .flat_map(|op| wallet.tx_graph().outspends(*op))
+                .filter(|txid| {
+                    wallet.get_tx(**txid).is_some_and(|tx| {
+                        matches!(
+                            tx.chain_position,
+                            bdk_chain::ChainPosition::Unconfirmed { .. }
+                        )
+                    })
+                })
+                .map(|txid| {
+                    (
+                        *txid,
+                        observed_at.max(
+                            wallet
+                                .tx_graph()
+                                .get_tx_node(*txid)
+                                .and_then(|tx| tx.last_seen)
+                                .unwrap_or(0),
+                        ),
+                    )
+                })
+                .collect();
+            wallet.apply_evicted_txs(evicted);
+        }
         let old = self.current_state.replace(CurrentStateSnapshot {
             identity: self.current_state_identity(),
             outputs,
@@ -289,10 +323,12 @@ pub async fn fetch_esplora(
         SyncRequestType::Incremental(r) => (r.chain_tip(), r.start_time()),
     };
     let mut reads = Vec::new();
+    let mut monitored_txids = Vec::new();
     let mut last_active_indices = BTreeMap::<KeychainKind, u32>::new();
     match request {
         SyncRequestType::Full(mut request) => {
             for keychain in request.keychains() {
+                let last_revealed = request.last_revealed(&keychain);
                 let mut gap = 0usize;
                 loop {
                     let batch: Vec<_> = request
@@ -315,6 +351,10 @@ pub async fn fetch_esplora(
                         if read.active {
                             gap = 0;
                             last_active_indices.insert(keychain, index);
+                        } else if last_revealed.is_some_and(|last| index <= last) {
+                            // A rescan must cover every already-revealed address,
+                            // even when an earlier gap exceeds the stop limit.
+                            gap = 0;
                         } else {
                             gap += 1;
                         }
@@ -327,6 +367,7 @@ pub async fn fetch_esplora(
             }
         }
         SyncRequestType::Incremental(mut request) => {
+            monitored_txids.extend(request.iter_txids());
             reads = stream::iter(
                 request
                     .iter_spks_with_expected_txids()
@@ -363,7 +404,9 @@ pub async fn fetch_esplora(
 
     // Deliberately do NOT put scripts into this BDK request: doing so invokes
     // its unbounded address-history traversal even for an incremental sync.
-    let mut funding = SyncRequest::<()>::builder_at(start_time).outpoints(outputs.keys().copied());
+    let mut funding = SyncRequest::<()>::builder_at(start_time)
+        .outpoints(outputs.keys().copied())
+        .txids(monitored_txids);
     if let Some(tip) = chain_tip {
         funding = funding.chain_tip(tip);
     }

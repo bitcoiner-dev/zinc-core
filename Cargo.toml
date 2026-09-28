@@ -27,6 +27,13 @@ include = [
 
 [workspace]
 
+# BDK #2324: retain historical transactions while honoring eviction after a
+# reorg. Pin the compatible backport, not a moving branch. bdk_core must use
+# the same source as bdk_chain so all adapters share its request/update types.
+[patch.crates-io]
+bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "c211596ffb9ed21d47bb7c6a1511568f1038bb10" }
+bdk_core = { git = "https://github.com/bitcoindevkit/bdk", rev = "c211596ffb9ed21d47bb7c6a1511568f1038bb10" }
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
