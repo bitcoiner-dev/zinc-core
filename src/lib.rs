@@ -37,10 +37,14 @@ mod logging;
 
 // Core modules
 pub mod backend_error;
+/// Backend-paginated Activity reads, separate from current-state sync.
+pub mod activity;
 pub mod backend_receipt;
 pub mod builder;
 pub mod cancellation;
 pub mod crypto;
+/// Current UTXO synchronization, separate from paginated Activity history.
+pub mod current_state;
 pub mod error;
 /// Vendor-neutral capability negotiation for hardware and other external signers.
 pub mod external_signing;
@@ -2394,6 +2398,26 @@ impl ZincWasmWallet {
         }
     }
 
+    /// Fetch a backend-paginated Activity page without a full wallet scan.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = fetchTransactionPage)]
+    pub fn fetch_transaction_page(&self, esplora_url: String, limit: usize, cursor: Option<String>)
+        -> Result<js_sys::Promise, JsValue> {
+        self.check_vitality()?;
+        let pager = self.inner.try_borrow_mut().map_err(|_|JsValue::from_str("Wallet busy"))?
+            .prepare_activity_page(&esplora_url, cursor.as_deref()).map_err(|e|JsValue::from_str(&e))?;
+        let inner = self.inner.clone();
+        Ok(wasm_bindgen_futures::future_to_promise(async move {
+            let client = crate::builder::configured_esplora_client(&esplora_url)
+                .map_err(|e|JsValue::from_str(&e.to_string()))?;
+            let (pager, mut page) = pager.fetch(&client, limit).await.map_err(|e|JsValue::from_str(&e))?;
+            let mut wallet = inner.try_borrow_mut().map_err(|_|JsValue::from_str("Wallet busy"))?;
+            wallet.retain_activity_page(pager, &page).map_err(|e|JsValue::from_str(&e))?;
+            wallet.annotate_activity_page(&mut page);
+            serde_wasm_bindgen::to_value(&page).map_err(|e|JsValue::from_str(&e.to_string()))
+        }))
+    }
+
     /// Return first receive addresses/public keys for taproot/payment roles.
     ///
     /// In unified mode, `payment*` mirrors the same taproot branch.
@@ -2480,8 +2504,7 @@ impl ZincWasmWallet {
     #[wasm_bindgen(js_name = sync)]
     pub fn sync(&self, esplora_url: String) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        use crate::builder::{configured_esplora_client, SyncRequestType};
-        use bdk_esplora::EsploraAsyncExt;
+        use crate::builder::configured_esplora_client;
 
         let inner_rc = self.inner.clone();
         let network = self.state_snapshot().network;
@@ -2552,28 +2575,8 @@ impl ZincWasmWallet {
             };
 
             // 2. Fetch (NO LOCK HELD)
-            let vault_update_res: Result<bdk_wallet::Update, BackendFailureV1> = match sync_req
-                .taproot
-            {
-                SyncRequestType::Full(req) => {
-                    zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot full scan");
-                    client
-                        .full_scan(req, 20, 5)
-                        .await
-                        .map(|u| u.into())
-                        .map_err(|e| {
-                            zinc_log_debug!(target: LOG_TARGET_WASM, "Vault full scan failed: {:?}", e);
-                            BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
-                        })
-                }
-                SyncRequestType::Incremental(req) => {
-                    zinc_log_info!(target: LOG_TARGET_WASM, "starting taproot incremental sync");
-                    client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "Vault sync failed: {:?}", e);
-                        BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
-                    })
-                }
-            };
+            let vault_update_res = crate::current_state::fetch_esplora(&client, sync_req.taproot, 20, 5)
+                .await.map_err(|error| error.backend_failure());
 
             let vault_update = match vault_update_res {
                 Ok(u) => u,
@@ -2596,32 +2599,11 @@ impl ZincWasmWallet {
                 }
             };
 
-            let payment_update: Option<bdk_wallet::Update> = if let Some(req_type) =
+            let payment_update = if let Some(req_type) =
                 sync_req.payment
             {
-                let update_res: Result<bdk_wallet::Update, BackendFailureV1> = match req_type {
-                    SyncRequestType::Full(req) => {
-                        zinc_log_info!(target: LOG_TARGET_WASM, "starting payment full scan");
-                        client
-                                .full_scan(req, 20, 5)
-                                .await
-                                .map(|u| u.into())
-                                .map_err(|e| {
-                                    zinc_log_debug!(target: LOG_TARGET_WASM, "Payment full scan failed: {:?}", e);
-                                    BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
-                                })
-                    }
-                    SyncRequestType::Incremental(req) => {
-                        zinc_log_info!(
-                            target: LOG_TARGET_WASM,
-                            "starting payment incremental sync"
-                        );
-                        client.sync(req, 1).await.map(|u| u.into()).map_err(|e| {
-                                zinc_log_debug!(target: LOG_TARGET_WASM, "Payment sync failed: {:?}", e);
-                                BackendFailureV1::from_esplora(&e, BackendOperationV1::Sync)
-                            })
-                    }
-                };
+                let update_res = crate::current_state::fetch_esplora(&client, req_type, 20, 5)
+                    .await.map_err(|error| error.backend_failure());
 
                 match update_res {
                     Ok(u) => Some(u),
@@ -2660,7 +2642,7 @@ impl ZincWasmWallet {
                         }
                         zinc_log_debug!(target: LOG_TARGET_WASM, "sync: applying updates");
                         let res = inner
-                            .apply_sync(vault_update, payment_update)
+                            .apply_current_state(vault_update, payment_update)
                             .map_err(|e| {
                                 inner.is_syncing = false;
                                 zinc_log_error!(target: LOG_TARGET_WASM, "failed to apply sync");
@@ -3349,6 +3331,7 @@ impl ZincWasmWallet {
         &self,
         original_txid: String,
         ord_url: String,
+        esplora_url: String,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         let original_txid = original_txid
@@ -3356,6 +3339,20 @@ impl ZincWasmWallet {
             .map_err(|_| JsValue::from_str("Invalid cancellation target"))?;
         let inner_rc = self.inner.clone();
         Ok(wasm_bindgen_futures::future_to_promise(async move {
+            let (account, chain, needs_target) = {
+                let inner = inner_rc.try_borrow().map_err(|_| JsValue::from_str("Wallet busy"))?;
+                (inner.account_generation(), inner.chain_state_generation(),
+                    inner.cancellation_input_snapshot(original_txid).is_err())
+            };
+            if needs_target {
+                let client = crate::builder::configured_esplora_client(&esplora_url)
+                    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+                let target = crate::cancellation::CancellationTargetRead::fetch(&client, original_txid).await
+                    .map_err(|error| JsValue::from_str(&error))?;
+                inner_rc.try_borrow_mut().map_err(|_| JsValue::from_str("Wallet busy"))?
+                    .retain_cancellation_target(target, account, chain)
+                    .map_err(|error| JsValue::from_str(&error))?;
+            }
             let (snapshot, generation) = {
                 let inner = inner_rc.try_borrow().map_err(|_| {
                     JsValue::from_str("Wallet busy during cancellation verification")

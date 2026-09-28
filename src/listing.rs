@@ -792,7 +792,7 @@ pub fn create_listing_purchase(
         .peek_address(KeychainKind::External, 0)
         .script_pubkey();
     let protected_outpoints: std::collections::HashSet<OutPoint> =
-        wallet.inscribed_utxos.iter().copied().collect();
+        wallet.unavailable_outpoints().into_iter().collect();
     let payment_role = wallet.scheme == AddressScheme::Dual;
     let signing_wallet = if payment_role {
         wallet
@@ -819,9 +819,7 @@ pub fn create_listing_purchase(
     }
 
     let mut builder = signing_wallet.build_tx();
-    if !wallet.inscribed_utxos.is_empty() {
-        builder.unspendable(protected_outpoints.iter().copied().collect());
-    }
+    builder.unspendable(protected_outpoints.iter().copied().collect());
     builder.ordering(TxOrdering::Untouched);
     builder
         .add_utxos(&buyer_outpoints)

@@ -5,7 +5,6 @@
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_chain::Merge;
-use bdk_esplora::EsploraAsyncExt;
 
 use bdk_wallet::descriptor::{Descriptor, DescriptorPublicKey, IntoWalletDescriptor};
 use bdk_wallet::signer::SignersContainer;
@@ -1238,6 +1237,11 @@ fn validate_public_hardware_descriptors(
 
 /// Stateful wallet runtime that owns account wallets and safety state.
 pub struct ZincWallet {
+    pub(crate) activity_pager: Option<crate::activity::ActivityPager>,
+    pub(crate) activity_serial: u64,
+    pub(crate) activity_first_page: Option<crate::history::TransactionPage>,
+    pub(crate) activity_pages: std::collections::BTreeMap<String, crate::history::TransactionPage>,
+    pub(crate) current_state: Option<crate::current_state::CurrentStateSnapshot>,
     // We use Option for payment_wallet to support Unified mode (where only taproot exists)
     // In Unified mode, payment calls are routed to taproot.
     /// Taproot wallet (always present).
@@ -1297,6 +1301,7 @@ pub struct ZincWallet {
     /// Wallet outpoints explicitly covered by the verified Ord response.
     pub(crate) classified_outpoints: std::collections::HashSet<bitcoin::OutPoint>,
     pub(crate) cancellation_input_assets: Option<crate::cancellation::VerifiedCancellationInputs>,
+    pub(crate) cancellation_target: Option<crate::cancellation::CancellationTargetCache>,
     /// Cryptographic identity of this wallet (Seed or Hardware).
     pub(crate) kind: WalletKind,
     /// Public derivation metadata used to create short-lived BDK signers for seed wallets.
@@ -1826,8 +1831,7 @@ impl ZincWallet {
         for (wallet, payment) in std::iter::once((&self.vault_wallet, false))
             .chain(self.payment_wallet.as_ref().map(|wallet| (wallet, true)))
         {
-            for unspent in wallet
-                .list_unspent()
+            for unspent in self.current_unspent(wallet)
                 .filter(|utxo| input_outpoints.contains(&utxo.outpoint))
             {
                 let descriptor_slot = slot(payment, unspent.keychain);
@@ -2299,7 +2303,7 @@ impl ZincWallet {
             && self.ordinals_verified_generation == Some(self.chain_state_generation)
     }
 
-    fn invalidate_asset_state(&mut self) {
+    pub(crate) fn invalidate_asset_state(&mut self) {
         self.cancellation_input_assets = None;
         let changed = self.ordinals_verified
             || self.ordinals_metadata_complete
@@ -2578,6 +2582,7 @@ impl ZincWallet {
         }
 
         Ok(ZincPersistence {
+            current_state: self.current_state.clone(),
             taproot: Some(vault_changeset),
             payment: payment_changeset,
         })
@@ -2762,6 +2767,11 @@ impl ZincWallet {
 
     /// Rebuild wallet state from current public descriptors, clearing cached sync state.
     pub fn reset_sync_state(&mut self) -> Result<(), String> {
+        self.current_state = None;
+        self.activity_pager = None;
+        self.activity_first_page = None;
+        self.activity_pages.clear();
+        self.activity_serial = self.activity_serial.wrapping_add(1);
         zinc_log_info!(
             target: LOG_TARGET_BUILDER,
             "resetting wallet sync state (chain mismatch recovery)"
@@ -2820,7 +2830,7 @@ impl ZincWallet {
         Ok(())
     }
 
-    /// Run a full sync against Esplora for taproot and optional payment wallets.
+    /// Refresh current UTXOs against Esplora; Activity is fetched separately.
     pub async fn sync(&mut self, esplora_url: &str) -> Result<Vec<String>, String> {
         let client = configured_esplora_client(esplora_url).map_err(|error| {
             serialize_backend_failure(&BackendFailureV1::from_esplora(
@@ -2829,45 +2839,32 @@ impl ZincWallet {
             ))
         })?;
 
-        let now = wasm_now_secs();
-        let vault_req = Self::flexible_full_scan_request(&self.vault_wallet, self.scan_policy, now);
-        let payment_req = self
-            .payment_wallet
-            .as_ref()
-            .map(|w| Self::flexible_full_scan_request(w, self.scan_policy, now));
-
+        let requests = self.prepare_requests(self.force_next_full);
+        self.force_next_full = false;
         let stop_gap = self.scan_policy.account_gap_limit as usize;
         let parallel_requests = 5;
 
         // 1. Sync Vault
-        let vault_update = client
-            .full_scan(vault_req, stop_gap, parallel_requests)
+        let vault_update = crate::current_state::fetch_esplora(&client, requests.taproot, stop_gap, parallel_requests)
             .await
             .map_err(|error| {
-                serialize_backend_failure(&BackendFailureV1::from_esplora(
-                    &error,
-                    BackendOperationV1::Sync,
-                ))
+                serialize_backend_failure(&error.backend_failure())
             })?;
 
         // 2. Sync Payment (if exists)
-        let payment_update = if let Some(req) = payment_req {
+        let payment_update = if let Some(req) = requests.payment {
             Some(
-                client
-                    .full_scan(req, stop_gap, parallel_requests)
+                crate::current_state::fetch_esplora(&client, req, stop_gap, parallel_requests)
                     .await
                     .map_err(|error| {
-                        serialize_backend_failure(&BackendFailureV1::from_esplora(
-                            &error,
-                            BackendOperationV1::Sync,
-                        ))
+                        serialize_backend_failure(&error.backend_failure())
                     })?,
             )
         } else {
             None
         };
 
-        self.apply_sync(vault_update, payment_update)
+        self.apply_current_state(vault_update, payment_update)
     }
 
     /// Collect the wallet's main receive addresses for ordinals sync.
@@ -2904,7 +2901,7 @@ impl ZincWallet {
             // like Sparrow hold inscriptions across many used addresses; without this the ordinals scan
             // never sees them, inscribed_utxos stays empty for those outpoints, and a normal send would
             // happily select an inscription UTXO. Covers both external and internal keychains.
-            for u in wallet.list_unspent() {
+            for u in self.current_unspent(wallet) {
                 let addr = wallet
                     .peek_address(u.keychain, u.derivation_index)
                     .address
@@ -2944,7 +2941,7 @@ impl ZincWallet {
         let mut seen = std::collections::HashSet::new();
 
         let mut collect_from_wallet = |wallet: &Wallet| {
-            for u in wallet.list_unspent() {
+            for u in self.current_unspent(wallet) {
                 let addr = wallet
                     .peek_address(u.keychain, u.derivation_index)
                     .address
@@ -2983,7 +2980,7 @@ impl ZincWallet {
         let mut seen = std::collections::HashSet::new();
 
         let mut collect_from_wallet = |wallet: &Wallet| {
-            for u in wallet.list_unspent() {
+            for u in self.current_unspent(wallet) {
                 let op = u.outpoint.to_string();
                 if seen.insert(op.clone()) {
                     // Ord only indexes confirmed outputs, so callers need each outpoint's
@@ -3517,9 +3514,9 @@ impl ZincWallet {
 
     /// Return raw combined BDK balance across taproot and payment wallets.
     pub fn get_raw_balance(&self) -> bdk_wallet::Balance {
-        let vault_bal = self.vault_wallet.balance();
+        let vault_bal = self.current_balance(&self.vault_wallet);
         if let Some(payment_wallet) = &self.payment_wallet {
-            let pay_bal = payment_wallet.balance();
+            let pay_bal = self.current_balance(payment_wallet);
             bdk_wallet::Balance {
                 immature: vault_bal.immature + pay_bal.immature,
                 trusted_pending: vault_bal.trusted_pending + pay_bal.trusted_pending,
@@ -3538,7 +3535,7 @@ impl ZincWallet {
         // Robust Approach:
         let calc_balance = |wallet: &Wallet| {
             let mut bal = bdk_wallet::Balance::default();
-            for utxo in wallet.list_unspent() {
+            for utxo in self.current_unspent(wallet) {
                 if self.inscribed_utxos.contains(&utxo.outpoint) {
                     zinc_log_debug!(
                         target: LOG_TARGET_BUILDER,
@@ -3657,7 +3654,7 @@ impl ZincWallet {
             ..scan_depth)
             .map(|offset| (KeychainKind::External, offset))
             .collect();
-        for utxo in wallet.list_unspent() {
+        for utxo in self.current_unspent(wallet) {
             indexed_keychains.insert((utxo.keychain, utxo.derivation_index));
         }
 
@@ -3691,7 +3688,7 @@ impl ZincWallet {
             let mut protected_asset_count = 0u32;
             let mut inscription_ids = Vec::new();
 
-            for utxo in wallet.list_unspent() {
+            for utxo in self.current_unspent(wallet) {
                 if utxo.keychain != keychain || utxo.derivation_index != absolute_index {
                     continue;
                 }
@@ -3852,7 +3849,7 @@ impl ZincWallet {
             indexed_keychains.insert((KeychainKind::External, offset));
             indexed_keychains.insert((KeychainKind::Internal, offset));
         }
-        for utxo in wallet.list_unspent() {
+        for utxo in self.current_unspent(wallet) {
             indexed_keychains.insert((utxo.keychain, utxo.derivation_index));
         }
 
@@ -3936,7 +3933,7 @@ impl ZincWallet {
     }
 
     fn collect_utxos_from(&self, wallet: &Wallet, role: &str, tip: u32, out: &mut Vec<UtxoItem>) {
-        for u in wallet.list_unspent() {
+        for u in self.current_unspent(wallet) {
             let (confirmed, confirmations) = match &u.chain_position {
                 bdk_chain::ChainPosition::Confirmed { anchor, .. } => (
                     true,
@@ -4021,7 +4018,7 @@ impl ZincWallet {
     /// Resolve one of the wallet's own UTXOs (across taproot + payment keychains) to its `TxOut`.
     fn resolve_owned_txout(&self, op: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
         let find = |w: &Wallet| {
-            w.list_unspent()
+            self.current_unspent(w)
                 .find(|u| u.outpoint == *op)
                 .map(|u| u.txout.clone())
         };
@@ -4104,7 +4101,7 @@ impl ZincWallet {
             .script_pubkey();
         let mut fee_inputs = Vec::new();
         for wallet in std::iter::once(&self.vault_wallet).chain(self.payment_wallet.as_ref()) {
-            for unspent in wallet.list_unspent() {
+            for unspent in self.current_unspent(wallet) {
                 let outpoint = unspent.outpoint;
                 if !unspent.chain_position.is_confirmed()
                     || unspent.txout.script_pubkey != payment_script
@@ -4911,7 +4908,7 @@ impl ZincWallet {
 
         let mut fee_candidates = Vec::<(bitcoin::OutPoint, TxOut)>::new();
         let mut collect = |wallet: &Wallet| {
-            for candidate in wallet.list_unspent() {
+            for candidate in self.current_unspent(wallet) {
                 if candidate.outpoint == *outpoint
                     || self.inscribed_utxos.contains(&candidate.outpoint)
                     || !matches!(
@@ -5110,11 +5107,11 @@ impl ZincWallet {
             .map_err(|e| ZincError::ConfigError(format!("Recipient network mismatch: {e}")))?;
 
         let mut owned: BTreeMap<bitcoin::OutPoint, TxOut> = BTreeMap::new();
-        for utxo in self.vault_wallet.list_unspent() {
+        for utxo in self.current_unspent(&self.vault_wallet) {
             owned.insert(utxo.outpoint, utxo.txout.clone());
         }
         if let Some(wallet) = &self.payment_wallet {
-            for utxo in wallet.list_unspent() {
+            for utxo in self.current_unspent(wallet) {
                 owned.insert(utxo.outpoint, utxo.txout.clone());
             }
         }
@@ -5621,6 +5618,7 @@ impl ZincWallet {
         }
 
         let active_receive_index = self.active_receive_index();
+        let unavailable = self.unavailable_outpoints();
         let wallet = if self.scheme == AddressScheme::Dual {
             self.payment_wallet.as_mut().ok_or_else(|| {
                 ZincError::WalletError("Payment wallet not initialized".to_string())
@@ -5643,9 +5641,7 @@ impl ZincWallet {
         if let Some(sequence) = input_sequence {
             builder.set_exact_sequence(sequence);
         }
-        if !self.inscribed_utxos.is_empty() {
-            builder.unspendable(self.inscribed_utxos.iter().copied().collect());
-        }
+        builder.unspendable(unavailable);
 
         builder
             .add_recipient(recipient.script_pubkey(), request.amount)
@@ -6481,7 +6477,7 @@ impl ZincWallet {
         let mut known_utxos: HashMap<bitcoin::OutPoint, bitcoin::TxOut> = HashMap::new();
 
         let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-            for utxo in w.list_unspent() {
+            for utxo in self.current_unspent(w) {
                 map.insert(utxo.outpoint, utxo.txout);
             }
         };
@@ -6720,11 +6716,11 @@ impl ZincWallet {
     ) -> Result<(), String> {
         let selected = |index: usize| inputs_to_sign.is_none_or(|indices| indices.contains(&index));
         let mut wallet_outpoints = std::collections::HashSet::new();
-        for utxo in self.vault_wallet.list_unspent() {
+        for utxo in self.current_unspent(&self.vault_wallet) {
             wallet_outpoints.insert(utxo.outpoint);
         }
         if let Some(wallet) = &self.payment_wallet {
-            for utxo in wallet.list_unspent() {
+            for utxo in self.current_unspent(wallet) {
                 wallet_outpoints.insert(utxo.outpoint);
             }
         }
@@ -7228,7 +7224,7 @@ impl ZincWallet {
         let mut known_utxos = HashMap::new();
 
         let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-            for utxo in w.list_unspent() {
+            for utxo in self.current_unspent(w) {
                 map.insert(utxo.outpoint, utxo.txout);
             }
         };
@@ -7525,7 +7521,7 @@ impl ZincWallet {
         let mut known_utxos = std::collections::HashMap::new();
         let collect_utxos =
             |w: &Wallet, map: &mut std::collections::HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-                for utxo in w.list_unspent() {
+                for utxo in self.current_unspent(w) {
                     map.insert(utxo.outpoint, utxo.txout);
                 }
             };
@@ -7943,7 +7939,7 @@ impl ZincWallet {
         let mut known_utxos = HashMap::new();
 
         let collect_utxos = |w: &Wallet, map: &mut HashMap<bitcoin::OutPoint, bitcoin::TxOut>| {
-            for utxo in w.list_unspent() {
+            for utxo in self.current_unspent(w) {
                 map.insert(utxo.outpoint, utxo.txout);
             }
         };
@@ -8235,11 +8231,11 @@ impl ZincWallet {
         // ordinals reveal envelope.
         let mut wallet_outpoints: std::collections::HashSet<bitcoin::OutPoint> =
             std::collections::HashSet::new();
-        for utxo in self.vault_wallet.list_unspent() {
+        for utxo in self.current_unspent(&self.vault_wallet) {
             wallet_outpoints.insert(utxo.outpoint);
         }
         if let Some(wallet) = &self.payment_wallet {
-            for utxo in wallet.list_unspent() {
+            for utxo in self.current_unspent(wallet) {
                 wallet_outpoints.insert(utxo.outpoint);
             }
         }
@@ -8832,6 +8828,11 @@ impl WalletBuilder {
             };
 
         let mut wallet = ZincWallet {
+            activity_pager: None,
+            activity_serial: 0,
+            activity_first_page: None,
+            activity_pages: std::collections::BTreeMap::new(),
+            current_state: None,
             vault_wallet,
             payment_wallet,
             scheme: self.scheme,
@@ -8858,6 +8859,7 @@ impl WalletBuilder {
             ordinals_observed_at_unix: None,
             classified_outpoints: std::collections::HashSet::new(),
             cancellation_input_assets: None,
+            cancellation_target: None,
             kind,
             signing_layout,
             is_syncing: false,
@@ -8866,6 +8868,7 @@ impl WalletBuilder {
             force_next_full: false,
         };
         wallet.ensure_primary_spks_revealed();
+        wallet.restore_current_state(self.persistence.and_then(|p| p.current_state));
         Ok(wallet)
     }
 
@@ -8983,6 +8986,11 @@ impl WalletBuilder {
         };
 
         let mut wallet = ZincWallet {
+            activity_pager: None,
+            activity_serial: 0,
+            activity_first_page: None,
+            activity_pages: std::collections::BTreeMap::new(),
+            current_state: None,
             vault_wallet,
             payment_wallet,
             scheme,
@@ -9009,6 +9017,7 @@ impl WalletBuilder {
             ordinals_observed_at_unix: None,
             classified_outpoints: std::collections::HashSet::new(),
             cancellation_input_assets: None,
+            cancellation_target: None,
             kind: WalletKind::Hardware {
                 fingerprint,
                 taproot_external: taproot_external_desc,
@@ -9021,6 +9030,7 @@ impl WalletBuilder {
             force_next_full: false,
         };
         wallet.ensure_primary_spks_revealed();
+        wallet.restore_current_state(persistence.and_then(|p| p.current_state));
         Ok(wallet)
     }
 }
@@ -9028,6 +9038,9 @@ impl WalletBuilder {
 /// Serializable persistence snapshot for taproot/payment wallet changesets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZincPersistence {
+    /// Current-output cache; old full-history persistence has no such filter.
+    #[serde(default)]
+    pub current_state: Option<crate::current_state::CurrentStateSnapshot>,
     /// Merged changeset for the taproot wallet.
     pub taproot: Option<bdk_wallet::ChangeSet>,
     /// Merged changeset for the optional payment wallet.

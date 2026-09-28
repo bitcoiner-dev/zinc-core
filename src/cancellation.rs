@@ -4,6 +4,195 @@
 use crate::{builder::ZincWallet, ordinals::client::ResolvedAssets};
 use bitcoin::{OutPoint, TxOut, Txid};
 
+/// Targeted, hash-checked pending-payment facts. This is never inserted into
+/// holdings and cannot make a historical input spendable outside cancellation.
+#[derive(Debug)]
+pub struct CancellationTargetRead {
+    original_txid: Txid,
+    inputs: Vec<(OutPoint, TxOut)>,
+}
+
+pub(crate) struct CancellationTargetCache {
+    read: CancellationTargetRead,
+    account_generation: u64,
+    chain_generation: u64,
+}
+
+#[cfg(test)]
+mod targeted_tests {
+    use super::*;
+    use crate::builder::{Seed64, SyncSleeper, WalletBuilder};
+    use bitcoin::{hashes::Hash, Amount, Network, Transaction, TxIn};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn pending_payment_without_change_uses_only_target_and_direct_parent() {
+        let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([92; 64]))
+            .build()
+            .unwrap();
+        let parent = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([93; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: wallet.peek_taproot_address(0).script_pubkey(),
+            }],
+        };
+        let target = Transaction {
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent.compute_txid(), 0),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+            ..parent.clone()
+        };
+        let txid = target.compute_txid();
+        let mut server = mockito::Server::new_async().await;
+        let original = server.mock("GET",format!("/tx/{txid}").as_str()).with_body(json!({
+            "txid":txid,"version":2,"locktime":0,"vin":[{
+                "txid":parent.compute_txid(),"vout":0,"scriptsig":"","sequence":target.input[0].sequence.to_consensus_u32(),"is_coinbase":false}],
+            "vout":[{"value":49000,"scriptpubkey":""}],"size":target.total_size(),"weight":target.weight().to_wu(),
+            "fee":1000,"status":{"confirmed":false}
+        }).to_string()).expect(1).create_async().await;
+        let funding = server
+            .mock("GET", format!("/tx/{}/raw", parent.compute_txid()).as_str())
+            .with_body(bitcoin::consensus::serialize(&parent))
+            .expect(1)
+            .create_async()
+            .await;
+        let status = server
+            .mock("GET", format!("/tx/{txid}/status").as_str())
+            .with_body(r#"{"confirmed":false}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .unwrap();
+        let read = CancellationTargetRead::fetch(&client, txid).await.unwrap();
+        assert_eq!(
+            read.inputs,
+            vec![(
+                OutPoint::new(parent.compute_txid(), 0),
+                parent.output[0].clone()
+            )]
+        );
+        let account = wallet.account_generation();
+        let chain = wallet.chain_state_generation();
+        wallet
+            .retain_cancellation_target(read, account, chain)
+            .unwrap();
+        assert_eq!(wallet.get_raw_balance().total().to_sat(), 0);
+        assert!(wallet.list_utxos().is_empty());
+        assert!(
+            wallet.cancellation_input_snapshot(txid).is_err(),
+            "target metadata must not establish asset authority"
+        );
+        let read = CancellationTargetRead {
+            original_txid: txid,
+            inputs: vec![(
+                OutPoint::new(parent.compute_txid(), 0),
+                parent.output[0].clone(),
+            )],
+        };
+        wallet.retire_inflight_sync();
+        assert!(wallet
+            .retain_cancellation_target(read, account, chain)
+            .is_err());
+        for mock in [original, funding, status] {
+            mock.assert_async().await;
+        }
+    }
+
+    #[test]
+    fn foreign_cancellation_inputs_are_rejected() {
+        let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([92; 64]))
+            .build()
+            .unwrap();
+        let read = CancellationTargetRead {
+            original_txid: Txid::all_zeros(),
+            inputs: vec![(
+                OutPoint::null(),
+                TxOut {
+                    value: Amount::from_sat(1000),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+            )],
+        };
+        assert!(wallet
+            .retain_cancellation_target(
+                read,
+                wallet.account_generation(),
+                wallet.chain_state_generation()
+            )
+            .is_err());
+    }
+}
+
+impl CancellationTargetRead {
+    /// Fetch only the requested payment and its direct funding transactions.
+    /// No address history is needed, including after restoring an old wallet.
+    pub async fn fetch(
+        client: &esplora_client::AsyncClient<crate::builder::SyncSleeper>,
+        txid: Txid,
+    ) -> Result<Self, String> {
+        let target = client
+            .get_tx_info(&txid)
+            .await
+            .map_err(|_| "Cancellation transaction unavailable")?
+            .ok_or("Cancellation transaction not found")?;
+        if target.txid != txid || target.to_tx().compute_txid() != txid || target.status.confirmed {
+            return Err("Cancellation requires the exact pending payment".into());
+        }
+        let mut parents = std::collections::BTreeMap::new();
+        let mut inputs = Vec::new();
+        for input in target.vin {
+            let op = OutPoint::new(input.txid, input.vout);
+            if input.is_coinbase || inputs.iter().any(|(previous, _)| *previous == op) {
+                return Err("Invalid cancellation input".into());
+            }
+            if !parents.contains_key(&op.txid) {
+                let parent = client
+                    .get_tx(&op.txid)
+                    .await
+                    .map_err(|_| "Cancellation funding transaction unavailable")?
+                    .ok_or("Cancellation funding transaction not found")?;
+                if parent.compute_txid() != op.txid {
+                    return Err("Cancellation funding transaction mismatch".into());
+                }
+                parents.insert(op.txid, parent);
+            }
+            let output = parents[&op.txid]
+                .output
+                .get(op.vout as usize)
+                .ok_or("Cancellation output missing")?
+                .clone();
+            inputs.push((op, output));
+        }
+        if inputs.is_empty()
+            || client
+                .get_tx_status(&txid)
+                .await
+                .map_err(|_| "Cancellation status unavailable")?
+                .confirmed
+        {
+            return Err("Cancellation target is no longer pending".into());
+        }
+        Ok(Self {
+            original_txid: txid,
+            inputs,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancellationInputSnapshot {
     original_txid: Txid,
@@ -54,6 +243,32 @@ pub struct VerifiedCancellationInputs {
 }
 
 impl ZincWallet {
+    /// Publish only for the context that started the targeted network read.
+    /// All inputs must belong to this wallet; Ord still verifies every input.
+    pub fn retain_cancellation_target(
+        &mut self,
+        read: CancellationTargetRead,
+        account: u64,
+        chain: u64,
+    ) -> Result<(), String> {
+        if self.account_generation() != account
+            || self.chain_state_generation() != chain
+            || read.inputs.is_empty()
+            || read.inputs.iter().any(|(_, output)| {
+                !std::iter::once(&self.vault_wallet)
+                    .chain(self.payment_wallet.iter())
+                    .any(|wallet| wallet.is_mine(output.script_pubkey.clone()))
+            })
+        {
+            return Err("Cancellation target does not match the current wallet".into());
+        }
+        self.cancellation_target = Some(CancellationTargetCache {
+            read,
+            account_generation: account,
+            chain_generation: chain,
+        });
+        Ok(())
+    }
     /// Capture the exact inputs of a locally known, canonical pending payment.
     /// A host must resolve every returned outpoint through the value-validating
     /// Ord client, then publish with `apply_verified_cancellation_inputs`.
@@ -63,6 +278,22 @@ impl ZincWallet {
     ) -> Result<CancellationInputSnapshot, String> {
         if !self.asset_state_is_current() || self.is_syncing {
             return Err("Cancellation requires a current, settled asset snapshot".into());
+        }
+        if let Some(target) = &self.cancellation_target {
+            if target.read.original_txid == original_txid {
+                if target.account_generation != self.account_generation()
+                    || target.chain_generation != self.chain_state_generation()
+                {
+                    return Err("Cancellation target must be refreshed".into());
+                }
+                return Ok(CancellationInputSnapshot {
+                    original_txid,
+                    account_generation: self.account_generation(),
+                    chain_generation: self.chain_state_generation(),
+                    asset_generation: self.asset_data_generation,
+                    inputs: target.read.inputs.clone(),
+                });
+            }
         }
         let original = self
             .vault_wallet

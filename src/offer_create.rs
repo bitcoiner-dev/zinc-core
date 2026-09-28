@@ -144,6 +144,7 @@ pub fn create_offer(
         ..Default::default()
     };
 
+    let unavailable = wallet.unavailable_outpoints();
     let signing_wallet = if wallet.scheme == AddressScheme::Dual {
         wallet
             .payment_wallet
@@ -157,9 +158,7 @@ pub fn create_offer(
         .script_pubkey();
 
     let mut builder = signing_wallet.build_tx();
-    if !wallet.inscribed_utxos.is_empty() {
-        builder.unspendable(wallet.inscribed_utxos.iter().copied().collect());
-    }
+    builder.unspendable(unavailable);
 
     // Match ord's offer template invariants:
     // - preserve recipient insertion order (buyer postage, then seller payout),

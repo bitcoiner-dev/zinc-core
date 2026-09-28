@@ -1,0 +1,402 @@
+//! Current-output synchronization. Address discovery asks for activity counts,
+//! never transaction history; transaction reads are limited to current funding
+//! outpoints. History is a separate, paginated read path.
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "tests/current_state.rs"]
+mod tests;
+
+use crate::builder::ZincWallet;
+use crate::builder::{SyncRequestType, SyncSleeper};
+use bdk_chain::spk_client::SyncRequest;
+use bdk_esplora::EsploraAsyncExt;
+use bdk_wallet::KeychainKind;
+use bitcoin::{OutPoint, ScriptBuf, TxOut};
+use futures_util::{stream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Persisted current-output authority, separate from the additive BDK graph.
+/// This is cached data, not permission to sign: a fresh chain/Ord receipt is
+/// still required after unlock. Descriptor identity prevents cross-wallet use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentStateSnapshot {
+    identity: String,
+    outputs: BTreeMap<OutPoint, TxOut>,
+    active_scripts: BTreeSet<ScriptBuf>,
+}
+
+impl ZincWallet {
+    pub(crate) fn current_state_identity(&self) -> String {
+        let describe = |wallet: &bdk_wallet::Wallet| {
+            format!(
+                "{}:{}:{}",
+                wallet.network(),
+                wallet.public_descriptor(KeychainKind::External),
+                wallet.public_descriptor(KeychainKind::Internal)
+            )
+        };
+        format!(
+            "{}|{}",
+            describe(&self.vault_wallet),
+            self.payment_wallet
+                .as_ref()
+                .map(describe)
+                .unwrap_or_default()
+        )
+    }
+
+    pub(crate) fn restore_current_state(&mut self, snapshot: Option<CurrentStateSnapshot>) {
+        self.current_state = snapshot.filter(|s| s.identity == self.current_state_identity());
+        self.mark_current_scripts_used();
+    }
+
+    fn mark_current_scripts_used(&mut self) {
+        if let Some(snapshot) = &self.current_state {
+            for wallet in
+                std::iter::once(&mut self.vault_wallet).chain(self.payment_wallet.iter_mut())
+            {
+                for script in &snapshot.active_scripts {
+                    if let Some((keychain, index)) = wallet.derivation_of_spk(script.clone()) {
+                        wallet.mark_used(keychain, index);
+                    }
+                }
+            }
+        }
+    }
+
+    /// BDK's graph is additive. A funding transaction can contain other owned
+    /// outputs spent years ago; only the complete UTXO read can authorize them.
+    pub(crate) fn current_unspent<'a>(
+        &'a self,
+        wallet: &'a bdk_wallet::Wallet,
+    ) -> impl Iterator<Item = bdk_wallet::LocalOutput> + 'a {
+        wallet.list_unspent().filter(|u| {
+            self.current_state
+                .as_ref()
+                .is_none_or(|s| s.outputs.get(&u.outpoint) == Some(&u.txout))
+        })
+    }
+
+    pub(crate) fn current_balance(&self, wallet: &bdk_wallet::Wallet) -> bdk_wallet::Balance {
+        wallet.tx_graph().balance(
+            wallet.local_chain(),
+            wallet.latest_checkpoint().block_id(),
+            bdk_chain::CanonicalizationParams::default(),
+            wallet
+                .spk_index()
+                .outpoints()
+                .iter()
+                .cloned()
+                .filter(|(_, op)| {
+                    self.current_state
+                        .as_ref()
+                        .is_none_or(|s| s.outputs.contains_key(op))
+                }),
+            |&(keychain, _), _| keychain == KeychainKind::Internal,
+        )
+    }
+
+    /// The automatic BDK coin selector must exclude stale graph outputs too.
+    pub(crate) fn unavailable_outpoints(&self) -> Vec<OutPoint> {
+        let mut result: BTreeSet<_> = self.inscribed_utxos.iter().copied().collect();
+        if let Some(snapshot) = &self.current_state {
+            for wallet in std::iter::once(&self.vault_wallet).chain(self.payment_wallet.iter()) {
+                result.extend(
+                    wallet
+                        .list_unspent()
+                        .filter(|u| snapshot.outputs.get(&u.outpoint) != Some(&u.txout))
+                        .map(|u| u.outpoint),
+                );
+            }
+        }
+        result.into_iter().collect()
+    }
+
+    /// Apply both keychains atomically at the existing generation boundary.
+    /// Incomplete fetches never produce this type and cannot clear balances.
+    pub fn apply_current_state(
+        &mut self,
+        vault: CurrentStateUpdate,
+        payment: Option<CurrentStateUpdate>,
+    ) -> Result<Vec<String>, String> {
+        if self.payment_wallet.is_some() != payment.is_some() {
+            return Err("Current-state update must cover both wallet roles".into());
+        }
+        if let Some(payment) = &payment {
+            if vault.update.chain.as_ref().map(|c| c.block_id())
+                != payment.update.chain.as_ref().map(|c| c.block_id())
+            {
+                return Err("Wallet roles were read at different chain tips".into());
+            }
+        }
+        let mut outputs = vault.outputs;
+        let mut active_scripts = self
+            .current_state
+            .as_ref()
+            .map(|s| s.active_scripts.clone())
+            .unwrap_or_default();
+        active_scripts.extend(vault.active_scripts);
+        let payment_update = if let Some(payment) = payment {
+            for (op, output) in payment.outputs {
+                if let Some(previous) = outputs.insert(op, output.clone()) {
+                    if previous != output {
+                        return Err("Conflicting wallet-role output".into());
+                    }
+                }
+            }
+            active_scripts.extend(payment.active_scripts);
+            Some(payment.update)
+        } else {
+            None
+        };
+        let events = self.apply_sync(vault.update, payment_update)?;
+        let old = self.current_state.replace(CurrentStateSnapshot {
+            identity: self.current_state_identity(),
+            outputs,
+            active_scripts,
+        });
+        // Every advertised output must actually be owned and canonical in BDK.
+        // A server race or malformed response fails closed, never exposing a
+        // partly verified spendable balance or keeping old Ord authority alive.
+        let canonical: BTreeMap<_, _> = std::iter::once(&self.vault_wallet)
+            .chain(self.payment_wallet.iter())
+            .flat_map(|w| w.list_unspent())
+            .map(|u| (u.outpoint, u.txout))
+            .collect();
+        let valid = self
+            .current_state
+            .as_ref()
+            .unwrap()
+            .outputs
+            .iter()
+            .all(|(op, output)| canonical.get(op) == Some(output));
+        if old != self.current_state || !valid {
+            self.chain_state_generation = self.chain_state_generation.wrapping_add(1);
+            self.wallet_data_generation = self.wallet_data_generation.wrapping_add(1);
+            self.invalidate_asset_state();
+        }
+        if !valid {
+            self.current_state.as_mut().unwrap().outputs.clear();
+            self.chain_observed_at_unix = None;
+            return Err("Current outputs disagree with canonical wallet state".into());
+        }
+        self.mark_current_scripts_used();
+        Ok(events)
+    }
+}
+
+/// A complete keychain read. Transport adapters must finish the entire request
+/// before constructing this; failed/partial reads must not become empty sets.
+pub struct CurrentStateUpdate {
+    pub(crate) update: bdk_wallet::Update,
+    pub(crate) outputs: BTreeMap<OutPoint, TxOut>,
+    pub(crate) active_scripts: BTreeSet<ScriptBuf>,
+}
+
+impl CurrentStateUpdate {
+    /// Adapter boundary for non-HTTP transports. The caller must have completed
+    /// every requested script read. Core still checks each claimed output
+    /// against its funding transaction and canonical owned state on apply.
+    pub fn from_complete_read(
+        update: bdk_wallet::Update,
+        outputs: BTreeMap<OutPoint, TxOut>,
+        active_scripts: BTreeSet<ScriptBuf>,
+    ) -> Result<Self, String> {
+        for (op, output) in &outputs {
+            let tx = update
+                .tx_update
+                .txs
+                .iter()
+                .find(|tx| tx.compute_txid() == op.txid)
+                .ok_or("Missing current-output funding transaction")?;
+            if tx.output.get(op.vout as usize) != Some(output) {
+                return Err("Current-output funding transaction mismatch".into());
+            }
+        }
+        Ok(Self {
+            update,
+            outputs,
+            active_scripts,
+        })
+    }
+}
+
+/// Network or malformed-response failure. Hosts retain their existing retry
+/// scheduler and must never publish a completeness receipt on failure.
+#[derive(Debug, thiserror::Error)]
+pub enum CurrentStateError {
+    #[error(transparent)]
+    Backend(#[from] esplora_client::Error),
+    #[error("Invalid current-output response: {0}")]
+    Invalid(&'static str),
+}
+
+impl CurrentStateError {
+    /// Preserve transport/error categories for the host's bounded retry policy.
+    pub fn backend_failure(&self) -> crate::BackendFailureV1 {
+        match self {
+            Self::Backend(error) => {
+                crate::BackendFailureV1::from_esplora(error, crate::BackendOperationV1::Sync)
+            }
+            Self::Invalid(_) => crate::BackendFailureV1::invalid_response(
+                crate::BackendDependencyV1::Esplora,
+                crate::BackendOperationV1::Sync,
+            ),
+        }
+    }
+}
+
+struct ScriptRead {
+    script: ScriptBuf,
+    active: bool,
+    outputs: Vec<esplora_client::Utxo>,
+}
+
+async fn read_script(
+    client: &esplora_client::AsyncClient<SyncSleeper>,
+    script: ScriptBuf,
+) -> Result<ScriptRead, CurrentStateError> {
+    let stats = client.get_scripthash_stats(&script).await?;
+    // Never infer an empty address from a failed request. Even when the stats
+    // report no history, read UTXOs: a transaction can arrive between requests.
+    let outputs = client.get_scripthash_utxos(&script).await?;
+    let active =
+        stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0 || !outputs.is_empty();
+    Ok(ScriptRead {
+        script,
+        active,
+        outputs,
+    })
+}
+
+/// Fetch a current-state update with bounded concurrency and no `/txs` calls.
+/// A full scan retains gap-limit discovery, including spent-only addresses and
+/// change. An incremental scan covers every already-revealed script.
+pub async fn fetch_esplora(
+    client: &esplora_client::AsyncClient<SyncSleeper>,
+    request: SyncRequestType,
+    stop_gap: usize,
+    parallel_requests: usize,
+) -> Result<CurrentStateUpdate, CurrentStateError> {
+    if stop_gap == 0 || parallel_requests == 0 {
+        return Err(CurrentStateError::Invalid("zero scan bound"));
+    }
+    let parallel_requests = parallel_requests.min(8);
+    let initial_tip = client.get_tip_hash().await?;
+    let (chain_tip, start_time) = match &request {
+        SyncRequestType::Full(r) => (r.chain_tip(), r.start_time()),
+        SyncRequestType::Incremental(r) => (r.chain_tip(), r.start_time()),
+    };
+    let mut reads = Vec::new();
+    let mut last_active_indices = BTreeMap::<KeychainKind, u32>::new();
+    match request {
+        SyncRequestType::Full(mut request) => {
+            for keychain in request.keychains() {
+                let mut gap = 0usize;
+                loop {
+                    let batch: Vec<_> = request
+                        .iter_spks(keychain)
+                        .take(parallel_requests)
+                        .collect();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let results: Vec<_> =
+                        stream::iter(batch.into_iter().map(|(index, script)| async move {
+                            read_script(client, script).await.map(|read| (index, read))
+                        }))
+                        .buffered(parallel_requests)
+                        .try_collect()
+                        .await?;
+                    // Process the entire batch, including any active address
+                    // after an empty run inside it, before deciding to stop.
+                    for (index, read) in results {
+                        if read.active {
+                            gap = 0;
+                            last_active_indices.insert(keychain, index);
+                        } else {
+                            gap += 1;
+                        }
+                        reads.push(read);
+                    }
+                    if gap >= stop_gap {
+                        break;
+                    }
+                }
+            }
+        }
+        SyncRequestType::Incremental(mut request) => {
+            reads = stream::iter(
+                request
+                    .iter_spks_with_expected_txids()
+                    .map(|item| read_script(client, item.spk)),
+            )
+            .buffer_unordered(parallel_requests)
+            .try_collect()
+            .await?;
+        }
+    }
+    let mut outputs = BTreeMap::new();
+    let mut active_scripts = BTreeSet::new();
+    for read in reads {
+        if read.active {
+            active_scripts.insert(read.script.clone());
+        }
+        let mut script_outpoints = BTreeSet::new();
+        for output in read.outputs {
+            let outpoint = OutPoint::new(output.txid, output.vout);
+            if !script_outpoints.insert(outpoint) {
+                return Err(CurrentStateError::Invalid("duplicate outpoint"));
+            }
+            let txout = TxOut {
+                value: output.value,
+                script_pubkey: read.script.clone(),
+            };
+            if let Some(previous) = outputs.insert(outpoint, txout.clone()) {
+                if previous != txout {
+                    return Err(CurrentStateError::Invalid("conflicting outpoint"));
+                }
+            }
+        }
+    }
+
+    // Deliberately do NOT put scripts into this BDK request: doing so invokes
+    // its unbounded address-history traversal even for an incremental sync.
+    let mut funding = SyncRequest::<()>::builder_at(start_time).outpoints(outputs.keys().copied());
+    if let Some(tip) = chain_tip {
+        funding = funding.chain_tip(tip);
+    }
+    let response = client
+        .sync(funding.build(), parallel_requests)
+        .await
+        .map_err(|error| CurrentStateError::Backend(*error))?;
+    for (outpoint, expected) in &outputs {
+        let tx = response
+            .tx_update
+            .txs
+            .iter()
+            .find(|tx| tx.compute_txid() == outpoint.txid)
+            .ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
+        if tx.output.get(outpoint.vout as usize) != Some(expected) {
+            return Err(CurrentStateError::Invalid("funding output mismatch"));
+        }
+        if response.tx_update.txs.iter().any(|tx| {
+            tx.input
+                .iter()
+                .any(|input| input.previous_output == *outpoint)
+        }) {
+            return Err(CurrentStateError::Invalid("output spent during read"));
+        }
+    }
+    if client.get_tip_hash().await? != initial_tip {
+        return Err(CurrentStateError::Invalid("chain changed during read"));
+    }
+    let mut update: bdk_wallet::Update = response.into();
+    update.last_active_indices = last_active_indices;
+    Ok(CurrentStateUpdate {
+        update,
+        outputs,
+        active_scripts,
+    })
+}
