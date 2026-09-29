@@ -1355,6 +1355,9 @@ pub struct ZincSyncRequest {
     pub taproot: SyncRequestType,
     /// Optional payment sync request.
     pub payment: Option<SyncRequestType>,
+    /// Descriptor-bound scripts already observed with activity. These only
+    /// avoid repeat history-count reads; current UTXOs are always read afresh.
+    pub active_scripts: std::collections::BTreeSet<bitcoin::ScriptBuf>,
 }
 
 /// User-facing balance view that separates total, spendable, and inscribed value.
@@ -2640,6 +2643,11 @@ impl ZincWallet {
         ZincSyncRequest {
             taproot: vault,
             payment,
+            active_scripts: self
+                .current_state
+                .as_ref()
+                .map(|state| state.active_scripts().clone())
+                .unwrap_or_default(),
         }
     }
 

@@ -125,11 +125,142 @@ fn current_output_authority_survives_restart_without_authorizing_signing() {
     assert_eq!(restored.get_raw_balance().total().to_sat(), 50_000);
     assert!(!restored.ordinals_verified());
     assert!(restored.chain_observed_at_unix.is_none());
+    assert!(restored
+        .prepare_requests(false)
+        .active_scripts
+        .contains(&tx.output[0].script_pubkey));
     // An address with only old/spent activity must not be reused on restart.
     assert!(!restored
         .vault_wallet
         .list_unused_addresses(KeychainKind::External)
         .any(|a| a.index == 0));
+}
+
+#[test]
+fn activity_hints_cannot_cross_descriptor_identity() {
+    let mut original = wallet();
+    let tx = funding(&original);
+    original
+        .apply_current_state(update(&original, &tx, &[]), None)
+        .unwrap();
+    let mut other = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([38; 64]))
+        .build()
+        .unwrap();
+    other.restore_current_state(original.current_state.clone());
+    assert!(other.prepare_requests(false).active_scripts.is_empty());
+}
+
+#[tokio::test]
+async fn known_activity_skips_stats_and_spent_only_discovery_still_resets_gap() {
+    use crate::builder::SyncSleeper;
+    use bitcoin::hashes::sha256;
+    use serde_json::json;
+    let wallet = wallet();
+    let scripts: Vec<_> = (0..8)
+        .map(|i| wallet.peek_taproot_address(i).script_pubkey())
+        .collect();
+    let known = BTreeSet::from([scripts[0].clone()]);
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+    let tip = server
+        .mock("GET", "/blocks/tip/hash")
+        .with_body("07".repeat(32))
+        .expect(2)
+        .create_async()
+        .await;
+    let utxos = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex("^/scripthash/[^/]+/utxo$".into()),
+        )
+        .with_body("[]")
+        .expect(4)
+        .create_async()
+        .await;
+    let mut stats_mocks = Vec::new();
+    for (index, script) in scripts.iter().take(4).enumerate() {
+        let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
+        let count = usize::from(index == 1);
+        stats_mocks.push(server.mock("GET", path.as_str()).with_body(json!({
+            "chain_stats":{"tx_count":count,"funded_txo_count":count,"funded_txo_sum":0,"spent_txo_count":count,"spent_txo_sum":0},
+            "mempool_stats":{"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0}
+        }).to_string()).expect(usize::from(index != 0)).create_async().await);
+    }
+    let client = esplora_client::Builder::new(&server.url())
+        .max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>()
+        .unwrap();
+    let request = bdk_chain::spk_client::FullScanRequest::builder_at(1000)
+        .spks_for_keychain(
+            KeychainKind::External,
+            scripts.into_iter().enumerate().map(|(i, s)| (i as u32, s)),
+        )
+        .build();
+    let result = crate::current_state::fetch_esplora_with_known_activity(
+        &client,
+        crate::builder::SyncRequestType::Full(request),
+        &known,
+        2,
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(result.outputs.is_empty());
+    assert_eq!(result.active_scripts.len(), 2);
+    assert_eq!(
+        result
+            .update
+            .last_active_indices
+            .get(&KeychainKind::External),
+        Some(&1)
+    );
+    for mock in stats_mocks.into_iter().chain([tip, utxos]) {
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn known_activity_never_masks_failed_current_output_read() {
+    use crate::builder::SyncSleeper;
+    use bitcoin::hashes::sha256;
+    let script = wallet().peek_taproot_address(0).script_pubkey();
+    let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+    let tip = server
+        .mock("GET", "/blocks/tip/hash")
+        .with_body("07".repeat(32))
+        .expect(1)
+        .create_async()
+        .await;
+    let stats = server
+        .mock("GET", path.as_str())
+        .expect(0)
+        .create_async()
+        .await;
+    let utxos = server
+        .mock("GET", format!("{path}/utxo").as_str())
+        .with_status(500)
+        .expect(1)
+        .create_async()
+        .await;
+    let client = esplora_client::Builder::new(&server.url())
+        .max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>()
+        .unwrap();
+    let request = bdk_chain::spk_client::SyncRequest::builder_at(1000)
+        .spks_with_indexes([((KeychainKind::External, 0), script.clone())])
+        .build();
+    let result = crate::current_state::fetch_esplora_with_known_activity(
+        &client,
+        crate::builder::SyncRequestType::Incremental(request),
+        &BTreeSet::from([script]),
+        2,
+        1,
+    )
+    .await;
+    assert!(result.is_err());
+    for mock in [tip, stats, utxos] {
+        mock.assert_async().await;
+    }
 }
 
 #[test]
@@ -559,7 +690,7 @@ async fn high_activity_current_state_never_requests_history() {
         "chain_stats":{"tx_count":100000,"funded_txo_count":200000,"funded_txo_sum":999999999,
             "spent_txo_count":199999,"spent_txo_sum":999949999},
         "mempool_stats":{"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0}
-    }).to_string()).expect(1).create_async().await;
+    }).to_string()).expect(0).create_async().await;
     let utxos = server
         .mock("GET", format!("{path}/utxo").as_str())
         .with_body(

@@ -26,6 +26,12 @@ pub struct CurrentStateSnapshot {
     active_scripts: BTreeSet<ScriptBuf>,
 }
 
+impl CurrentStateSnapshot {
+    pub(crate) fn active_scripts(&self) -> &BTreeSet<ScriptBuf> {
+        &self.active_scripts
+    }
+}
+
 impl ZincWallet {
     pub(crate) fn current_state_identity(&self) -> String {
         let describe = |wallet: &bdk_wallet::Wallet| {
@@ -290,13 +296,19 @@ struct ScriptRead {
 async fn read_script(
     client: &esplora_client::AsyncClient<SyncSleeper>,
     script: ScriptBuf,
+    known_active: bool,
 ) -> Result<ScriptRead, CurrentStateError> {
-    let stats = client.get_scripthash_stats(&script).await?;
-    // Never infer an empty address from a failed request. Even when the stats
-    // report no history, read UTXOs: a transaction can arrive between requests.
+    // Current outputs are never cached, including for historically used
+    // scripts. An empty response does not erase the fact an address was used.
     let outputs = client.get_scripthash_utxos(&script).await?;
-    let active =
-        stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0 || !outputs.is_empty();
+    let active = if known_active || !outputs.is_empty() {
+        true
+    } else {
+        // A spent-only address must still reset the discovery gap. No activity
+        // is inferred from an unsuccessful stats or UTXO read.
+        let stats = client.get_scripthash_stats(&script).await?;
+        stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0
+    };
     Ok(ScriptRead {
         script,
         active,
@@ -310,6 +322,26 @@ async fn read_script(
 pub async fn fetch_esplora(
     client: &esplora_client::AsyncClient<SyncSleeper>,
     request: SyncRequestType,
+    stop_gap: usize,
+    parallel_requests: usize,
+) -> Result<CurrentStateUpdate, CurrentStateError> {
+    fetch_esplora_with_known_activity(
+        client,
+        request,
+        &BTreeSet::new(),
+        stop_gap,
+        parallel_requests,
+    )
+    .await
+}
+
+/// Reuse descriptor-bound, previously observed activity as conservative gap
+/// evidence. These hints never supply outputs, confirmation state or signing
+/// authority. The caller obtains them from `ZincWallet::prepare_requests`.
+pub async fn fetch_esplora_with_known_activity(
+    client: &esplora_client::AsyncClient<SyncSleeper>,
+    request: SyncRequestType,
+    known_active_scripts: &BTreeSet<ScriptBuf>,
     stop_gap: usize,
     parallel_requests: usize,
 ) -> Result<CurrentStateUpdate, CurrentStateError> {
@@ -340,7 +372,10 @@ pub async fn fetch_esplora(
                     }
                     let results: Vec<_> =
                         stream::iter(batch.into_iter().map(|(index, script)| async move {
-                            read_script(client, script).await.map(|read| (index, read))
+                            let known_active = known_active_scripts.contains(&script);
+                            read_script(client, script, known_active)
+                                .await
+                                .map(|read| (index, read))
                         }))
                         .buffered(parallel_requests)
                         .try_collect()
@@ -368,11 +403,10 @@ pub async fn fetch_esplora(
         }
         SyncRequestType::Incremental(mut request) => {
             monitored_txids.extend(request.iter_txids());
-            reads = stream::iter(
-                request
-                    .iter_spks_with_expected_txids()
-                    .map(|item| read_script(client, item.spk)),
-            )
+            reads = stream::iter(request.iter_spks_with_expected_txids().map(|item| {
+                let known_active = known_active_scripts.contains(&item.spk);
+                read_script(client, item.spk, known_active)
+            }))
             .buffer_unordered(parallel_requests)
             .try_collect()
             .await?;

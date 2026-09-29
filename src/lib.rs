@@ -2592,10 +2592,15 @@ impl ZincWasmWallet {
             };
 
             // 2. Fetch (NO LOCK HELD)
-            let vault_update_res =
-                crate::current_state::fetch_esplora(&client, sync_req.taproot, 20, 5)
-                    .await
-                    .map_err(|error| error.backend_failure());
+            let vault_update_res = crate::current_state::fetch_esplora_with_known_activity(
+                &client,
+                sync_req.taproot,
+                &sync_req.active_scripts,
+                20,
+                5,
+            )
+            .await
+            .map_err(|error| error.backend_failure());
 
             let vault_update = match vault_update_res {
                 Ok(u) => u,
@@ -2619,9 +2624,15 @@ impl ZincWasmWallet {
             };
 
             let payment_update = if let Some(req_type) = sync_req.payment {
-                let update_res = crate::current_state::fetch_esplora(&client, req_type, 20, 5)
-                    .await
-                    .map_err(|error| error.backend_failure());
+                let update_res = crate::current_state::fetch_esplora_with_known_activity(
+                    &client,
+                    req_type,
+                    &sync_req.active_scripts,
+                    20,
+                    5,
+                )
+                .await
+                .map_err(|error| error.backend_failure());
 
                 match update_res {
                     Ok(u) => Some(u),
