@@ -46,10 +46,7 @@ fn script_path(script: &bitcoin::Script) -> String {
     format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()))
 }
 
-async fn empty_change(
-    server: &mut mockito::Server,
-    wallet: &ZincWallet,
-) -> Vec<mockito::Mock> {
+async fn empty_change(server: &mut mockito::Server, wallet: &ZincWallet) -> Vec<mockito::Mock> {
     let mut mocks = Vec::new();
     for w in std::iter::once(&wallet.vault_wallet).chain(wallet.payment_wallet.iter()) {
         let script = w
@@ -57,7 +54,43 @@ async fn empty_change(
             .script_pubkey();
         mocks.push(
             server
-                .mock("GET", format!("{}/txs", script_path(&script)).as_str())
+                .mock(
+                    "GET",
+                    format!("{}/txs/mempool", script_path(&script)).as_str(),
+                )
+                .with_body("[]")
+                .create_async()
+                .await,
+        );
+        mocks.push(
+            server
+                .mock(
+                    "GET",
+                    format!("{}/txs/chain", script_path(&script)).as_str(),
+                )
+                .with_body("[]")
+                .create_async()
+                .await,
+        );
+    }
+    mocks
+}
+
+async fn empty_external_pending(
+    server: &mut mockito::Server,
+    wallet: &ZincWallet,
+) -> Vec<mockito::Mock> {
+    let mut mocks = Vec::new();
+    for w in std::iter::once(&wallet.vault_wallet).chain(wallet.payment_wallet.iter()) {
+        let script = w
+            .peek_address(bdk_wallet::KeychainKind::External, 0)
+            .script_pubkey();
+        mocks.push(
+            server
+                .mock(
+                    "GET",
+                    format!("{}/txs/mempool", script_path(&script)).as_str(),
+                )
                 .with_body("[]")
                 .create_async()
                 .await,
@@ -71,13 +104,14 @@ async fn twenty_rows_fetch_one_wire_page_and_reuse_five_extras() {
     let mut wallet = wallet();
     let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
+    let _pending = empty_external_pending(&mut server, &wallet).await;
     let path = script_path(&wallet.peek_taproot_address(0).script_pubkey());
     let rows: Vec<_> = (76..=100)
         .rev()
         .map(|height| tx(&wallet, height, false))
         .collect();
     let first = server
-        .mock("GET", format!("{path}/txs").as_str())
+        .mock("GET", format!("{path}/txs/chain").as_str())
         .with_body(json!(rows).to_string())
         .expect(1)
         .create_async()
@@ -125,6 +159,7 @@ async fn dual_address_transactions_are_merged_without_double_counting() {
         .unwrap();
     let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
+    let _pending = empty_external_pending(&mut server, &wallet).await;
     let rows: Vec<_> = (1..=10)
         .rev()
         .map(|height| tx(&wallet, height, true))
@@ -138,7 +173,7 @@ async fn dual_address_transactions_are_merged_without_double_counting() {
             server
                 .mock(
                     "GET",
-                    format!("{}/txs", script_path(&address.script_pubkey())).as_str(),
+                    format!("{}/txs/chain", script_path(&address.script_pubkey())).as_str(),
                 )
                 .with_body(json!(rows).to_string())
                 .expect(1)
@@ -192,13 +227,14 @@ async fn continuation_fetches_only_the_next_wire_page_and_replays_without_networ
     let mut wallet = wallet();
     let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
+    let _pending = empty_external_pending(&mut server, &wallet).await;
     let path = script_path(&wallet.peek_taproot_address(0).script_pubkey());
     let rows: Vec<_> = (76..=100)
         .rev()
         .map(|height| tx(&wallet, height, false))
         .collect();
     let first = server
-        .mock("GET", format!("{path}/txs").as_str())
+        .mock("GET", format!("{path}/txs/chain").as_str())
         .with_body(json!(rows).to_string())
         .expect(1)
         .create_async()
@@ -263,13 +299,14 @@ async fn malformed_activity_cannot_create_spend_authority() {
     let mut wallet = wallet();
     let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
+    let _pending = empty_external_pending(&mut server, &wallet).await;
     let mut row = tx(&wallet, 100, false);
     row["vout"][0]["value"] = json!(999999);
     let _bad = server
         .mock(
             "GET",
             format!(
-                "{}/txs",
+                "{}/txs/chain",
                 script_path(&wallet.peek_taproot_address(0).script_pubkey())
             )
             .as_str(),
@@ -290,4 +327,166 @@ async fn malformed_activity_cannot_create_spend_authority() {
     assert_eq!(wallet.get_raw_balance().total().to_sat(), 0);
     assert!(wallet.chain_observed_at_unix.is_none());
     assert!(!wallet.ordinals_verified());
+}
+
+#[tokio::test]
+async fn full_mempool_does_not_hide_confirmed_history_or_trigger_unbounded_reads() {
+    let mut wallet = wallet();
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+    let _empty = empty_change(&mut server, &wallet).await;
+    let path = script_path(&wallet.peek_taproot_address(0).script_pubkey());
+    let pending: Vec<_> = (101..=150)
+        .rev()
+        .map(|height| {
+            let mut row = tx(&wallet, height, false);
+            row["status"] = json!({"confirmed": false});
+            row
+        })
+        .collect();
+    let confirmed: Vec<_> = (74..=100)
+        .rev()
+        .map(|height| tx(&wallet, height, false))
+        .collect();
+    let mixed = server
+        .mock("GET", format!("{path}/txs").as_str())
+        .with_body(json!(confirmed).to_string())
+        .expect(0)
+        .create_async()
+        .await;
+    let mempool = server
+        .mock("GET", format!("{path}/txs/mempool").as_str())
+        .with_body(json!(pending).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let first = server
+        .mock("GET", format!("{path}/txs/chain").as_str())
+        .with_body(json!(&confirmed[..25]).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let next = server
+        .mock(
+            "GET",
+            format!(
+                "{path}/txs/chain/{}",
+                confirmed[24]["txid"].as_str().unwrap()
+            )
+            .as_str(),
+        )
+        .with_body(json!(&confirmed[25..]).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let client = esplora_client::Builder::new(&server.url())
+        .max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>()
+        .unwrap();
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    loop {
+        let (pager, page) = wallet
+            .prepare_activity_page(&server.url(), cursor.as_deref())
+            .unwrap()
+            .fetch(&client, 20)
+            .await
+            .unwrap();
+        assert!(page.items.len() <= 20);
+        ids.extend(page.items.iter().map(|item| item.txid.clone()));
+        cursor = page.next_cursor.clone();
+        let more = page.has_more;
+        wallet.retain_activity_page(pager, &page).unwrap();
+        if !more {
+            break;
+        }
+        assert!(ids.len() < 80);
+    }
+    let mut expected: Vec<_> = pending
+        .iter()
+        .chain(&confirmed)
+        .map(|row| row["txid"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort();
+    expected.sort();
+    assert_eq!(ids, expected);
+    for mock in [mixed, mempool, first, next] {
+        mock.assert_async().await;
+    }
+    assert_eq!(wallet.get_raw_balance().total().to_sat(), 0);
+    assert!(!wallet.ordinals_verified());
+}
+
+#[tokio::test]
+async fn confirmation_between_pending_and_chain_reads_is_deduplicated() {
+    let mut wallet = wallet();
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+    let _empty = empty_change(&mut server, &wallet).await;
+    let path = script_path(&wallet.peek_taproot_address(0).script_pubkey());
+    let confirmed = tx(&wallet, 100, false);
+    let mut pending = confirmed.clone();
+    pending["status"] = json!({"confirmed":false});
+    let _pending = server
+        .mock("GET", format!("{path}/txs/mempool").as_str())
+        .with_body(json!([pending]).to_string())
+        .create_async()
+        .await;
+    let _chain = server
+        .mock("GET", format!("{path}/txs/chain").as_str())
+        .with_body(json!([confirmed]).to_string())
+        .create_async()
+        .await;
+    let client = esplora_client::Builder::new(&server.url())
+        .max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>()
+        .unwrap();
+    let (_, page) = wallet
+        .prepare_activity_page(&server.url(), None)
+        .unwrap()
+        .fetch(&client, 20)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(!page.has_more);
+}
+
+#[tokio::test]
+async fn oversized_pending_or_confirmed_pages_are_rejected() {
+    for (pending_count, confirmed_count) in [(51, 0), (0, 26)] {
+        let mut wallet = wallet();
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let _empty = empty_change(&mut server, &wallet).await;
+        let path = script_path(&wallet.peek_taproot_address(0).script_pubkey());
+        let pending: Vec<_> = (101..101 + pending_count)
+            .map(|height| {
+                let mut row = tx(&wallet, height, false);
+                row["status"] = json!({"confirmed":false});
+                row
+            })
+            .collect();
+        let confirmed: Vec<_> = (1..=confirmed_count)
+            .map(|height| tx(&wallet, height, false))
+            .collect();
+        let _pending = server
+            .mock("GET", format!("{path}/txs/mempool").as_str())
+            .with_body(json!(pending).to_string())
+            .create_async()
+            .await;
+        let _chain = server
+            .mock("GET", format!("{path}/txs/chain").as_str())
+            .with_body(json!(confirmed).to_string())
+            .create_async()
+            .await;
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .unwrap();
+        assert!(wallet
+            .prepare_activity_page(&server.url(), None)
+            .unwrap()
+            .fetch(&client, 20)
+            .await
+            .is_err());
+        assert_eq!(wallet.get_raw_balance().total().to_sat(), 0);
+        assert!(!wallet.ordinals_verified());
+    }
 }

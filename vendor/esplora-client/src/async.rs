@@ -506,6 +506,21 @@ impl<S: Sleeper> AsyncClient<S> {
         self.get_response_json(&path).await
     }
 
+    /// Get one confirmed-history page without relying on the provider-specific
+    /// mixed mempool/chain first-page limit. Never follows the cursor itself.
+    pub async fn scripthash_txs_chain(
+        &self,
+        script: &Script,
+        last_seen: Option<Txid>,
+    ) -> Result<Vec<Tx>, Error> {
+        let script_hash = sha256::Hash::hash(script.as_bytes());
+        let path = match last_seen {
+            Some(last_seen) => format!("/scripthash/{script_hash:x}/txs/chain/{last_seen}"),
+            None => format!("/scripthash/{script_hash:x}/txs/chain"),
+        };
+        self.get_response_json(&path).await
+    }
+
     /// Get statistics about the mempool.
     pub async fn get_mempool_stats(&self) -> Result<MempoolStats, Error> {
         self.get_response_json("/mempool").await

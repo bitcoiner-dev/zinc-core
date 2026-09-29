@@ -162,17 +162,37 @@ impl ActivityPager {
             .collect();
         let filled: Vec<_> =
             stream::iter(empty.into_iter().map(|(index, mut source)| async move {
-                let txs = client
-                    .scripthash_txs(&source.script, source.after)
+                // The mixed /txs endpoint is not a portable page boundary:
+                // mempool-electrs can fill its whole first page with confirmed
+                // rows (or with pending rows and no confirmed history). Read
+                // each bounded stream explicitly, once for mempool and then
+                // one confirmed page at a time.
+                let mut txs = if !source.started {
+                    client
+                        .get_mempool_scripthash_txs(&source.script)
+                        .await
+                        .map_err(|_| "Activity provider unavailable; try again later".to_string())?
+                } else {
+                    Vec::new()
+                };
+                if txs.len() > 50 || txs.iter().any(|tx| tx.status.confirmed) {
+                    return Err("Invalid pending Activity page".to_string());
+                }
+                let chain = client
+                    .scripthash_txs_chain(&source.script, source.after)
                     .await
                     .map_err(|_| "Activity provider unavailable; try again later".to_string())?;
-                let confirmed = txs.iter().filter(|tx| tx.status.confirmed).count();
-                if confirmed > 25 || txs.len().saturating_sub(confirmed) > 50 {
+                let confirmed = chain.len();
+                if confirmed > 25 {
                     return Err("Activity provider exceeded its page bound".into());
                 }
-                if source.started && txs.iter().any(|tx| !tx.status.confirmed) {
+                if chain.iter().any(|tx| !tx.status.confirmed) {
                     return Err("Confirmed history page contained pending transactions".to_string());
                 }
+                // Confirmation can happen between the two reads. Prefer the
+                // confirmed copy, while still validating every returned row.
+                let confirmed_ids: BTreeSet<_> = chain.iter().map(|tx| tx.txid).collect();
+                txs.extend(chain);
                 let mut unique = BTreeSet::new();
                 for tx in &txs {
                     if tx.status.confirmed
@@ -182,7 +202,9 @@ impl ActivityPager {
                     {
                         return Err("Confirmed Activity response is missing block metadata".into());
                     }
-                    if tx.to_tx().compute_txid() != tx.txid || !unique.insert(tx.txid) {
+                    if tx.to_tx().compute_txid() != tx.txid
+                        || !unique.insert((tx.txid, tx.status.confirmed))
+                    {
                         return Err("Invalid transaction in Activity response".to_string());
                     }
                     if !tx.vout.iter().any(|out| out.scriptpubkey == source.script)
@@ -196,8 +218,9 @@ impl ActivityPager {
                         return Err("Activity response does not match requested script".to_string());
                     }
                 }
-                // Esplora's wire page is fixed at 25 confirmed rows (the first
-                // page may also include pending rows). Keep extras for next time.
+                txs.retain(|tx| tx.status.confirmed || !confirmed_ids.contains(&tx.txid));
+                // Confirmed wire pages contain at most 25 rows. Keep extras
+                // (including pending rows) buffered for the next UI page.
                 if let Some(last) = txs.iter().rev().find(|tx| tx.status.confirmed) {
                     if source.after == Some(last.txid) {
                         return Err("Activity cursor did not advance".into());
