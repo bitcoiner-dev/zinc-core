@@ -126,15 +126,20 @@ mod tests {
     }
 
     #[test]
-    fn discovery_tracker_publishes_only_monotonic_active_frontiers() {
+    fn discovery_tracker_reports_empty_probe_progress_without_expanding_active_frontier() {
         let mut tracker = crate::AccountDiscoveryTracker::default();
 
-        assert_eq!(tracker.record_probe(0, true), None);
-        assert_eq!(tracker.record_probe(1, false), None);
-        assert_eq!(tracker.record_probe(2, true), Some(3));
+        assert_eq!(tracker.record_probe(0, true), 1);
+        assert_eq!(tracker.record_probe(1, false), 1);
+        assert_eq!(tracker.record_probe(2, true), 3);
         assert_eq!(tracker.discovered_count(), 3);
         assert_eq!(tracker.scanned_accounts, 3);
         assert!(!tracker.gap_reached(2));
+        for index in 3..23 {
+            assert_eq!(tracker.record_probe(index, false), 3);
+        }
+        assert!(tracker.gap_reached(20));
+        assert_eq!(tracker.scanned_accounts, 23);
     }
 
     #[test]

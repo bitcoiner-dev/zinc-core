@@ -842,21 +842,21 @@ struct AccountDiscoveryTracker {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl AccountDiscoveryTracker {
-    fn record_probe(&mut self, account_index: u32, active: bool) -> Option<u32> {
+    fn record_probe(&mut self, account_index: u32, active: bool) -> u32 {
         self.scanned_accounts = self.scanned_accounts.saturating_add(1);
         if active {
-            let previous = self.discovered_count();
             self.max_active_index = Some(
                 self.max_active_index
                     .map_or(account_index, |current| current.max(account_index)),
             );
             self.current_gap = 0;
-            let next = self.discovered_count();
-            return (next > previous).then_some(next);
+        } else {
+            self.current_gap = self.current_gap.saturating_add(1);
         }
-
-        self.current_gap = self.current_gap.saturating_add(1);
-        None
+        // A completed empty probe is progress too. Consumers use the callback
+        // as an inactivity heartbeat while scanning the trailing unused gap;
+        // only the discovered count controls which accounts may be published.
+        self.discovered_count()
     }
 
     fn discovered_count(&self) -> u32 {
@@ -2853,20 +2853,19 @@ impl ZincWasmWallet {
                     }
                 };
 
-                if let Some(discovered_count) = tracker.record_probe(account_index, has_activity) {
-                    if let Some(callback) = on_progress.as_ref() {
-                        let progress = AccountDiscoveryProgressV1 {
-                            version: ACCOUNT_DISCOVERY_SCHEMA_V1,
-                            scanned_account_index: account_index,
-                            discovered_count,
-                        };
-                        if let Ok(value) = serde_wasm_bindgen::to_value(&progress) {
-                            if callback.call1(&JsValue::UNDEFINED, &value).is_err() {
-                                zinc_log_warn!(
-                                    target: LOG_TARGET_WASM,
-                                    "discover_accounts progress callback failed"
-                                );
-                            }
+                let discovered_count = tracker.record_probe(account_index, has_activity);
+                if let Some(callback) = on_progress.as_ref() {
+                    let progress = AccountDiscoveryProgressV1 {
+                        version: ACCOUNT_DISCOVERY_SCHEMA_V1,
+                        scanned_account_index: account_index,
+                        discovered_count,
+                    };
+                    if let Ok(value) = serde_wasm_bindgen::to_value(&progress) {
+                        if callback.call1(&JsValue::UNDEFINED, &value).is_err() {
+                            zinc_log_warn!(
+                                target: LOG_TARGET_WASM,
+                                "discover_accounts progress callback failed"
+                            );
                         }
                     }
                 }
