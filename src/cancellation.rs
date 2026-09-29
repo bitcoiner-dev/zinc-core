@@ -54,7 +54,7 @@ mod targeted_tests {
             ..parent.clone()
         };
         let txid = target.compute_txid();
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let original = server.mock("GET",format!("/tx/{txid}").as_str()).with_body(json!({
             "txid":txid,"version":2,"locktime":0,"vin":[{
                 "txid":parent.compute_txid(),"vout":0,"scriptsig":"","sequence":target.input[0].sequence.to_consensus_u32(),"is_coinbase":false}],

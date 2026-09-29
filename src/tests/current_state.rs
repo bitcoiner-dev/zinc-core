@@ -473,7 +473,7 @@ async fn full_rescan_covers_revealed_addresses_before_applying_stop_gap() {
     use serde_json::json;
     for (last_revealed, expected_reads) in [(None, 5), (Some(12), 20)] {
         let wallet = wallet();
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let history = server
             .mock(
                 "GET",
@@ -539,7 +539,7 @@ async fn high_activity_current_state_never_requests_history() {
     let tx = funding(&wallet);
     let script = tx.output[0].script_pubkey.clone();
     let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
-    let mut server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let history = server
         .mock(
             "GET",

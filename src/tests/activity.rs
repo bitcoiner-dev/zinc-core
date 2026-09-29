@@ -47,7 +47,7 @@ fn script_path(script: &bitcoin::Script) -> String {
 }
 
 async fn empty_change(
-    server: &mut mockito::ServerGuard,
+    server: &mut mockito::Server,
     wallet: &ZincWallet,
 ) -> Vec<mockito::Mock> {
     let mut mocks = Vec::new();
@@ -69,7 +69,7 @@ async fn empty_change(
 #[tokio::test]
 async fn twenty_rows_fetch_one_wire_page_and_reuse_five_extras() {
     let mut wallet = wallet();
-    let mut server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
     let path = script_path(&wallet.peek_taproot_address(0).script_pubkey());
     let rows: Vec<_> = (76..=100)
@@ -123,7 +123,7 @@ async fn dual_address_transactions_are_merged_without_double_counting() {
         .with_scheme(crate::AddressScheme::Dual)
         .build()
         .unwrap();
-    let mut server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
     let rows: Vec<_> = (1..=10)
         .rev()
@@ -190,7 +190,7 @@ async fn cursors_reject_other_backend_and_retired_account_generation() {
 #[tokio::test]
 async fn continuation_fetches_only_the_next_wire_page_and_replays_without_network() {
     let mut wallet = wallet();
-    let mut server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
     let path = script_path(&wallet.peek_taproot_address(0).script_pubkey());
     let rows: Vec<_> = (76..=100)
@@ -261,7 +261,7 @@ async fn continuation_fetches_only_the_next_wire_page_and_replays_without_networ
 #[tokio::test]
 async fn malformed_activity_cannot_create_spend_authority() {
     let mut wallet = wallet();
-    let mut server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let _empty = empty_change(&mut server, &wallet).await;
     let mut row = tx(&wallet, 100, false);
     row["vout"][0]["value"] = json!(999999);

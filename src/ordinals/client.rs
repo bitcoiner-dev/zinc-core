@@ -15,7 +15,7 @@ async fn send_ord_request(
     request: reqwest::RequestBuilder,
     operation: BackendOperationV1,
 ) -> Result<reqwest::Response, OrdError> {
-    request.send().await.map_err(|error| {
+    crate::backend_pacing::send(request).await.map_err(|error| {
         BackendFailureV1::from_reqwest(&error, BackendDependencyV1::Ord, operation).into()
     })
 }
@@ -1302,7 +1302,7 @@ mod tests {
 
     #[tokio::test]
     async fn address_404_is_characterized_as_an_empty_asset_snapshot() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let mock = server
             .mock("GET", "/address/bc1ptest")
             .with_status(404)
@@ -1323,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn ord_rate_limit_preserves_status_and_bounded_retry_after() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let mock = server
             .mock("GET", "/blockheight")
             .with_status(429)
@@ -1349,7 +1349,7 @@ mod tests {
 
     #[tokio::test]
     async fn ord_service_unavailable_is_not_retried_by_the_client() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let mock = server
             .mock("GET", "/blockheight")
             .with_status(503)
@@ -1372,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_blockheight_is_typed_invalid_response() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let mock = server
             .mock("GET", "/blockheight")
             .with_status(200)
@@ -1395,7 +1395,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_address_json_is_typed_invalid_response() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let mock = server
             .mock("GET", "/address/bc1ptest")
             .with_status(200)
@@ -1419,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_bulk_outputs_fail_closed() {
         let outpoint = "6fb976ab49dcec017f1e201e84395983204ae1a7c2abf7ced0a85d692e442799:0";
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let mock = server
             .mock("POST", "/outputs")
             .with_status(200)
@@ -1683,7 +1683,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn get_inscription_content_fetches_body_and_content_type() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let _mock = server
             .mock("GET", "/content/abc123i0")
             .with_status(200)

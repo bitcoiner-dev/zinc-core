@@ -36,9 +36,10 @@ pub const MAX_DISCOVERY_ACCOUNTS: u32 = 100;
 mod logging;
 
 // Core modules
-pub mod backend_error;
 /// Backend-paginated Activity reads, separate from current-state sync.
 pub mod activity;
+pub mod backend_error;
+pub mod backend_pacing;
 pub mod backend_receipt;
 pub mod builder;
 pub mod cancellation;
@@ -547,7 +548,7 @@ async fn fetch_addr_stats(
     let mut balance = 0u64;
     let mut has_history = false;
 
-    if let Ok(resp) = client.get(&url).send().await {
+    if let Ok(resp) = backend_pacing::send(client.get(&url)).await {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             let chain_stats = &json["chain_stats"];
             let mempool_stats = &json["mempool_stats"];
@@ -573,11 +574,12 @@ async fn fetch_addr_stats(
     // 2. Get Inscriptions from Ord
     let mut inscriptions = Vec::new();
     let ord_addr_url = format!("{ord_url}/address/{address}");
-    if let Ok(resp) = client
-        .get(&ord_addr_url)
-        .header("Accept", "application/json")
-        .send()
-        .await
+    if let Ok(resp) = backend_pacing::send(
+        client
+            .get(&ord_addr_url)
+            .header("Accept", "application/json"),
+    )
+    .await
     {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             // Handle different JSON structures: { "inscriptions": [...] } or direct array [...]
@@ -700,7 +702,7 @@ async fn probe_esplora_address_activity(
     let request_timeout_ms = remaining_ms
         .min(f64::from(ACCOUNT_DISCOVERY_ADDRESS_REQUEST_TIMEOUT_MS))
         .ceil() as u32;
-    let request = client.get(&url).send();
+    let request = backend_pacing::send(client.get(&url));
     let timeout = gloo_timers::future::TimeoutFuture::new(request_timeout_ms.max(1));
     futures_util::pin_mut!(request);
     futures_util::pin_mut!(timeout);
@@ -2401,20 +2403,35 @@ impl ZincWasmWallet {
     /// Fetch a backend-paginated Activity page without a full wallet scan.
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = fetchTransactionPage)]
-    pub fn fetch_transaction_page(&self, esplora_url: String, limit: usize, cursor: Option<String>)
-        -> Result<js_sys::Promise, JsValue> {
+    pub fn fetch_transaction_page(
+        &self,
+        esplora_url: String,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
-        let pager = self.inner.try_borrow_mut().map_err(|_|JsValue::from_str("Wallet busy"))?
-            .prepare_activity_page(&esplora_url, cursor.as_deref()).map_err(|e|JsValue::from_str(&e))?;
+        let pager = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| JsValue::from_str("Wallet busy"))?
+            .prepare_activity_page(&esplora_url, cursor.as_deref())
+            .map_err(|e| JsValue::from_str(&e))?;
         let inner = self.inner.clone();
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             let client = crate::builder::configured_esplora_client(&esplora_url)
-                .map_err(|e|JsValue::from_str(&e.to_string()))?;
-            let (pager, mut page) = pager.fetch(&client, limit).await.map_err(|e|JsValue::from_str(&e))?;
-            let mut wallet = inner.try_borrow_mut().map_err(|_|JsValue::from_str("Wallet busy"))?;
-            wallet.retain_activity_page(pager, &page).map_err(|e|JsValue::from_str(&e))?;
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let (pager, mut page) = pager
+                .fetch(&client, limit)
+                .await
+                .map_err(|e| JsValue::from_str(&e))?;
+            let mut wallet = inner
+                .try_borrow_mut()
+                .map_err(|_| JsValue::from_str("Wallet busy"))?;
+            wallet
+                .retain_activity_page(pager, &page)
+                .map_err(|e| JsValue::from_str(&e))?;
             wallet.annotate_activity_page(&mut page);
-            serde_wasm_bindgen::to_value(&page).map_err(|e|JsValue::from_str(&e.to_string()))
+            serde_wasm_bindgen::to_value(&page).map_err(|e| JsValue::from_str(&e.to_string()))
         }))
     }
 
@@ -2575,8 +2592,10 @@ impl ZincWasmWallet {
             };
 
             // 2. Fetch (NO LOCK HELD)
-            let vault_update_res = crate::current_state::fetch_esplora(&client, sync_req.taproot, 20, 5)
-                .await.map_err(|error| error.backend_failure());
+            let vault_update_res =
+                crate::current_state::fetch_esplora(&client, sync_req.taproot, 20, 5)
+                    .await
+                    .map_err(|error| error.backend_failure());
 
             let vault_update = match vault_update_res {
                 Ok(u) => u,
@@ -2599,11 +2618,10 @@ impl ZincWasmWallet {
                 }
             };
 
-            let payment_update = if let Some(req_type) =
-                sync_req.payment
-            {
+            let payment_update = if let Some(req_type) = sync_req.payment {
                 let update_res = crate::current_state::fetch_esplora(&client, req_type, 20, 5)
-                    .await.map_err(|error| error.backend_failure());
+                    .await
+                    .map_err(|error| error.backend_failure());
 
                 match update_res {
                     Ok(u) => Some(u),
@@ -3340,16 +3358,25 @@ impl ZincWasmWallet {
         let inner_rc = self.inner.clone();
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             let (account, chain, needs_target) = {
-                let inner = inner_rc.try_borrow().map_err(|_| JsValue::from_str("Wallet busy"))?;
-                (inner.account_generation(), inner.chain_state_generation(),
-                    inner.cancellation_input_snapshot(original_txid).is_err())
+                let inner = inner_rc
+                    .try_borrow()
+                    .map_err(|_| JsValue::from_str("Wallet busy"))?;
+                (
+                    inner.account_generation(),
+                    inner.chain_state_generation(),
+                    inner.cancellation_input_snapshot(original_txid).is_err(),
+                )
             };
             if needs_target {
                 let client = crate::builder::configured_esplora_client(&esplora_url)
                     .map_err(|error| JsValue::from_str(&error.to_string()))?;
-                let target = crate::cancellation::CancellationTargetRead::fetch(&client, original_txid).await
-                    .map_err(|error| JsValue::from_str(&error))?;
-                inner_rc.try_borrow_mut().map_err(|_| JsValue::from_str("Wallet busy"))?
+                let target =
+                    crate::cancellation::CancellationTargetRead::fetch(&client, original_txid)
+                        .await
+                        .map_err(|error| JsValue::from_str(&error))?;
+                inner_rc
+                    .try_borrow_mut()
+                    .map_err(|_| JsValue::from_str("Wallet busy"))?
                     .retain_cancellation_target(target, account, chain)
                     .map_err(|error| JsValue::from_str(&error))?;
             }

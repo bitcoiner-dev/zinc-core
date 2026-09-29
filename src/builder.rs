@@ -1011,6 +1011,14 @@ unsafe impl Send for WasmSleep {}
 
 #[cfg(target_arch = "wasm32")]
 impl esplora_client::Sleeper for WasmSleeper {
+    fn before_request(
+        url: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(crate::backend_pacing::before_request(url))
+    }
+    fn after_response(url: &str, status: u16, retry_after: Option<&str>) {
+        crate::backend_pacing::after_response(url, status, retry_after);
+    }
     type Sleep = WasmSleep;
     fn sleep(dur: std::time::Duration) -> Self::Sleep {
         WasmSleep(gloo_timers::future::TimeoutFuture::new(
@@ -1029,6 +1037,14 @@ pub struct TokioSleeper;
 
 #[cfg(not(target_arch = "wasm32"))]
 impl esplora_client::Sleeper for TokioSleeper {
+    fn before_request(
+        url: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(crate::backend_pacing::before_request(url))
+    }
+    fn after_response(url: &str, status: u16, retry_after: Option<&str>) {
+        crate::backend_pacing::after_response(url, status, retry_after);
+    }
     type Sleep = tokio::time::Sleep;
     fn sleep(dur: std::time::Duration) -> Self::Sleep {
         tokio::time::sleep(dur)
@@ -1831,7 +1847,8 @@ impl ZincWallet {
         for (wallet, payment) in std::iter::once((&self.vault_wallet, false))
             .chain(self.payment_wallet.as_ref().map(|wallet| (wallet, true)))
         {
-            for unspent in self.current_unspent(wallet)
+            for unspent in self
+                .current_unspent(wallet)
                 .filter(|utxo| input_outpoints.contains(&utxo.outpoint))
             {
                 let descriptor_slot = slot(payment, unspent.keychain);
@@ -2845,20 +2862,21 @@ impl ZincWallet {
         let parallel_requests = 5;
 
         // 1. Sync Vault
-        let vault_update = crate::current_state::fetch_esplora(&client, requests.taproot, stop_gap, parallel_requests)
-            .await
-            .map_err(|error| {
-                serialize_backend_failure(&error.backend_failure())
-            })?;
+        let vault_update = crate::current_state::fetch_esplora(
+            &client,
+            requests.taproot,
+            stop_gap,
+            parallel_requests,
+        )
+        .await
+        .map_err(|error| serialize_backend_failure(&error.backend_failure()))?;
 
         // 2. Sync Payment (if exists)
         let payment_update = if let Some(req) = requests.payment {
             Some(
                 crate::current_state::fetch_esplora(&client, req, stop_gap, parallel_requests)
                     .await
-                    .map_err(|error| {
-                        serialize_backend_failure(&error.backend_failure())
-                    })?,
+                    .map_err(|error| serialize_backend_failure(&error.backend_failure()))?,
             )
         } else {
             None
@@ -9317,7 +9335,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_esplora_client_revalidates_chain_reads() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let client = configured_esplora_client(&server.url()).expect("client");
         let first = server
             .mock("GET", "/blocks/tip/height")
@@ -9344,7 +9362,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_esplora_client_never_hides_http_retries() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let tip = server
             .mock("GET", "/blocks/tip/height")
             .with_status(503)
@@ -9359,7 +9377,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_esplora_broadcast_returns_the_local_txid() {
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let broadcast = server
             .mock("POST", "/tx")
             .with_status(400)
@@ -9395,7 +9413,7 @@ mod tests {
             output: Vec::new(),
         };
         let expected_txid = tx.compute_txid();
-        let mut server = mockito::Server::new_async().await;
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let broadcast = server
             .mock("POST", "/tx")
             .with_status(503)

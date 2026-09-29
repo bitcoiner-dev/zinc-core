@@ -569,7 +569,7 @@ mod tests {
             } else {
                 serde_json::json!([output])
             };
-            let mut server = mockito::Server::new_async().await;
+            let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
             let request = server
                 .mock("POST", "/outputs")
                 .match_body(mockito::Matcher::Json(serde_json::json!([

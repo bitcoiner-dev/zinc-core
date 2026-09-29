@@ -23,6 +23,7 @@ include = [
     "src/**",
     "tests/**",
     "examples/**",
+    "vendor/esplora-client/**",
 ]
 
 [workspace]
@@ -31,6 +32,7 @@ include = [
 # reorg. Pin the compatible backport, not a moving branch. bdk_core must use
 # the same source as bdk_chain so all adapters share its request/update types.
 [patch.crates-io]
+esplora-client = { path = "vendor/esplora-client" }
 bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", rev = "c211596ffb9ed21d47bb7c6a1511568f1038bb10" }
 bdk_core = { git = "https://github.com/bitcoindevkit/bdk", rev = "c211596ffb9ed21d47bb7c6a1511568f1038bb10" }
 
@@ -47,6 +49,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 log = "0.4"
+web-time = "1.1.0"
 
 # BDK & Bitcoin
 bdk_wallet = "3.1.0"
