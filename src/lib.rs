@@ -43,6 +43,8 @@ pub mod backend_pacing;
 pub mod backend_receipt;
 pub mod builder;
 pub mod cancellation;
+#[cfg(any(target_arch = "wasm32", test))]
+mod sync_read_cancellation;
 pub mod crypto;
 /// Current UTXO synchronization, separate from paginated Activity history.
 pub mod current_state;
@@ -1391,6 +1393,8 @@ enum WalletMaterial {
 /// WASM-safe stateful wallet handle wrapping the core `ZincWallet`.
 pub struct ZincWasmWallet {
     inner: Rc<RefCell<ZincWallet>>,
+    #[cfg(any(target_arch = "wasm32", test))]
+    sync_reads: sync_read_cancellation::SyncReadCancellation,
     material: WalletMaterial,
     state: Cell<WalletState>,
     vitality: u32,
@@ -1464,6 +1468,8 @@ impl ZincWasmWallet {
             })?;
             inner.lock_private_material();
         }
+        #[cfg(any(target_arch = "wasm32", test))]
+        self.sync_reads.cancel();
         zeroize::Zeroize::zeroize(&mut self.material);
         self.vitality = 0;
         Ok(())
@@ -1604,6 +1610,8 @@ impl ZincWasmWallet {
                 account_index,
             }),
             vitality: VITALITY_MAGIC,
+            #[cfg(any(target_arch = "wasm32", test))]
+            sync_reads: Default::default(),
         })
     }
 
@@ -1716,6 +1724,8 @@ impl ZincWasmWallet {
                 account_index: active_index,
             }),
             vitality: VITALITY_MAGIC,
+            #[cfg(any(target_arch = "wasm32", test))]
+            sync_reads: Default::default(),
         })
     }
 
@@ -1764,6 +1774,8 @@ impl ZincWasmWallet {
                 account_index: active_index,
             }),
             vitality: VITALITY_MAGIC,
+            #[cfg(any(target_arch = "wasm32", test))]
+            sync_reads: Default::default(),
         })
     }
 
@@ -1798,6 +1810,8 @@ impl ZincWasmWallet {
                 account_index: active_index,
             }),
             vitality: VITALITY_MAGIC,
+            #[cfg(any(target_arch = "wasm32", test))]
+            sync_reads: Default::default(),
         })
     }
 
@@ -1831,6 +1845,8 @@ impl ZincWasmWallet {
                 next_wallet.account_generation = inner.account_generation().wrapping_add(1);
                 *inner = next_wallet;
                 self.state.set(next_state);
+                #[cfg(any(target_arch = "wasm32", test))]
+                self.sync_reads.cancel();
                 Ok(())
             }
             Err(e) => Err(JsValue::from_str(&format!(
@@ -2517,13 +2533,16 @@ impl ZincWasmWallet {
     }
 
     /// Retire an in-flight sync generation after the shell cancels or times out.
-    /// The network future may still resolve, but its apply step will fail stale.
+    /// Abort the owned network read as well as fencing its apply step. Already
+    /// dispatched server work cannot be recalled; no later queued read proceeds.
     #[wasm_bindgen(js_name = retireSyncGeneration)]
     pub fn retire_sync_generation(&self) -> Result<(), JsValue> {
         self.check_vitality()?;
         match self.inner.try_borrow_mut() {
             Ok(mut inner) => {
                 inner.retire_inflight_sync();
+                #[cfg(any(target_arch = "wasm32", test))]
+                self.sync_reads.cancel();
                 Ok(())
             }
             Err(error) => Err(JsValue::from_str(&format!(
@@ -2539,7 +2558,11 @@ impl ZincWasmWallet {
         use crate::builder::configured_esplora_client;
 
         let inner_rc = self.inner.clone();
+        let sync_reads = self.sync_reads.clone();
         let network = self.state_snapshot().network;
+        let requested_generation = self.inner.try_borrow()
+            .map_err(|_| JsValue::from_str("Wallet busy preparing sync"))?
+            .account_generation();
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
@@ -2552,6 +2575,9 @@ impl ZincWasmWallet {
             let (sync_req, sync_generation, last_complete_tip, total_keychains) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
+                        if inner.account_generation() != requested_generation {
+                            return Err(JsValue::from_str(SYNC_STALE_ERROR));
+                        }
                         if !inner.try_begin_sync(js_sys::Date::now()) {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Sync already in progress, skipping.");
                             return Err(JsValue::from_str("Wallet Busy: Sync already in progress"));
@@ -2607,14 +2633,16 @@ impl ZincWasmWallet {
             };
 
             // 2. Fetch (NO LOCK HELD)
-            let vault_update_res = crate::current_state::fetch_esplora_with_known_activity(
+            let vault_update_res = sync_reads
+            .run(crate::current_state::fetch_esplora_with_known_activity(
                 &client,
                 sync_req.taproot,
                 &sync_req.active_scripts,
                 20,
                 5,
-            )
+            ))
             .await
+            .map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?
             .map_err(|error| error.backend_failure());
 
             let vault_update = match vault_update_res {
@@ -2639,14 +2667,16 @@ impl ZincWasmWallet {
             };
 
             let payment_update = if let Some(req_type) = sync_req.payment {
-                let update_res = crate::current_state::fetch_esplora_with_known_activity(
+                let update_res = sync_reads
+                .run(crate::current_state::fetch_esplora_with_known_activity(
                     &client,
                     req_type,
                     &sync_req.active_scripts,
                     20,
                     5,
-                )
+                ))
                 .await
+                .map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?
                 .map_err(|error| error.backend_failure());
 
                 match update_res {
@@ -3181,7 +3211,11 @@ impl ZincWasmWallet {
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         let inner_rc = self.inner.clone();
+        let sync_reads = self.sync_reads.clone();
         let network = self.state_snapshot().network;
+        let requested_generation = self.inner.try_borrow()
+            .map_err(|_| JsValue::from_str("Wallet busy preparing sync"))?
+            .account_generation();
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
@@ -3189,6 +3223,9 @@ impl ZincWasmWallet {
             let (outpoints, wallet_height, sync_generation, chain_generation) = {
                 match inner_rc.try_borrow_mut() {
                     Ok(mut inner) => {
+                        if inner.account_generation() != requested_generation {
+                            return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                        }
                         if !inner.try_begin_sync(js_sys::Date::now()) {
                             zinc_log_debug!(target: LOG_TARGET_WASM, "Ord sync skipped: Wallet is busy syncing.");
                             return Err(JsValue::from_str(
@@ -3241,7 +3278,11 @@ impl ZincWasmWallet {
             };
 
             // 2a. Check Lag
-            let ord_height = match client.get_indexing_height().await {
+            let ord_height = match sync_reads
+                .run(client.get_indexing_height())
+                .await
+                .map_err(|_| JsValue::from_str(ORD_SYNC_STALE_ERROR))?
+            {
                 Ok(h) => h,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "Failed to get ord height: {:?}", e);
@@ -3337,7 +3378,11 @@ impl ZincWasmWallet {
             // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
             // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
-            let resolved = match client.resolve_assets_for_utxos(&queryable_utxos).await {
+            let resolved = match sync_reads
+                .run(client.resolve_assets_for_utxos(&queryable_utxos))
+                .await
+                .map_err(|_| JsValue::from_str(ORD_SYNC_STALE_ERROR))?
+            {
                 Ok(r) => r,
                 Err(e) => {
                     zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);
