@@ -3116,7 +3116,11 @@ impl ZincWasmWallet {
 
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = syncOrdinals)]
-    pub fn sync_ordinals(&self, ord_url: String) -> Result<js_sys::Promise, JsValue> {
+    pub fn sync_ordinals(
+        &self,
+        ord_url: String,
+        bulk_inscriptions: Option<bool>,
+    ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         let inner_rc = self.inner.clone();
         let network = self.state_snapshot().network;
@@ -3171,6 +3175,12 @@ impl ZincWasmWallet {
 
             // 2. Perform Network IO (NO Borrow Held)
             let client = crate::ordinals::OrdClient::new(ord_url.to_string());
+            // Explicit provider capability; absent means legacy-compatible GETs.
+            let client = if bulk_inscriptions == Some(true) {
+                client.with_bulk_inscriptions()
+            } else {
+                client
+            };
 
             // 2a. Check Lag
             let ord_height = match client.get_indexing_height().await {

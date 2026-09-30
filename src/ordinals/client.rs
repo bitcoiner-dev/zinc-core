@@ -8,6 +8,8 @@ use reqwest::Client;
 use serde::{Deserialize, Deserializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+const INSCRIPTIONS_BATCH: usize = 32;
+const INSCRIPTIONS_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const OUTPUTS_BATCH: usize = 100;
 const OUTPUTS_MAX_CONCURRENCY: usize = 4;
 
@@ -65,6 +67,7 @@ async fn parse_ord_text(
 pub struct OrdClient {
     base_url: String,
     http_client: Client,
+    bulk_inscriptions: bool,
 }
 
 #[derive(Deserialize)]
@@ -639,6 +642,7 @@ impl OrdClient {
             base_url,
             // reqwest::Client::new() works on both native and WASM
             http_client: Client::new(),
+            bulk_inscriptions: false,
         }
     }
 
@@ -691,6 +695,97 @@ impl OrdClient {
         .await?;
         ensure_ord_success(&details_resp, BackendOperationV1::InscriptionDetails)?;
         parse_ord_json(details_resp, BackendOperationV1::InscriptionDetails).await
+    }
+
+    // Stream before deserialization on both native and WASM. Content-Length is
+    // only an early rejection hint; chunked/decompressed bodies have the same cap.
+    async fn parse_inscriptions_response<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T, OrdError> {
+        let invalid = || OrdError::invalid_response(BackendOperationV1::InscriptionDetails);
+        if response
+            .content_length()
+            .is_some_and(|n| n > INSCRIPTIONS_RESPONSE_LIMIT as u64)
+        {
+            return Err(invalid());
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| invalid())?;
+            if chunk.len() > INSCRIPTIONS_RESPONSE_LIMIT - bytes.len() {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| invalid())
+    }
+
+    /// Opt in only after the caller has established this provider supports
+    /// Ord's bounded POST /inscriptions API. Unknown/older providers retain
+    /// individual reads; errors never change the selected transport or retry.
+    pub fn with_bulk_inscriptions(mut self) -> Self {
+        self.bulk_inscriptions = true;
+        self
+    }
+
+    async fn get_inscriptions_bounded(&self, ids: &[String]) -> Result<Vec<Inscription>, OrdError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Bound request size even for hostile output responses.
+        if ids.iter().any(|id| {
+            id.len() > 80
+                || !id.split_once('i').is_some_and(|(tx, index)| {
+                    tx.len() == 64
+                        && tx.parse::<bitcoin::Txid>().is_ok()
+                        && index.parse::<u32>().is_ok()
+                        && index.parse::<u32>().is_ok_and(|n| n.to_string() == index)
+                })
+        }) || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+        {
+            return Err(OrdError::invalid_response(
+                BackendOperationV1::InscriptionDetails,
+            ));
+        }
+        let bulk = self.bulk_inscriptions;
+        let mut result = Vec::new();
+        for chunk in ids.chunks(if bulk { INSCRIPTIONS_BATCH } else { 8 }) {
+            let details: Vec<Inscription> = if bulk {
+                let response = send_ord_request(
+                    self.http_client
+                        .post(format!("{}/inscriptions", self.base_url))
+                        .header("Accept", "application/json")
+                        .json(chunk),
+                    BackendOperationV1::InscriptionDetails,
+                )
+                .await?;
+                ensure_ord_success(&response, BackendOperationV1::InscriptionDetails)?;
+                Self::parse_inscriptions_response(response).await?
+            } else {
+                futures_util::future::try_join_all(chunk.iter().map(|id| async move {
+                    let response = send_ord_request(
+                        self.http_client
+                            .get(format!("{}/inscription/{}", self.base_url, id))
+                            .header("Accept", "application/json"),
+                        BackendOperationV1::InscriptionDetails,
+                    )
+                    .await?;
+                    ensure_ord_success(&response, BackendOperationV1::InscriptionDetails)?;
+                    Self::parse_inscriptions_response::<Inscription>(response).await
+                }))
+                .await?
+            };
+            let requested: HashSet<&str> = chunk.iter().map(String::as_str).collect();
+            let returned: HashSet<&str> = details.iter().map(|i| i.id.as_str()).collect();
+            if details.len() != chunk.len() || returned != requested {
+                return Err(OrdError::invalid_response(
+                    BackendOperationV1::InscriptionDetails,
+                ));
+            }
+            result.extend(details);
+        }
+        Ok(result)
     }
 
     /// Fetch raw inscription content bytes for one inscription id.
@@ -870,7 +965,7 @@ impl OrdClient {
 
     /// Resolve all ordinal assets for the given wallet outpoints in as few requests as possible:
     /// one bulk `/outputs` pass (batched, concurrent) for inscription ids + runes + protected status,
-    /// then a parallel per-inscription detail fetch for display metadata + satpoint offsets.
+    /// then bounded inscription detail batches for display metadata + satpoint offsets.
     ///
     /// Fails closed: if the bulk response does not cover every requested outpoint, returns an error so
     /// the ordinals state is never marked verified on partial data (a silently-missing output could
@@ -1096,15 +1191,34 @@ impl OrdClient {
             outpoint_runes.insert(op, resolved);
         }
 
-        // 3. Parallel per-inscription details (number/content_type/satpoint offset for display + shield).
-        const INS_BATCH: usize = 8;
-        let mut inscriptions = Vec::new();
-        for chunk in inscription_ids.chunks(INS_BATCH) {
-            let detail_futures = chunk
-                .iter()
-                .map(|id| self.get_inscription_details(id.as_str()));
-            for result in futures_util::future::join_all(detail_futures).await {
-                inscriptions.push(result?);
+        // Every detail must agree with the output snapshot used for protection.
+        let inscriptions = self.get_inscriptions_bounded(&inscription_ids).await?;
+        let mut locations = HashMap::new();
+        for entry in &entries {
+            for id in &entry.inscriptions {
+                let op = entry
+                    .outpoint
+                    .as_deref()
+                    .and_then(|op| op.parse::<OutPoint>().ok())
+                    .ok_or_else(|| {
+                        OrdError::invalid_response(BackendOperationV1::InscriptionDetails)
+                    })?;
+                if locations.insert(id.as_str(), (op, entry.value)).is_some() {
+                    return Err(OrdError::invalid_response(
+                        BackendOperationV1::InscriptionDetails,
+                    ));
+                }
+            }
+        }
+        for inscription in &inscriptions {
+            let (op, value) = locations[inscription.id.as_str()];
+            if inscription.satpoint.outpoint != op
+                || value.is_some_and(|v| inscription.satpoint.offset >= v)
+                || inscription.value.zip(value).is_some_and(|(a, b)| a != b)
+            {
+                return Err(OrdError::invalid_response(
+                    BackendOperationV1::InscriptionDetails,
+                ));
             }
         }
 
@@ -1236,6 +1350,262 @@ mod tests {
     };
     use crate::backend_error::{BackendFailureCategoryV1, BackendOperationV1};
     use futures_util::{StreamExt, TryStreamExt};
+
+    fn bulk_id(n: u32) -> String {
+        format!("{}i{n}", "11".repeat(32))
+    }
+    fn bulk_detail(n: u32) -> serde_json::Value {
+        serde_json::json!({"id": bulk_id(n), "number": n,
+            "satpoint": format!("{}:0:0", "22".repeat(32)), "value": 330})
+    }
+
+    #[tokio::test]
+    async fn bulk_inscriptions_chunks_and_preserves_explicit_selection_across_clones() {
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let probe = server
+            .mock("POST", "/inscriptions")
+            .match_body("[]")
+            .with_body("[]")
+            .expect(0)
+            .create_async()
+            .await;
+        let ids: Vec<_> = (0..33).map(bulk_id).collect();
+        let first = server
+            .mock("POST", "/inscriptions")
+            .match_body(serde_json::to_string(&ids[..32]).unwrap().as_str())
+            .with_body(
+                serde_json::to_string(&(0..32).rev().map(bulk_detail).collect::<Vec<_>>()).unwrap(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let last = server
+            .mock("POST", "/inscriptions")
+            .match_body(serde_json::to_string(&ids[32..]).unwrap().as_str())
+            .with_body(serde_json::to_string(&vec![bulk_detail(32)]).unwrap())
+            .expect(2)
+            .create_async()
+            .await;
+        let client = OrdClient::new(server.url()).with_bulk_inscriptions();
+        assert_eq!(
+            client.get_inscriptions_bounded(&ids).await.unwrap().len(),
+            33
+        );
+        client
+            .clone()
+            .get_inscriptions_bounded(&ids[32..])
+            .await
+            .unwrap();
+        probe.assert_async().await;
+        first.assert_async().await;
+        last.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn bulk_inscriptions_unknown_provider_never_probes_or_requires_bulk() {
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let post = server
+            .mock("POST", "/inscriptions")
+            .with_status(403)
+            .expect(0)
+            .create_async()
+            .await;
+        let get = server
+            .mock("GET", format!("/inscription/{}", bulk_id(0)).as_str())
+            .with_body(bulk_detail(0).to_string())
+            .expect(2)
+            .create_async()
+            .await;
+        let client = OrdClient::new(server.url());
+        for _ in 0..2 {
+            client
+                .get_inscriptions_bounded(&[bulk_id(0)])
+                .await
+                .unwrap();
+        }
+        post.assert_async().await;
+        get.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn bulk_inscriptions_errors_never_fall_back_or_retry() {
+        for status in [400, 401, 403, 404, 405, 429, 500, 501, 503] {
+            let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+            let post = server
+                .mock("POST", "/inscriptions")
+                .with_status(status)
+                .expect(1)
+                .create_async()
+                .await;
+            let get = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            assert!(OrdClient::new(server.url())
+                .with_bulk_inscriptions()
+                .get_inscriptions_bounded(&[bulk_id(0)])
+                .await
+                .is_err());
+            post.assert_async().await;
+            get.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_inscriptions_rejects_bad_coverage_and_payloads() {
+        for body in [
+            "[]".to_owned(),
+            "null".to_owned(),
+            "invalid".to_owned(),
+            serde_json::json!([bulk_detail(1)]).to_string(),
+            serde_json::json!([bulk_detail(0), bulk_detail(0)]).to_string(),
+            " ".repeat(super::INSCRIPTIONS_RESPONSE_LIMIT + 1),
+        ] {
+            let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+            server
+                .mock("POST", "/inscriptions")
+                .match_body("[]")
+                .with_body("[]")
+                .create_async()
+                .await;
+            let bad = server
+                .mock("POST", "/inscriptions")
+                .match_body(serde_json::json!([bulk_id(0)]).to_string().as_str())
+                .with_body(body)
+                .expect(1)
+                .create_async()
+                .await;
+            let get = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            assert!(OrdClient::new(server.url())
+                .with_bulk_inscriptions()
+                .get_inscriptions_bounded(&[bulk_id(0)])
+                .await
+                .is_err());
+            bad.assert_async().await;
+            get.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_inscriptions_data_404_is_not_capability_failure() {
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        server
+            .mock("POST", "/inscriptions")
+            .match_body("[]")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let bad = server
+            .mock("POST", "/inscriptions")
+            .match_body(serde_json::json!([bulk_id(0)]).to_string().as_str())
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let get = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        assert!(OrdClient::new(server.url())
+            .with_bulk_inscriptions()
+            .get_inscriptions_bounded(&[bulk_id(0)])
+            .await
+            .is_err());
+        bad.assert_async().await;
+        get.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn bulk_inscriptions_resolver_binds_details_to_validated_outputs() {
+        for case in [
+            "valid",
+            "wrong-output",
+            "offset-outside",
+            "wrong-value",
+            "duplicate-output-id",
+        ] {
+            let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+            let op = format!("{}:0", "22".repeat(32));
+            let ids = if case == "duplicate-output-id" {
+                vec![bulk_id(0), bulk_id(0)]
+            } else {
+                vec![bulk_id(0)]
+            };
+            server
+                .mock("POST", "/outputs")
+                .with_body(
+                    serde_json::json!([{"indexed":true, "outpoint":op,
+                    "transaction":"22".repeat(32), "value":330, "sat_ranges":[[10,340]],
+                    "inscriptions":ids, "runes":{}}])
+                    .to_string(),
+                )
+                .create_async()
+                .await;
+            server
+                .mock("POST", "/inscriptions")
+                .match_body("[]")
+                .with_body("[]")
+                .create_async()
+                .await;
+            let mut detail = bulk_detail(0);
+            if case == "wrong-output" {
+                detail["satpoint"] = format!("{}:1:0", "22".repeat(32)).into();
+            }
+            if case == "offset-outside" {
+                detail["satpoint"] = format!("{}:0:330", "22".repeat(32)).into();
+            }
+            if case == "wrong-value" {
+                detail["value"] = 331.into();
+            }
+            server
+                .mock("POST", "/inscriptions")
+                .match_body(serde_json::json!([bulk_id(0)]).to_string().as_str())
+                .with_body(serde_json::json!([detail]).to_string())
+                .create_async()
+                .await;
+            let result = OrdClient::new(server.url())
+                .with_bulk_inscriptions()
+                .resolve_assets_for_utxos(&[(op, 330)])
+                .await;
+            if case == "valid" {
+                assert_eq!(result.unwrap().inscriptions.len(), 1);
+            } else {
+                assert!(result.is_err(), "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_inscriptions_rejects_oversized_chunked_response() {
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let post = server
+            .mock("POST", "/inscriptions")
+            .match_body(serde_json::json!([bulk_id(0)]).to_string().as_str())
+            .with_chunked_body(|writer| {
+                writer.write_all(&vec![b' '; super::INSCRIPTIONS_RESPONSE_LIMIT + 1])
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let get = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        assert!(OrdClient::new(server.url())
+            .with_bulk_inscriptions()
+            .get_inscriptions_bounded(&[bulk_id(0)])
+            .await
+            .is_err());
+        post.assert_async().await;
+        get.assert_async().await;
+    }
 
     async fn try_collect_bounded<I, F, Fut, T, E>(
         items: I,
