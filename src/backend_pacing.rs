@@ -5,6 +5,7 @@
 //! calls remain cancellable and operation deadlines must include admission.
 //! This is process/WASM-instance local, not a cross-device or cross-IP quota.
 
+use crate::work_admission::{Permit, Priority, Ticket, WorkAdmission};
 use esplora_client::Sleeper;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -107,11 +108,33 @@ impl Schedule {
     }
 }
 
-#[derive(Default)]
-struct Origin {
-    turn: futures_util::lock::Mutex<()>,
-    schedule: Mutex<Schedule>,
+struct ShellWaiter {
+    ticket: Ticket,
+    permit: Option<Permit>,
+    expires: Instant,
 }
+#[derive(Default)]
+struct ShellQueue {
+    next_id: u32,
+    waiting: HashMap<u32, ShellWaiter>,
+}
+struct Origin {
+    turn: Arc<WorkAdmission>,
+    schedule: Mutex<Schedule>,
+    shell: Mutex<ShellQueue>,
+}
+impl Default for Origin {
+    fn default() -> Self {
+        Self {
+            turn: WorkAdmission::new(1),
+            schedule: Mutex::default(),
+            shell: Mutex::default(),
+        }
+    }
+}
+const SHELL_LEASE: Duration = Duration::from_secs(1);
+const SHELL_POLL: Duration = Duration::from_millis(25);
+const MAX_SHELL_WAITERS: usize = 256;
 
 #[derive(Default)]
 struct Registry {
@@ -147,8 +170,28 @@ fn origin(url: &str) -> Arc<Origin> {
 }
 
 impl Origin {
-    async fn acquire(&self) {
-        let _turn = self.turn.lock().await;
+    fn reap_shell(&self) {
+        let now = Instant::now();
+        self.shell
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting
+            .retain(|_, waiter| waiter.expires > now);
+    }
+    async fn acquire(&self, priority: Priority) {
+        let acquire = self.turn.acquire(priority);
+        futures_util::pin_mut!(acquire);
+        // A crashed shell cannot strand a queue ticket or reserve a rate slot.
+        let _turn = loop {
+            self.reap_shell();
+            let tick = crate::builder::SyncSleeper::sleep(SHELL_POLL);
+            futures_util::pin_mut!(tick);
+            if let futures_util::future::Either::Left((permit, _)) =
+                futures_util::future::select(acquire.as_mut(), tick).await
+            {
+                break permit;
+            }
+        };
         loop {
             let wait = {
                 let mut state = self.schedule.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,7 +209,7 @@ impl Origin {
 }
 
 pub(crate) async fn before_request(url: &str) {
-    origin(url).acquire().await;
+    origin(url).acquire(Priority::Foreground).await;
 }
 
 pub fn after_response(url: &str, status: u16, retry_after: Option<&str>) {
@@ -183,6 +226,11 @@ pub fn after_response(url: &str, status: u16, retry_after: Option<&str>) {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn backend_request_delay(url: &str) -> u32 {
     let origin = origin(url);
+    origin.reap_shell();
+    let mut ticket = origin.turn.register(Priority::Background);
+    let Some(_permit) = ticket.poll(None) else {
+        return 100;
+    };
     let mut state = origin.schedule.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     let wait = state.admit(now);
@@ -191,6 +239,69 @@ pub fn backend_request_delay(url: &str) -> u32 {
     } else {
         wait.as_millis().saturating_add(1).min(u128::from(u32::MAX)) as u32
     }
+}
+
+/// Persistent background admission for shell presentation reads. IDs identify
+/// only local queue entries, not wallets. Zero refuses a full queue; no bypass.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn backend_request_begin(url: &str) -> u32 {
+    let origin = origin(url);
+    origin.reap_shell();
+    let mut shell = origin.shell.lock().unwrap_or_else(|e| e.into_inner());
+    if shell.waiting.len() >= MAX_SHELL_WAITERS {
+        return 0;
+    }
+    let Some(id) = shell.next_id.checked_add(1) else {
+        return 0;
+    };
+    shell.next_id = id;
+    shell.waiting.insert(
+        id,
+        ShellWaiter {
+            ticket: origin.turn.register(Priority::Background),
+            permit: None,
+            expires: Instant::now() + SHELL_LEASE,
+        },
+    );
+    id
+}
+/// u32::MAX means expired/unknown: callers fail the attempt, never requeue or
+/// replay it automatically. Positive delay keeps the same FIFO position.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn backend_request_poll(url: &str, id: u32) -> u32 {
+    let origin = origin(url);
+    origin.reap_shell();
+    let mut shell = origin.shell.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(waiter) = shell.waiting.get_mut(&id) else {
+        return u32::MAX;
+    };
+    waiter.expires = Instant::now() + SHELL_LEASE;
+    if waiter.permit.is_none() {
+        waiter.permit = waiter.ticket.poll(None);
+    }
+    if waiter.permit.is_none() {
+        return SHELL_POLL.as_millis() as u32;
+    }
+    let wait = origin
+        .schedule
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .admit(Instant::now());
+    if wait.is_zero() {
+        shell.waiting.remove(&id);
+        0
+    } else {
+        wait.min(SHELL_POLL).as_millis().saturating_add(1) as u32
+    }
+}
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn backend_request_cancel(url: &str, id: u32) {
+    origin(url)
+        .shell
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .waiting
+        .remove(&id);
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
@@ -202,10 +313,23 @@ pub fn backend_response_observed(url: &str, status: u16, retry_after: Option<Str
 /// discovery/Ord/fee HTTP calls; Esplora (including BDK) uses SyncSleeper hooks.
 /// No retries, redirects beyond reqwest's policy, or provider changes are added.
 pub async fn send(builder: reqwest::RequestBuilder) -> Result<reqwest::Response, reqwest::Error> {
+    send_with_priority(builder, Priority::Foreground).await
+}
+
+pub async fn send_background(
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    send_with_priority(builder, Priority::Background).await
+}
+
+async fn send_with_priority(
+    builder: reqwest::RequestBuilder,
+    priority: Priority,
+) -> Result<reqwest::Response, reqwest::Error> {
     let (client, request) = builder.build_split();
     let request = request?;
     let url = request.url().to_string();
-    before_request(&url).await;
+    origin(&url).acquire(priority).await;
     let response = client.execute(request).await?;
     after_response(
         &url,
@@ -221,6 +345,81 @@ pub async fn send(builder: reqwest::RequestBuilder) -> Result<reqwest::Response,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_fifo_cancellation_expiry_and_shared_credit() {
+        let url = "https://shell-priority-test.invalid";
+        let origin = origin(url);
+        let first = backend_request_begin(url);
+        let second = backend_request_begin(url);
+        assert!(first > 0 && second > first);
+        assert!(backend_request_poll(url, second) > 0);
+        assert_eq!(
+            origin.schedule.lock().unwrap().startup_remaining,
+            STARTUP_REQUESTS
+        );
+        backend_request_cancel(url, first);
+        assert_eq!(backend_request_poll(url, second), 0);
+        assert_eq!(
+            origin.schedule.lock().unwrap().startup_remaining,
+            STARTUP_REQUESTS - 1
+        );
+        let abandoned = backend_request_begin(url);
+        origin
+            .shell
+            .lock()
+            .unwrap()
+            .waiting
+            .get_mut(&abandoned)
+            .unwrap()
+            .expires = Instant::now();
+        origin.reap_shell();
+        assert_eq!(backend_request_poll(url, abandoned), u32::MAX);
+        assert_eq!(
+            origin.schedule.lock().unwrap().startup_remaining,
+            STARTUP_REQUESTS - 1
+        );
+    }
+
+    #[test]
+    fn shell_and_core_lanes_obey_the_same_cooldown_without_replay() {
+        let url = "https://shell-cooldown-test.invalid";
+        let origin = origin(url);
+        after_response(url, 429, Some("12"));
+        let id = backend_request_begin(url);
+        assert!(backend_request_poll(url, id) > 0);
+        let state = origin.schedule.lock().unwrap();
+        assert_eq!(state.startup_remaining, 0);
+        assert!(state.wait(Instant::now()) > Duration::from_secs(11));
+        drop(state);
+        backend_request_cancel(url, id);
+        assert!(origin.shell.lock().unwrap().waiting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_priority_waiters_share_startup_and_cancel_without_rate_debt() {
+        let origin = Origin::default();
+        futures_util::future::join_all((0..6).map(|i| {
+            origin.acquire(if i % 2 == 0 {
+                Priority::Foreground
+            } else {
+                Priority::Background
+            })
+        }))
+        .await;
+        assert_eq!(
+            origin.schedule.lock().unwrap().startup_remaining,
+            STARTUP_REQUESTS - 6
+        );
+        let before = origin.schedule.lock().unwrap().startup_remaining;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            origin.acquire(Priority::Background)
+        )
+        .await
+        .is_err());
+        assert_eq!(origin.schedule.lock().unwrap().startup_remaining, before);
+    }
 
     #[test]
     fn origin_budget_ignores_path_credentials_and_default_port() {
@@ -278,14 +477,15 @@ mod tests {
     async fn concurrent_clients_share_admission_and_cancellation_leaves_no_debt() {
         let origin = Origin::default();
         let start = Instant::now();
-        futures_util::future::join_all((0..6).map(|_| origin.acquire())).await;
+        futures_util::future::join_all((0..6).map(|_| origin.acquire(Priority::Foreground))).await;
         assert!(start.elapsed() >= STARTUP_SPACING * 2);
         // Timeout a queued caller; only the last dispatched request owns a slot.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(1), origin.acquire())
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            origin.acquire(Priority::Foreground)
+        )
+        .await
+        .is_err());
         let next = origin.schedule.lock().unwrap().next.unwrap();
         assert!(next <= Instant::now() + SPACING);
     }
@@ -379,7 +579,7 @@ mod tests {
         // Drain the shared startup allowance, without issuing HTTP traffic,
         // so this transport test exercises steady-state shared admission.
         for _ in 0..STARTUP_REQUESTS {
-            origin(&server.url()).acquire().await;
+            origin(&server.url()).acquire(Priority::Foreground).await;
         }
         let tip = server
             .mock("GET", "/blocks/tip/height")

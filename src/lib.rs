@@ -76,6 +76,7 @@ pub mod offer_relay;
 pub mod ordinals;
 /// Signed pairing + sign-intent protocol primitives.
 pub mod sign_intent;
+pub mod work_admission;
 
 // Re-exports for convenience
 pub use backend_error::{
@@ -548,7 +549,7 @@ async fn fetch_addr_stats(
     let mut balance = 0u64;
     let mut has_history = false;
 
-    if let Ok(resp) = backend_pacing::send(client.get(&url)).await {
+    if let Ok(resp) = backend_pacing::send_background(client.get(&url)).await {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             let chain_stats = &json["chain_stats"];
             let mempool_stats = &json["mempool_stats"];
@@ -574,7 +575,7 @@ async fn fetch_addr_stats(
     // 2. Get Inscriptions from Ord
     let mut inscriptions = Vec::new();
     let ord_addr_url = format!("{ord_url}/address/{address}");
-    if let Ok(resp) = backend_pacing::send(
+    if let Ok(resp) = backend_pacing::send_background(
         client
             .get(&ord_addr_url)
             .header("Accept", "application/json"),
@@ -702,7 +703,7 @@ async fn probe_esplora_address_activity(
     let request_timeout_ms = remaining_ms
         .min(f64::from(ACCOUNT_DISCOVERY_ADDRESS_REQUEST_TIMEOUT_MS))
         .ceil() as u32;
-    let request = backend_pacing::send(client.get(&url));
+    let request = backend_pacing::send_background(client.get(&url));
     let timeout = gloo_timers::future::TimeoutFuture::new(request_timeout_ms.max(1));
     futures_util::pin_mut!(request);
     futures_util::pin_mut!(timeout);
