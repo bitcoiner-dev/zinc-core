@@ -3458,6 +3458,32 @@ impl ZincWallet {
 
     /// Return account summaries for the active wallet.
     pub fn get_accounts(&self, count: u32) -> Vec<Account> {
+        self.accounts_in_range(0, count)
+    }
+
+    /// Derive a bounded page without deriving the preceding account prefix.
+    /// Callers yield and check cancellation between pages; these identities
+    /// carry no activity, discovery-completion or spendability assertion.
+    pub fn get_account_range(&self, start: u32, count: u32) -> Result<Vec<Account>, String> {
+        let end = start
+            .checked_add(count)
+            .ok_or("Invalid account preview range")?;
+        if count == 0 || count > 8 || end > 100 {
+            return Err("Invalid account preview range".into());
+        }
+        let accounts = self.accounts_in_range(start, end);
+        if accounts.len() != count as usize
+            || accounts
+                .iter()
+                .enumerate()
+                .any(|(offset, account)| account.index != start + offset as u32)
+        {
+            return Err("Account preview range unavailable".into());
+        }
+        Ok(accounts)
+    }
+
+    fn accounts_in_range(&self, start: u32, end: u32) -> Vec<Account> {
         match &self.kind {
             WalletKind::WatchAddress(address) => {
                 let taproot_address = address.to_string();
@@ -3496,7 +3522,7 @@ impl ZincWallet {
             }
             WalletKind::Seed { master_xprv } => {
                 let mut accounts = Vec::new();
-                for i in 0..count {
+                for i in start..end {
                     // Temporarily build a builder to derive addresses for other accounts
                     let builder = WalletBuilder::new(self.vault_wallet.network())
                         .kind(WalletKind::Seed {

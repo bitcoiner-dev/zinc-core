@@ -2040,6 +2040,20 @@ impl ZincWasmWallet {
         let accounts = inner.get_accounts(count);
         Ok(serde_wasm_bindgen::to_value(&accounts)?)
     }
+    #[wasm_bindgen(js_name = getAccountRange)]
+    /// Bounded local identity derivation, independent of network discovery.
+    pub fn get_account_range(&self, start: u32, count: u32) -> Result<JsValue, JsValue> {
+        self.check_vitality()?;
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| JsValue::from_str("Wallet busy (getAccountRange)"))?;
+        let accounts = inner
+            .get_account_range(start, count)
+            .map_err(|error| JsValue::from_str(&error))?;
+        serde_wasm_bindgen::to_value(&accounts).map_err(Into::into)
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = probeHardwareAccounts)]
     /// High-performance parallel probing of hardware account ranges.
@@ -2908,6 +2922,7 @@ impl ZincWasmWallet {
         account_gap_limit: u32,
         address_scan_depth: Option<u32>,
         timeout_ms: Option<u32>,
+        on_progress: Option<js_sys::Function>,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
 
@@ -2936,6 +2951,11 @@ impl ZincWasmWallet {
             .clamp(1, MAX_IMPORT_ADDRESS_SCAN_DEPTH);
         let timeout_ms = timeout_ms.unwrap_or(45_000).clamp(1, MAX_IMPORT_TIMEOUT_MS);
         let branch_label = branch_str.to_string();
+        let inner = self.inner.clone();
+        let generation = inner
+            .try_borrow()
+            .map_err(|_| JsValue::from_str("Wallet busy (discoverImportPath)"))?
+            .account_generation();
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
@@ -2957,7 +2977,29 @@ impl ZincWasmWallet {
             let deadline_ms = start_ms + f64::from(timeout_ms);
             let mut stop_reason = ImportPathDiscoveryStopReasonV1::MaxAccounts;
 
+            let publish = |event: serde_json::Value| -> Result<(), JsValue> {
+                if inner
+                    .try_borrow()
+                    .map_err(|_| JsValue::from_str("Recovery wallet busy"))?
+                    .account_generation()
+                    != generation
+                {
+                    return Err(JsValue::from_str(SYNC_STALE_ERROR));
+                }
+                if let Some(callback) = &on_progress {
+                    callback.call1(&JsValue::NULL, &serde_wasm_bindgen::to_value(&event)?)?;
+                }
+                Ok(())
+            };
             while account_index < MAX_IMPORT_ACCOUNTS {
+                if inner
+                    .try_borrow()
+                    .map_err(|_| JsValue::from_str("Recovery wallet busy"))?
+                    .account_generation()
+                    != generation
+                {
+                    return Err(JsValue::from_str(SYNC_STALE_ERROR));
+                }
                 if js_sys::Date::now() >= deadline_ms {
                     zinc_log_warn!(
                         target: LOG_TARGET_WASM,
@@ -2982,6 +3024,15 @@ impl ZincWasmWallet {
                     .with_account_index(account_index);
 
                 let zwallet = builder.build().map_err(|e| JsValue::from_str(&e))?;
+                let ordinals_address = zwallet.peek_taproot_address(0).to_string();
+                let payment_address = zwallet
+                    .peek_payment_address(0)
+                    .map(|address| address.to_string())
+                    .unwrap_or_else(|| ordinals_address.clone());
+                publish(serde_json::json!({
+                    "version": 1, "kind": "identity", "index": account_index,
+                    "paymentAddress": payment_address, "ordinalsAddress": ordinals_address,
+                }))?;
                 let check_activity = |addr_str: String| {
                     let client = client.clone();
                     let url = format!("{}/address/{}", esplora_url, addr_str);
@@ -3059,6 +3110,12 @@ impl ZincWasmWallet {
                     current_gap += 1;
                 }
 
+                publish(serde_json::json!({
+                    "version": 1, "kind": "coverage", "scannedThrough": account_index,
+                    "trailingInactive": current_gap, "requiredGap": account_gap_limit,
+                    "complete": current_gap >= account_gap_limit,
+                    "firstActiveAddressIndex": first_active_address_index,
+                }))?;
                 scanned_accounts = scanned_accounts.saturating_add(1);
                 account_index = account_index
                     .checked_add(1)

@@ -100,3 +100,39 @@ fn test_builder_dual_scheme() {
         "Payment address must be SegWit v0 (starts with bcrt1q)"
     );
 }
+
+#[test]
+fn account_preview_pages_preserve_identity_and_do_not_reveal_addresses() {
+    for mode in [
+        zinc_core::DerivationMode::Account,
+        zinc_core::DerivationMode::Index,
+    ] {
+        let wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([7; 64]))
+            .with_scheme(AddressScheme::Dual)
+            .with_derivation_mode(mode)
+            .build()
+            .expect("wallet");
+        let before = wallet.peek_taproot_address(0);
+        let expected = wallet.get_accounts(26);
+        for start in [0, 1, 8, 24] {
+            let page = wallet.get_account_range(start, 2).expect("bounded page");
+            assert_eq!(page.len(), 2);
+            for (offset, actual) in page.iter().enumerate() {
+                let expected = &expected[start as usize + offset];
+                assert_eq!(actual.index, expected.index);
+                assert_eq!(actual.taproot_address, expected.taproot_address);
+                assert_eq!(actual.payment_address, expected.payment_address);
+                assert_eq!(actual.taproot_public_key, expected.taproot_public_key);
+                assert_eq!(actual.payment_public_key, expected.payment_public_key);
+            }
+        }
+        assert_eq!(wallet.peek_taproot_address(0), before);
+        for (start, count) in [(0, 0), (0, 9), (99, 2), (100, 1), (u32::MAX, 1)] {
+            assert!(wallet.get_account_range(start, count).is_err());
+        }
+        assert_eq!(
+            wallet.get_account_range(99, 1).expect("last account")[0].index,
+            99
+        );
+    }
+}
