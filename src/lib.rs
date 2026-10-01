@@ -45,6 +45,8 @@ pub mod builder;
 pub mod cancellation;
 #[cfg(any(target_arch = "wasm32", test))]
 mod sync_read_cancellation;
+#[cfg(any(target_arch = "wasm32", test))]
+mod discovery_activity_memo;
 pub mod crypto;
 /// Current UTXO synchronization, separate from paginated Activity history.
 pub mod current_state;
@@ -678,6 +680,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AccountDiscoveryProbeError {
     Deadline,
+    #[cfg(target_arch = "wasm32")]
+    RetiredScope,
     /// Retained for pure helper tests that do not construct a transport error.
     #[cfg(test)]
     Backend,
@@ -1387,6 +1391,22 @@ enum WalletMaterial {
     MnemonicPhrase(String),
     WatchAddress(String),
     Hardware { fingerprint: [u8; 4] },
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+/// Memory-only, backend-owned evidence for one restore discovery job.
+/// No balances, payloads, getters or externally writable evidence are exposed.
+pub struct ZincWasmImportProbeScope {
+    memo: Rc<RefCell<discovery_activity_memo::DiscoveryActivityMemo>>,
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl ZincWasmImportProbeScope {
+    /// Fork a handle for one consuming async discovery call.
+    pub fn fork(&self) -> ZincWasmImportProbeScope { Self { memo: self.memo.clone() } }
+    /// Retire every fork on cancellation, context transition or job completion.
+    pub fn retire(&self) { self.memo.borrow_mut().retire(); }
 }
 
 #[wasm_bindgen]
@@ -2893,6 +2913,9 @@ impl ZincWasmWallet {
                             "Account discovery backend request failed",
                         ));
                     }
+                    Err(AccountDiscoveryProbeError::RetiredScope) => {
+                        return Err(JsValue::from_str(SYNC_STALE_ERROR));
+                    }
                     Err(AccountDiscoveryProbeError::BackendFailure(failure)) => {
                         return Err(backend_failure_to_js(&failure));
                     }
@@ -2945,6 +2968,16 @@ impl ZincWasmWallet {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = createImportProbeScope)]
+    pub fn create_import_probe_scope(&self, esplora_url: String) -> Result<ZincWasmImportProbeScope, JsValue> {
+        self.check_vitality()?;
+        let wallet = self.inner.try_borrow().map_err(|_| JsValue::from_str("Recovery wallet busy"))?;
+        Ok(ZincWasmImportProbeScope { memo: Rc::new(RefCell::new(
+            discovery_activity_memo::DiscoveryActivityMemo::new(
+                discovery_activity_memo::context(&wallet), esplora_url))) })
+    }
+
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = discoverImportPath)]
     pub fn discover_import_path(
         &self,
@@ -2954,6 +2987,7 @@ impl ZincWasmWallet {
         address_scan_depth: Option<u32>,
         timeout_ms: Option<u32>,
         on_progress: Option<js_sys::Function>,
+        probe_scope: Option<ZincWasmImportProbeScope>,
     ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
 
@@ -2987,6 +3021,12 @@ impl ZincWasmWallet {
             .try_borrow()
             .map_err(|_| JsValue::from_str("Wallet busy (discoverImportPath)"))?
             .account_generation();
+        let context = discovery_activity_memo::context(&inner.borrow());
+        let memo = probe_scope.map(|scope| scope.memo);
+        if let Some(memo) = &memo {
+            memo.borrow().validate(&context, &esplora_url, web_time::Instant::now())
+                .map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?;
+        }
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(
@@ -3067,7 +3107,28 @@ impl ZincWasmWallet {
                 let check_activity = |addr_str: String| {
                     let client = client.clone();
                     let url = format!("{}/address/{}", esplora_url, addr_str);
-                    async move { probe_esplora_address_activity(&client, url, deadline_ms).await }
+                    let memo = memo.clone();
+                    let context = context.clone();
+                    let backend = esplora_url.clone();
+                    let inner = inner.clone();
+                    async move {
+                        let current = || inner.try_borrow().ok()
+                            .is_some_and(|wallet| wallet.account_generation() == generation);
+                        if !current() { return Err(AccountDiscoveryProbeError::RetiredScope); }
+                        if let Some(memo) = &memo {
+                            if let Some(activity) = memo.borrow().lookup(&context, &backend, &addr_str, web_time::Instant::now())
+                                .map_err(|_| AccountDiscoveryProbeError::RetiredScope)? {
+                                return Ok(activity);
+                            }
+                        }
+                        let activity = probe_esplora_address_activity(&client, url, deadline_ms).await?;
+                        if !current() { return Err(AccountDiscoveryProbeError::RetiredScope); }
+                        if let Some(memo) = &memo {
+                            memo.borrow_mut().record(&context, &backend, addr_str, activity, web_time::Instant::now())
+                                .map_err(|_| AccountDiscoveryProbeError::RetiredScope)?;
+                        }
+                        Ok(activity)
+                    }
                 };
 
                 let scan_depth = if derivation_mode == DerivationMode::Index {
@@ -3125,6 +3186,9 @@ impl ZincWasmWallet {
                     #[cfg(test)]
                     Err(AccountDiscoveryProbeError::Backend) => {
                         return Err(JsValue::from_str("Import discovery backend request failed"));
+                    }
+                    Err(AccountDiscoveryProbeError::RetiredScope) => {
+                        return Err(JsValue::from_str(SYNC_STALE_ERROR));
                     }
                     Err(AccountDiscoveryProbeError::BackendFailure(failure)) => {
                         return Err(backend_failure_to_js(&failure));
