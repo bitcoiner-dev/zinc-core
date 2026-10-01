@@ -14,7 +14,7 @@ use bdk_wallet::KeychainKind;
 use bitcoin::{OutPoint, ScriptBuf, TxOut};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Persisted current-output authority, separate from the additive BDK graph.
 /// This is cached data, not permission to sign: a fresh chain/Ord receipt is
@@ -360,6 +360,22 @@ pub async fn fetch_esplora_with_known_activity(
     stop_gap: usize,
     parallel_requests: usize,
 ) -> Result<CurrentStateUpdate, CurrentStateError> {
+    // Only this exact public service has been qualified. Unknown/custom and
+    // other network providers remain legacy unless their trusted host opts in.
+    let batches = client.url().trim_end_matches('/') == "https://esplora.zincwallet.app";
+    fetch_esplora_with_policy(client, request, known_active_scripts, stop_gap, parallel_requests, batches).await
+}
+
+/// Current-state read policy for an explicitly qualified batch provider.
+/// The flag changes transport only, never address coverage or signing authority.
+pub async fn fetch_esplora_with_policy(
+    client: &esplora_client::AsyncClient<SyncSleeper>,
+    request: SyncRequestType,
+    known_active_scripts: &BTreeSet<ScriptBuf>,
+    stop_gap: usize,
+    parallel_requests: usize,
+    batch_outspends: bool,
+) -> Result<CurrentStateUpdate, CurrentStateError> {
     if stop_gap == 0 || parallel_requests == 0 {
         return Err(CurrentStateError::Invalid("zero scan bound"));
     }
@@ -470,7 +486,56 @@ pub async fn fetch_esplora_with_known_activity(
         funding = funding.chain_tip(tip);
     }
     let funding_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Funding);
-    let response = client
+    let snapshot_client;
+    // A strict, per-operation snapshot feeds the existing BDK graph/anchor
+    // implementation. No mutable evidence survives this call. Large collections
+    // use the legacy path before any speculative reads, bounding extra memory.
+    let txids = outputs.keys().map(|op| op.txid).collect::<BTreeSet<_>>();
+    let funding_client = if batch_outspends && !txids.is_empty() && txids.len() <= 64 {
+        let mut txs = HashMap::new();
+        let mut bytes = 0usize;
+        let results = stream::iter(txids.iter().copied()).map(|id| async move {
+            let tx = client.get_tx_info(&id).await?.ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
+            if tx.txid != id || tx.to_tx().compute_txid() != id {
+                return Err(CurrentStateError::Invalid("funding transaction identity mismatch"));
+            }
+            Ok::<_, CurrentStateError>((id, tx))
+        }).buffer_unordered(parallel_requests);
+        futures_util::pin_mut!(results);
+        while let Some((id, tx)) = results.try_next().await? {
+            bytes = bytes.checked_add(tx.to_tx().total_size()).ok_or(CurrentStateError::Invalid("funding snapshot too large"))?;
+            if bytes > 16 * 1024 * 1024 { return Err(CurrentStateError::Invalid("funding snapshot too large")); }
+            txs.insert(id, tx);
+        }
+        for (outpoint, expected) in &outputs {
+            let tx = txs.get(&outpoint.txid).ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
+            if tx.to_tx().output.get(outpoint.vout as usize) != Some(expected) {
+                return Err(CurrentStateError::Invalid("funding output mismatch"));
+            }
+        }
+        let ids = txids.iter().copied().collect::<Vec<_>>();
+        let mut statuses = HashMap::new();
+        for ids in ids.chunks(8) {
+            let batch = client.get_outspends_batch(ids).await?;
+            for (id, statuses_for_tx) in ids.iter().zip(batch) {
+                let tx = txs.get(id).ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
+                if statuses_for_tx.len() != tx.vout.len() {
+                    return Err(CurrentStateError::Invalid("incomplete outspend coverage"));
+                }
+                for (index, status) in statuses_for_tx.into_iter().enumerate() {
+                    if status.spent != status.txid.is_some()
+                        || status.spent != status.vin.is_some()
+                        || status.spent != status.status.is_some() {
+                        return Err(CurrentStateError::Invalid("inconsistent outspend status"));
+                    }
+                    statuses.insert((*id, index as u64), status);
+                }
+            }
+        }
+        snapshot_client = client.with_read_snapshot(txs, statuses);
+        &snapshot_client
+    } else { client };
+    let response = funding_client
         .sync(funding.build(), parallel_requests)
         .await
         .map_err(|error| CurrentStateError::Backend(*error))?;

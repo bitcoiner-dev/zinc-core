@@ -717,6 +717,7 @@ name = "esplora-client"
 version = "0.12.3"
 dependencies = [
  "bitcoin",
+ "futures-util",
  "hex-conservative 0.2.2",
  "log",
  "reqwest",

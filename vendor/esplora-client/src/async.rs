@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::block::Header as BlockHeader;
@@ -43,6 +44,8 @@ pub struct AsyncClient<S = DefaultSleeper> {
     client: Client,
     /// Number of times to retry a request
     max_retries: usize,
+    // Read evidence is owned by one current-state operation, never a durable cache.
+    read_snapshot: Option<Arc<(HashMap<Txid, Tx>, HashMap<(Txid, u64), OutputStatus>)>>,
     /// Marker for the type of sleeper used
     marker: PhantomData<S>,
 }
@@ -78,6 +81,7 @@ impl<S: Sleeper> AsyncClient<S> {
             url: builder.base_url,
             client: client_builder.build()?,
             max_retries: builder.max_retries,
+            read_snapshot: None,
             marker: PhantomData,
         })
     }
@@ -88,6 +92,7 @@ impl<S: Sleeper> AsyncClient<S> {
             url,
             client,
             max_retries: crate::DEFAULT_MAX_RETRIES,
+            read_snapshot: None,
             marker: PhantomData,
         }
     }
@@ -321,6 +326,9 @@ impl<S: Sleeper> AsyncClient<S> {
 
     /// Get transaction info given its [`Txid`].
     pub async fn get_tx_info(&self, txid: &Txid) -> Result<Option<Tx>, Error> {
+        if let Some(snapshot) = &self.read_snapshot {
+            if let Some(tx) = snapshot.0.get(txid) { return Ok(Some(tx.clone())); }
+        }
         self.get_opt_response_json(&format!("/tx/{txid}")).await
     }
 
@@ -328,6 +336,43 @@ impl<S: Sleeper> AsyncClient<S> {
     pub async fn get_tx_outspends(&self, txid: &Txid) -> Result<Vec<OutputStatus>, Error> {
         self.get_response_json(&format!("/tx/{txid}/outspends"))
             .await
+    }
+
+    /// Read a bounded public mempool/Electrs outspend batch. Call only for a
+    /// deliberately selected capable provider; errors never fall back or replay.
+    pub async fn get_outspends_batch(&self, txids: &[Txid]) -> Result<Vec<Vec<OutputStatus>>, Error> {
+        const LIMIT: usize = 1024 * 1024;
+        if txids.is_empty() || txids.len() > 8 || txids.iter().collect::<HashSet<_>>().len() != txids.len() {
+            return Err(Error::InvalidResponse);
+        }
+        let ids = txids.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+        let once = Self { url: self.url.clone(), client: self.client.clone(), max_retries: 0,
+            read_snapshot: None, marker: PhantomData };
+        let response = once.get_with_retry_policy(&format!("{}/txs/outspends?txids={ids}", self.url), true).await?;
+        if !response.status().is_success() {
+            return Err(Error::HttpResponse { status: response.status().as_u16(), message: "outspend batch failed".into() });
+        }
+        if response.content_length().is_some_and(|n| n > LIMIT as u64) { return Err(Error::InvalidResponse); }
+        // Bound decoded/chunked bodies as well as Content-Length on native/WASM.
+        use futures_util::StreamExt;
+        let mut chunks = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            if chunk.len() > LIMIT - bytes.len() { return Err(Error::InvalidResponse); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let result: Vec<Vec<OutputStatus>> = serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)?;
+        if result.len() != txids.len() { return Err(Error::InvalidResponse); }
+        Ok(result)
+    }
+
+    /// Supply fresh read evidence to BDK for this operation alone. This clone
+    /// must not be persisted or reused by a later synchronization.
+    pub fn with_read_snapshot(&self, txs: HashMap<Txid, Tx>, statuses: HashMap<(Txid, u64), OutputStatus>) -> Self where S: Clone {
+        let mut client = self.clone();
+        client.read_snapshot = Some(Arc::new((txs, statuses)));
+        client
     }
 
     /// Get a [`BlockHeader`] given a particular block hash.
@@ -369,6 +414,9 @@ impl<S: Sleeper> AsyncClient<S> {
         txid: &Txid,
         index: u64,
     ) -> Result<Option<OutputStatus>, Error> {
+        if let Some(snapshot) = &self.read_snapshot {
+            if let Some(status) = snapshot.1.get(&(*txid, index)) { return Ok(Some(status.clone())); }
+        }
         self.get_opt_response_json(&format!("/tx/{txid}/outspend/{index}"))
             .await
     }

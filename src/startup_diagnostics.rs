@@ -132,8 +132,8 @@ fn endpoint(url: &str) -> &'static str {
         } else {
             "script"
         }
-    } else if path.contains("/tx/") {
-        if path.contains("/outspend/") {
+    } else if path.contains("/tx/") || path == "/txs/outspends" {
+        if path.contains("/outspend/") || path == "/txs/outspends" {
             "outspend"
         } else {
             "transaction"
@@ -158,6 +158,7 @@ mod tests {
             ("scripthash/private?secret=x", "script"),
             ("scripthash/private/utxo", "utxo"),
             ("tx/private/outspend/123", "outspend"),
+            ("txs/outspends?txids=private", "outspend"),
             ("tx/private", "transaction"),
             ("blocks/tip/hash", "tip"),
             ("block-height/42", "block-hash"),

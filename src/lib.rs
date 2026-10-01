@@ -2575,10 +2575,11 @@ impl ZincWasmWallet {
 
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = sync)]
-    pub fn sync(&self, esplora_url: String) -> Result<js_sys::Promise, JsValue> {
+    pub fn sync(&self, esplora_url: String, batch_outspends: Option<bool>) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         use crate::builder::configured_esplora_client;
 
+        let batch_outspends = batch_outspends.unwrap_or_else(|| esplora_url.trim_end_matches('/') == "https://esplora.zincwallet.app");
         let inner_rc = self.inner.clone();
         let sync_reads = self.sync_reads.clone();
         let network = self.state_snapshot().network;
@@ -2657,13 +2658,13 @@ impl ZincWasmWallet {
             // The roles are independent reads. One cancellation owner covers
             // the joined pair; neither update is published before both succeed.
             let payment = sync_req.payment.map(|request| {
-                crate::current_state::fetch_esplora_with_known_activity(
-                    &client, request, &sync_req.active_scripts, 20, 5,
+                crate::current_state::fetch_esplora_with_policy(
+                    &client, request, &sync_req.active_scripts, 20, 5, batch_outspends,
                 )
             });
             let pair = sync_reads.run(crate::sync_pair::fetch(
-                crate::current_state::fetch_esplora_with_known_activity(
-                    &client, sync_req.taproot, &sync_req.active_scripts, 20, 5,
+                crate::current_state::fetch_esplora_with_policy(
+                    &client, sync_req.taproot, &sync_req.active_scripts, 20, 5, batch_outspends,
                 ),
                 payment,
             )).await.map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?;

@@ -97,6 +97,11 @@ features = [
 ]
 default-features = false
 
+[dependencies.futures-util]
+version = "0.3"
+default-features = false
+features = ["std"]
+
 [dependencies.hex]
 version = "0.2"
 package = "hex-conservative"
@@ -111,7 +116,7 @@ optional = true
 
 [dependencies.reqwest]
 version = "0.12"
-features = ["json"]
+features = ["json", "stream"]
 optional = true
 default-features = false
 
