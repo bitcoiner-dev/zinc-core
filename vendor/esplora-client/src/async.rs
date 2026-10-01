@@ -455,6 +455,21 @@ impl<S: Sleeper> AsyncClient<S> {
         self.get_response_json(&path).await
     }
 
+    /// Get current script statistics without consulting or populating a transport cache.
+    /// Suitable for negative current-state proofs; callers must validate both summaries.
+    pub async fn get_scripthash_stats_fresh(&self, script: &Script) -> Result<ScriptHashStats, Error> {
+        let script_hash = sha256::Hash::hash(script.as_bytes());
+        let url = format!("{}/scripthash/{script_hash}", self.url);
+        let response = self.get_with_retry_policy(&url, true).await?;
+        if !response.status().is_success() {
+            return Err(Error::HttpResponse {
+                status: response.status().as_u16(),
+                message: response.text().await?,
+            });
+        }
+        response.json::<ScriptHashStats>().await.map_err(Error::Reqwest)
+    }
+
     /// Get transaction history for the specified address, sorted with newest first.
     ///
     /// Returns up to 50 mempool transactions plus the first 25 confirmed transactions.
@@ -640,12 +655,24 @@ impl<S: Sleeper> AsyncClient<S> {
     /// Sends a GET request to the given `url`, retrying failed attempts
     /// for retryable error codes until max retries hit.
     async fn get_with_retry(&self, url: &str) -> Result<Response, Error> {
+        self.get_with_retry_policy(url, false).await
+    }
+
+    async fn get_with_retry_policy(&self, url: &str, fresh: bool) -> Result<Response, Error> {
         let mut delay = BASE_BACKOFF_MILLIS;
         let mut attempts = 0;
 
         loop {
             S::before_request(url).await;
-            let response = self.client.get(url).send().await?;
+            let request = self.client.get(url);
+            // Fetch cache mode avoids adding a custom CORS request header in browsers.
+            #[cfg(target_arch = "wasm32")]
+            let request = if fresh { request.fetch_cache_no_store() } else { request };
+            #[cfg(not(target_arch = "wasm32"))]
+            let request = if fresh {
+                request.header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+            } else { request };
+            let response = request.send().await?;
             S::after_response(url, response.status().as_u16(), response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
             match response {
                 resp if attempts < self.max_retries && is_status_retryable(resp.status()) => {

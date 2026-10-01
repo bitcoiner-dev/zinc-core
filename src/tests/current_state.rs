@@ -173,7 +173,7 @@ async fn known_activity_skips_stats_and_spent_only_discovery_still_resets_gap() 
             mockito::Matcher::Regex("^/scripthash/[^/]+/utxo$".into()),
         )
         .with_body("[]")
-        .expect(4)
+        .expect(2)
         .create_async()
         .await;
     let mut stats_mocks = Vec::new();
@@ -631,7 +631,7 @@ async fn full_rescan_covers_revealed_addresses_before_applying_stop_gap() {
                 mockito::Matcher::Regex("^/scripthash/[^/]+/utxo$".into()),
             )
             .with_body("[]")
-            .expect(expected_reads)
+            .expect(0)
             .create_async()
             .await;
         let scripts = (0..40)
@@ -690,7 +690,7 @@ async fn high_activity_current_state_never_requests_history() {
         "chain_stats":{"tx_count":100000,"funded_txo_count":200000,"funded_txo_sum":999999999,
             "spent_txo_count":199999,"spent_txo_sum":999949999},
         "mempool_stats":{"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0}
-    }).to_string()).expect(0).create_async().await;
+    }).to_string()).expect(1).create_async().await;
     let utxos = server
         .mock("GET", format!("{path}/utxo").as_str())
         .with_body(
@@ -736,5 +736,53 @@ async fn high_activity_current_state_never_requests_history() {
     );
     for mock in [history, tip, stats, utxos, funding, spend] {
         mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn unknown_script_negative_proof_requires_complete_fresh_statistics() {
+    use crate::builder::{SyncRequestType, SyncSleeper};
+    use bitcoin::hashes::sha256;
+    use serde_json::json;
+    let zero = json!({"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,
+        "spent_txo_count":0,"spent_txo_sum":0});
+    let active = json!({"tx_count":1,"funded_txo_count":1,"funded_txo_sum":50000,
+        "spent_txo_count":0,"spent_txo_sum":0});
+    let inconsistent = json!({"tx_count":0,"funded_txo_count":1,"funded_txo_sum":50000,
+        "spent_txo_count":0,"spent_txo_sum":0});
+    // Valid negative evidence, spent-only/confirmed and mempool evidence,
+    // contradictory counters, missing fields and transport failure.
+    for (chain, mempool, status, output_status, reads, valid) in [
+        (zero.clone(), zero.clone(), 200, 200, 0, true),
+        (active.clone(), zero.clone(), 200, 200, 1, true),
+        (active.clone(), zero.clone(), 200, 503, 1, false),
+        (zero.clone(), active, 200, 200, 1, true),
+        (inconsistent, zero.clone(), 200, 200, 0, false),
+        (json!({"tx_count":0}), zero.clone(), 200, 200, 0, false),
+        (zero.clone(), zero, 503, 200, 0, false),
+    ] {
+        let script = wallet().peek_taproot_address(0).script_pubkey();
+        let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let tip = server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32))
+            .expect(if valid { 2 } else { 1 }).create_async().await;
+        let stats = server.mock("GET", path.as_str())
+            .match_header("cache-control", "no-cache, no-store")
+            .with_status(status).with_body(json!({"chain_stats":chain,"mempool_stats":mempool}).to_string())
+            .expect(1).create_async().await;
+        let utxos = server.mock("GET", format!("{path}/utxo").as_str())
+            .with_status(output_status).with_body("[]").expect(reads).create_async().await;
+        let client = esplora_client::Builder::new(&server.url()).max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>().unwrap();
+        let request = bdk_chain::spk_client::SyncRequest::builder_at(1000)
+            .spks_with_indexes([((KeychainKind::External, 0), script)]).build();
+        let result = crate::current_state::fetch_esplora(&client,
+            SyncRequestType::Incremental(request), 5, 1).await;
+        assert_eq!(result.is_ok(), valid);
+        if let Ok(result) = result {
+            assert!(result.outputs.is_empty());
+            assert_eq!(result.active_scripts.len(), reads);
+        }
+        for mock in [tip, stats, utxos] { mock.assert_async().await; }
     }
 }

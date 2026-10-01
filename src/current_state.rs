@@ -298,16 +298,29 @@ async fn read_script(
     script: ScriptBuf,
     known_active: bool,
 ) -> Result<ScriptRead, CurrentStateError> {
-    // Current outputs are never cached, including for historically used
-    // scripts. An empty response does not erase the fact an address was used.
-    let outputs = client.get_scripthash_utxos(&script).await?;
-    let active = if known_active || !outputs.is_empty() {
+    // Historical hints are positive-only: they never authorize cached outputs.
+    // For an unknown script, a fresh all-zero chain AND mempool summary proves
+    // absence at this read without a redundant UTXO request. Nonzero summaries
+    // are gap evidence only; their counts/sums never populate balances or BDK.
+    let active = if known_active {
         true
     } else {
-        // A spent-only address must still reset the discovery gap. No activity
-        // is inferred from an unsuccessful stats or UTXO read.
-        let stats = client.get_scripthash_stats(&script).await?;
-        stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0
+        let stats = client.get_scripthash_stats_fresh(&script).await?;
+        let mut active = false;
+        for summary in [stats.chain_stats, stats.mempool_stats] {
+            let has_outputs = summary.funded_txo_count != 0 || summary.funded_txo_sum != 0
+                || summary.spent_txo_count != 0 || summary.spent_txo_sum != 0;
+            if summary.tx_count == 0 && has_outputs {
+                return Err(CurrentStateError::Invalid("inconsistent script statistics"));
+            }
+            active |= summary.tx_count != 0;
+        }
+        active
+    };
+    let outputs = if active {
+        client.get_scripthash_utxos(&script).await?
+    } else {
+        Vec::new()
     };
     Ok(ScriptRead {
         script,
