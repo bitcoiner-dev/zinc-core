@@ -50,6 +50,7 @@ mod discovery_activity_memo;
 pub mod crypto;
 /// Current UTXO synchronization, separate from paginated Activity history.
 pub mod current_state;
+pub mod sync_pair;
 pub mod error;
 /// Vendor-neutral capability negotiation for hardware and other external signers.
 pub mod external_signing;
@@ -2652,78 +2653,31 @@ impl ZincWasmWallet {
                 }
             };
 
-            // 2. Fetch (NO LOCK HELD)
-            let vault_update_res = sync_reads
-            .run(crate::current_state::fetch_esplora_with_known_activity(
-                &client,
-                sync_req.taproot,
-                &sync_req.active_scripts,
-                20,
-                5,
-            ))
-            .await
-            .map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?
-            .map_err(|error| error.backend_failure());
-
-            let vault_update = match vault_update_res {
-                Ok(u) => u,
-                Err(e) => {
+            // The roles are independent reads. One cancellation owner covers
+            // the joined pair; neither update is published before both succeed.
+            let payment = sync_req.payment.map(|request| {
+                crate::current_state::fetch_esplora_with_known_activity(
+                    &client, request, &sync_req.active_scripts, 20, 5,
+                )
+            });
+            let pair = sync_reads.run(crate::sync_pair::fetch(
+                crate::current_state::fetch_esplora_with_known_activity(
+                    &client, sync_req.taproot, &sync_req.active_scripts, 20, 5,
+                ),
+                payment,
+            )).await.map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?;
+            let (vault_update, payment_update) = match pair {
+                Ok(updates) => updates,
+                Err((error, completed)) => {
                     ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
                     if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
-                        &inner_rc,
-                        sync_generation,
-                        SYNC_STALE_ERROR,
-                    ) {
-                        return Err(stale);
-                    }
+                        &inner_rc, sync_generation, SYNC_STALE_ERROR,
+                    ) { return Err(stale); }
                     return Err(backend_scan_failure_to_js(
-                        e,
-                        last_complete_tip,
-                        sync_generation,
-                        0,
-                        total_keychains,
+                        error.backend_failure(), last_complete_tip, sync_generation,
+                        completed, total_keychains,
                     ));
                 }
-            };
-
-            let payment_update = if let Some(req_type) = sync_req.payment {
-                let update_res = sync_reads
-                .run(crate::current_state::fetch_esplora_with_known_activity(
-                    &client,
-                    req_type,
-                    &sync_req.active_scripts,
-                    20,
-                    5,
-                ))
-                .await
-                .map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?
-                .map_err(|error| error.backend_failure());
-
-                match update_res {
-                    Ok(u) => Some(u),
-                    Err(e) => {
-                        ZincWasmWallet::clear_syncing_if_generation_matches(
-                            &inner_rc,
-                            sync_generation,
-                        );
-                        if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
-                            &inner_rc,
-                            sync_generation,
-                            SYNC_STALE_ERROR,
-                        ) {
-                            return Err(stale);
-                        }
-                        return Err(backend_scan_failure_to_js(
-                            e,
-                            last_complete_tip,
-                            sync_generation,
-                            1,
-                            total_keychains,
-                        ));
-                    }
-                }
-            } else {
-                None
             };
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync: chain client returned");
 

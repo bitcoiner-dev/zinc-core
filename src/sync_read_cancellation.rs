@@ -50,6 +50,27 @@ mod tests {
     use std::{cell::Cell, task::Poll};
 
     #[test]
+    fn pair_cancellation_drops_both_roles_not_only_the_last_polled_role() {
+        struct Pending(Rc<Cell<bool>>);
+        impl Future for Pending {
+            type Output = Result<u8, ()>;
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+        impl Drop for Pending { fn drop(&mut self) { self.0.set(true); } }
+        let (left, right) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        let owner = SyncReadCancellation::default();
+        let pair = owner.run(crate::sync_pair::fetch(Pending(left.clone()), Some(Pending(right.clone()))));
+        futures_util::pin_mut!(pair);
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(pair.as_mut().poll(&mut cx).is_pending());
+        owner.cancel();
+        assert!(matches!(pair.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        assert!(left.get() && right.get());
+    }
+
+    #[test]
     fn cancellation_drops_pending_work_and_clears_the_slot() {
         struct Pending(Rc<Cell<bool>>);
         impl Future for Pending {
