@@ -12,14 +12,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use web_time::Instant;
 
-// Four immediate requests, then ~29/s for at most 128 total startup requests.
-// This uses a bounded fraction of the deployed 30/s + 120 Esplora and
-// 20/s + 100 Ord burst budgets; steady state remains ~15/s. It is NOT a
+// Four immediate requests, then ~29/s for at most 192 total startup requests.
+// This stays under the deployed 30/s Esplora rate and leaves about a third
+// of the 20/s + 100 Ord burst for unpaced media; steady state remains ~15/s.
+// 192 covers a typical selected-account restore (discovery, coverage and
+// funding reads) at the startup rate. It is NOT a
 // continuously refilling token bucket. Only 60 seconds without dispatches or
 // responses rearms startup. Wallet/account changes never reset the origin.
 const SPACING: Duration = Duration::from_millis(67);
 const STARTUP_SPACING: Duration = Duration::from_millis(34);
-const STARTUP_REQUESTS: u16 = 128;
+const STARTUP_REQUESTS: u16 = 192;
 const IMMEDIATE_REQUESTS: u8 = 4;
 const IDLE_RESET: Duration = Duration::from_secs(60);
 const MAX_ORIGINS: usize = 128;
@@ -600,10 +602,13 @@ mod tests {
 
     #[test]
     fn bounded_startup_fits_deployed_ord_and_tight_esplora_budgets() {
-        for (rate, capacity) in [(20.0, 100.0), (30.0, 5.0)] {
+        // Unpaced inscription media shares the Ord budget, so startup must
+        // leave real burst headroom there, not merely avoid exhausting it.
+        for (rate, capacity, headroom) in [(20.0, 100.0, 30.0), (30.0, 5.0, 1.0)] {
             let mut time = Instant::now();
             let mut last = time;
             let mut tokens = capacity;
+            let mut lowest = capacity;
             let mut s = Schedule::default();
             for cycle in 0..3 {
                 if cycle > 0 {
@@ -621,11 +626,13 @@ mod tests {
                         tokens >= 1.0,
                         "startup exceeds modeled provider burst budget"
                     );
+                    lowest = lowest.min(tokens);
                     tokens -= 1.0;
                     last = time;
                 }
                 assert_eq!(s.startup_remaining, 0);
             }
+            assert!(lowest >= headroom, "startup leaves {lowest:.1} of {capacity} burst tokens");
         }
     }
 

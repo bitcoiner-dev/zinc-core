@@ -5,7 +5,6 @@
 pub(crate) enum Phase {
     InitialTip,
     Coverage,
-    CoverageBatch,
     Funding,
     Validation,
     FinalTip,
@@ -16,7 +15,6 @@ impl Phase {
         match self {
             Self::InitialTip => "initial-tip",
             Self::Coverage => "coverage",
-            Self::CoverageBatch => "coverage-batch",
             Self::Funding => "funding",
             Self::Validation => "validation",
             Self::FinalTip => "final-tip",

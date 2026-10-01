@@ -2557,6 +2557,22 @@ impl ZincWasmWallet {
     /// Retire an in-flight sync generation after the shell cancels or times out.
     /// Abort the owned network read as well as fencing its apply step. Already
     /// dispatched server work cannot be recalled; no later queued read proceeds.
+    /// Shells enable this for profiles that never rotate addresses (Zinc-created
+    /// seeds and named single-address providers). See the Core method.
+    #[wasm_bindgen(js_name = setPrimaryAddressScope)]
+    pub fn set_primary_address_scope(&self, enabled: bool) -> Result<(), JsValue> {
+        self.check_vitality()?;
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                inner.set_primary_address_scope(enabled);
+                Ok(())
+            }
+            Err(error) => Err(JsValue::from_str(&format!(
+                "Wallet busy (set_primary_address_scope): {error}"
+            ))),
+        }
+    }
+
     #[wasm_bindgen(js_name = retireSyncGeneration)]
     pub fn retire_sync_generation(&self) -> Result<(), JsValue> {
         self.check_vitality()?;

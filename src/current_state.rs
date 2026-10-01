@@ -331,6 +331,62 @@ async fn read_script(
     })
 }
 
+/// Gap-limit state for one keychain of a full scan. Slots are kept in dispatch
+/// (index) order; `None` marks a read still in flight.
+struct ScanBranch {
+    keychain: KeychainKind,
+    last_revealed: Option<u32>,
+    slots: Vec<(u32, Option<bool>)>,
+    settled: usize,
+    settled_gap: usize,
+    exhausted: bool,
+}
+
+impl ScanBranch {
+    fn new(keychain: KeychainKind, last_revealed: Option<u32>) -> Self {
+        Self { keychain, last_revealed, slots: Vec::new(), settled: 0, settled_gap: 0, exhausted: false }
+    }
+
+    /// Activity and every already-revealed index reset the trailing gap.
+    fn resets(&self, index: u32, active: Option<bool>) -> bool {
+        active == Some(true) || self.last_revealed.is_some_and(|last| index <= last)
+    }
+
+    /// Whether the next address is required, treating pending reads as unused.
+    /// Activity can only shorten the trailing gap, so this never over-reads.
+    fn may_dispatch(&mut self, stop_gap: usize) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        // Fold the completed in-order prefix once; it can never change again.
+        while self.settled_gap < stop_gap {
+            let Some(&(index, Some(active))) = self.slots.get(self.settled) else { break };
+            self.settled_gap = if self.resets(index, Some(active)) { 0 } else { self.settled_gap + 1 };
+            self.settled += 1;
+        }
+        let mut gap = self.settled_gap;
+        if gap >= stop_gap {
+            return false;
+        }
+        for &(index, active) in &self.slots[self.settled..] {
+            gap = if self.resets(index, active) { 0 } else { gap + 1 };
+            if gap >= stop_gap {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn dispatch(&mut self, index: u32) -> usize {
+        self.slots.push((index, None));
+        self.slots.len() - 1
+    }
+
+    fn complete(&mut self, slot: usize, active: bool) {
+        self.slots[slot].1 = Some(active);
+    }
+}
+
 /// Fetch a current-state update with bounded concurrency and no `/txs` calls.
 /// A full scan retains gap-limit discovery, including spent-only addresses and
 /// change. An incremental scan covers every already-revealed script.
@@ -393,52 +449,47 @@ pub async fn fetch_esplora_with_policy(
     let coverage_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Coverage);
     match request {
         SyncRequestType::Full(mut request) => {
-            for keychain in request.keychains() {
-                let last_revealed = request.last_revealed(&keychain);
-                let mut gap = 0usize;
-                loop {
-                    // Bound speculation by the remaining mandatory trailing gap.
-                    // Revealed indices still reset the gap below, so none are skipped.
-                    // A positive read at the boundary resets the gap and continues.
-                    let remaining_gap = stop_gap - gap;
-                    let batch: Vec<_> = request
-                        .iter_spks(keychain)
-                        .take(parallel_requests.min(remaining_gap))
-                        .collect();
-                    if batch.is_empty() {
-                        break;
-                    }
-                    let batch_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::CoverageBatch);
-                    let results: Vec<_> =
-                        stream::iter(batch.into_iter().map(|(index, script)| async move {
-                            let known_active = known_active_scripts.contains(&script);
+            // Replenish the role's bounded window as each read completes rather
+            // than waiting for a whole batch. An address is dispatched only when
+            // it is required even if every read still in flight proves unused,
+            // so the scanned set equals an in-order scan that stops after
+            // `stop_gap` consecutive unused, unrevealed addresses. Keychains
+            // share the bound; earlier keychains fill free slots first.
+            let mut branches: Vec<_> = request
+                .keychains()
+                .into_iter()
+                .map(|keychain| ScanBranch::new(keychain, request.last_revealed(&keychain)))
+                .collect();
+            let mut in_flight = futures_util::stream::FuturesUnordered::new();
+            loop {
+                for (branch_index, branch) in branches.iter_mut().enumerate() {
+                    while in_flight.len() < parallel_requests && branch.may_dispatch(stop_gap) {
+                        let Some((index, script)) = request.next_spk(branch.keychain) else {
+                            branch.exhausted = true;
+                            break;
+                        };
+                        let slot = branch.dispatch(index);
+                        let known_active = known_active_scripts.contains(&script);
+                        in_flight.push(async move {
                             read_script(client, script, known_active)
                                 .await
-                                .map(|read| (index, read))
-                        }))
-                        .buffered(parallel_requests)
-                        .try_collect()
-                        .await?;
-                    batch_timing.finish();
-                    // Process the entire batch, including any active address
-                    // after an empty run inside it, before deciding to stop.
-                    for (index, read) in results {
-                        if read.active {
-                            gap = 0;
-                            last_active_indices.insert(keychain, index);
-                        } else if last_revealed.is_some_and(|last| index <= last) {
-                            // A rescan must cover every already-revealed address,
-                            // even when an earlier gap exceeds the stop limit.
-                            gap = 0;
-                        } else {
-                            gap += 1;
-                        }
-                        reads.push(read);
-                    }
-                    if gap >= stop_gap {
-                        break;
+                                .map(|read| (branch_index, slot, index, read))
+                        });
                     }
                 }
+                let Some(result) = in_flight.next().await else {
+                    break;
+                };
+                let (branch_index, slot, index, read) = result?;
+                let branch = &mut branches[branch_index];
+                branch.complete(slot, read.active);
+                if read.active {
+                    last_active_indices
+                        .entry(branch.keychain)
+                        .and_modify(|last| *last = (*last).max(index))
+                        .or_insert(index);
+                }
+                reads.push(read);
             }
         }
         SyncRequestType::Incremental(mut request) => {

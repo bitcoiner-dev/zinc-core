@@ -999,3 +999,237 @@ async fn outspend_batches_bound_chunks_and_do_not_reuse_mutable_evidence_across_
     assert!(client.get_outspends_batch(&[id, id]).await.is_err());
     assert!(client.get_outspends_batch(&vec![id; 9]).await.is_err());
 }
+
+#[tokio::test]
+async fn full_scan_shares_window_across_keychains_with_exact_coverage() {
+    use crate::builder::{SyncRequestType, SyncSleeper};
+    use bitcoin::hashes::sha256;
+    use serde_json::json;
+    // Receive and change share one bounded window; each keeps its own exact
+    // trailing gap, activity resets and revealed frontier. No surplus reads.
+    for (stop_gap, concurrency, external_active, internal_active, internal_revealed, external_expected, internal_expected) in [
+        (20, 5, vec![0u32], vec![], None, 21u32, 20u32),
+        (5, 5, vec![0, 5], vec![2], Some(9), 11, 15),
+        (3, 8, vec![], vec![0, 3, 6], None, 3, 10),
+    ] {
+        let wallet = wallet();
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let tip = server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32))
+            .expect(2).create_async().await;
+        let mut mocks = vec![tip];
+        let mut request = bdk_chain::spk_client::FullScanRequest::builder_at(1000);
+        for (keychain, offset, active, expected) in [
+            (KeychainKind::External, 0u32, &external_active, external_expected),
+            (KeychainKind::Internal, 100, &internal_active, internal_expected),
+        ] {
+            let scripts: Vec<_> = (0..40u32).map(|index| (index, wallet.peek_taproot_address(offset + index).script_pubkey())).collect();
+            for (index, script) in &scripts {
+                let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
+                let positive = active.contains(index);
+                let zero = json!({"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,
+                    "spent_txo_count":0,"spent_txo_sum":0});
+                let spent_only = json!({"tx_count":2,"funded_txo_count":1,"funded_txo_sum":1000,
+                    "spent_txo_count":1,"spent_txo_sum":1000});
+                mocks.push(server.mock("GET", path.as_str()).with_body(json!({
+                    "chain_stats": if positive { spent_only } else { zero.clone() },
+                    "mempool_stats":zero
+                }).to_string()).expect(usize::from(*index < expected)).create_async().await);
+                mocks.push(server.mock("GET", format!("{path}/utxo").as_str()).with_body("[]")
+                    .expect(usize::from(*index < expected && positive)).create_async().await);
+            }
+            request = request.spks_for_keychain(keychain, scripts);
+        }
+        if let Some(index) = internal_revealed {
+            request = request.last_revealed_for_keychain(KeychainKind::Internal, index);
+        }
+        let client = esplora_client::Builder::new(&server.url()).max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>().unwrap();
+        let result = crate::current_state::fetch_esplora(&client,
+            SyncRequestType::Full(request.build()), stop_gap, concurrency).await.unwrap();
+        assert!(result.outputs.is_empty());
+        assert_eq!(result.active_scripts.len(), external_active.len() + internal_active.len());
+        let last = &result.update.last_active_indices;
+        assert_eq!(last.get(&KeychainKind::External).copied(), external_active.last().copied());
+        assert_eq!(last.get(&KeychainKind::Internal).copied(), internal_active.last().copied());
+        for mock in mocks { mock.assert_async().await; }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_scan_replenishes_window_without_waiting_for_a_slow_read() {
+    use crate::builder::{SyncRequestType, SyncSleeper};
+    use bitcoin::hashes::sha256;
+    use std::{
+        collections::HashMap,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Condvar, Mutex},
+        time::{Duration, Instant},
+    };
+    let wallet = wallet();
+    let scripts: Vec<_> = (0..40u32).map(|index| (index, wallet.peek_taproot_address(index).script_pubkey())).collect();
+    let paths: HashMap<String, u32> = scripts.iter()
+        .map(|(index, script)| (format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes())), *index))
+        .collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    // (requested indices, reads currently held by the server, peak held)
+    let state = Arc::new((Mutex::new((Vec::<u32>::new(), 0usize, 0usize)), Condvar::new()));
+    let shared = state.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut handlers = Vec::new();
+        // Two tip reads plus exactly the 20 required script reads.
+        while handlers.len() < 22 && Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            let shared = shared.clone();
+            let paths = paths.clone();
+            handlers.push(std::thread::spawn(move || {
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new(); let mut byte = [0u8; 1];
+                while !bytes.ends_with(b"\r\n\r\n") { socket.read_exact(&mut byte).unwrap(); bytes.push(byte[0]); }
+                let request = String::from_utf8(bytes).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap().split('?').next().unwrap().to_string();
+                let response = if path == "/blocks/tip/hash" {
+                    Some("07".repeat(32))
+                } else {
+                    let index = paths[&path];
+                    let (lock, wake) = &*shared;
+                    let mut guard = lock.lock().unwrap();
+                    guard.0.push(index);
+                    guard.1 += 1;
+                    guard.2 = guard.2.max(guard.1);
+                    wake.notify_all();
+                    if index == 0 {
+                        // Hold the first read until the sixth address is requested.
+                        // A whole-batch barrier of five could never get there.
+                        guard = wake.wait_timeout_while(guard, Duration::from_secs(3), |held| !held.0.contains(&5)).unwrap().0;
+                    }
+                    let released = index != 0 || guard.0.contains(&5);
+                    guard.1 -= 1;
+                    drop(guard);
+                    let zero = r#"{"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0}"#;
+                    released.then(|| format!(r#"{{"chain_stats":{zero},"mempool_stats":{zero}}}"#))
+                };
+                match response {
+                    Some(body) => socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).unwrap(),
+                    None => socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(),
+                }
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    });
+    let request = bdk_chain::spk_client::FullScanRequest::builder_at(1000)
+        .spks_for_keychain(KeychainKind::External, scripts).build();
+    let client = esplora_client::Builder::new(&url).max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>().unwrap();
+    let result = crate::current_state::fetch_esplora(&client, SyncRequestType::Full(request), 20, 5).await;
+    server.join().unwrap();
+    let result = result.unwrap();
+    assert!(result.active_scripts.is_empty());
+    let (requested, _, peak) = state.0.lock().unwrap().clone();
+    let mut requested = requested;
+    requested.sort_unstable();
+    assert_eq!(requested, (0..20).collect::<Vec<_>>());
+    assert!(peak <= 5, "window exceeded its bound: {peak}");
+}
+
+fn full_scan_lengths(request: crate::builder::SyncRequestType) -> Vec<(KeychainKind, usize)> {
+    match request {
+        crate::builder::SyncRequestType::Full(mut request) => request
+            .keychains()
+            .into_iter()
+            .map(|keychain| (keychain, request.iter_spks(keychain).take(50).count()))
+            .collect(),
+        crate::builder::SyncRequestType::Incremental(_) => panic!("expected a full scan"),
+    }
+}
+
+#[test]
+fn primary_address_scope_limits_initial_full_scans_to_child_zero_and_revealed() {
+    use crate::builder::{AddressScheme, DerivationMode};
+    let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([37; 64]))
+        .with_scheme(AddressScheme::Dual)
+        .build()
+        .unwrap();
+    let gap = vec![(KeychainKind::External, 50), (KeychainKind::Internal, 50)];
+    let primary = vec![(KeychainKind::External, 1), (KeychainKind::Internal, 1)];
+    // Default remains the unbounded gap walk.
+    assert_eq!(full_scan_lengths(wallet.prepare_requests(false).taproot), gap);
+
+    wallet.set_primary_address_scope(true);
+    let request = wallet.prepare_requests(false);
+    assert_eq!(full_scan_lengths(request.taproot), primary);
+    assert_eq!(full_scan_lengths(request.payment.expect("dual payment role")), primary);
+    // An explicit rescan still walks the full unused gap.
+    assert_eq!(full_scan_lengths(wallet.prepare_requests(true).taproot), gap);
+    // Children this wallet revealed are always covered.
+    for _ in 0..3 {
+        wallet.next_taproot_address().unwrap();
+    }
+    // Index zero is revealed at build, so three more reveal children 0..=3.
+    assert_eq!(full_scan_lengths(wallet.prepare_requests(false).taproot),
+        vec![(KeychainKind::External, 4), (KeychainKind::Internal, 1)]);
+
+    // Index-mode descriptors already have one child; the scope does not alter them.
+    let indexed = || WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([37; 64]))
+        .with_derivation_mode(DerivationMode::Index)
+        .with_account_index(2)
+        .build()
+        .unwrap();
+    let mut scoped = indexed();
+    scoped.set_primary_address_scope(true);
+    assert_eq!(full_scan_lengths(scoped.prepare_requests(false).taproot),
+        full_scan_lengths(indexed().prepare_requests(false).taproot));
+}
+
+#[tokio::test]
+async fn primary_address_scope_scan_reads_only_child_zero_of_each_branch() {
+    use crate::builder::{AddressScheme, SyncRequestType, SyncSleeper};
+    use bitcoin::hashes::sha256;
+    use serde_json::json;
+    let mut wallet = WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([37; 64]))
+        .with_scheme(AddressScheme::Dual)
+        .build()
+        .unwrap();
+    wallet.set_primary_address_scope(true);
+    let request = wallet.prepare_requests(false);
+    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+    let zero = json!({"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0});
+    let mut mocks = vec![
+        server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32)).expect(4).create_async().await,
+    ];
+    let client = esplora_client::Builder::new(&server.url()).max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>().unwrap();
+    let mut reads = 0;
+    for role in [Some(request.taproot), request.payment] {
+        let Some(SyncRequestType::Full(mut role)) = role else { panic!("expected a full scan") };
+        // The same finite lists, without the chain-tip block reads of BDK's funding sync.
+        let mut scan = bdk_chain::spk_client::FullScanRequest::builder_at(1000);
+        for keychain in role.keychains() {
+            let spks: Vec<_> = role.iter_spks(keychain).collect();
+            for (_, script) in &spks {
+                reads += 1;
+                mocks.push(server.mock("GET", format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes())).as_str())
+                    .with_body(json!({"chain_stats": zero, "mempool_stats": zero}).to_string())
+                    .expect(1).create_async().await);
+            }
+            scan = scan.spks_for_keychain(keychain, spks);
+        }
+        // Even with a 20-address gap configured, the finite lists end the scan.
+        crate::current_state::fetch_esplora(&client, SyncRequestType::Full(scan.build()), 20, 5)
+            .await.unwrap();
+    }
+    assert_eq!(reads, 4);
+    for mock in mocks { mock.assert_async().await; }
+}

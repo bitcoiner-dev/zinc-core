@@ -1281,6 +1281,10 @@ pub struct ZincWallet {
     pub(crate) mode: ProfileMode,
     /// Active scan policy for address discovery.
     pub(crate) scan_policy: ScanPolicy,
+    /// Set by shells for profiles whose wallets only ever use child zero of
+    /// each branch. Full scans then cover receive/change zero plus revealed
+    /// children instead of walking the unused gap; explicit rescans do not.
+    pub(crate) primary_address_scope: bool,
     // Ordinal Shield State (In-Memory Only)
     /// Outpoints currently marked as inscribed/protected.
     pub(crate) inscribed_utxos: std::collections::HashSet<bitcoin::OutPoint>,
@@ -2628,9 +2632,13 @@ impl ZincWallet {
         // addresses past the revealed frontier are picked up by a forced rescan.
         let full = force_full || self.needs_full_scan();
         let policy = self.scan_policy;
+        // Index-mode descriptors already have exactly one child per branch.
+        let primary_only = full && !force_full && self.primary_address_scope && self.fixed_index().is_none();
 
         let build = |w: &Wallet| -> SyncRequestType {
-            if full {
+            if primary_only {
+                SyncRequestType::Full(Self::primary_scope_full_scan_request(w, now))
+            } else if full {
                 SyncRequestType::Full(Self::flexible_full_scan_request(w, policy, now))
             } else {
                 SyncRequestType::Incremental(Self::flexible_sync_request(w, now))
@@ -2649,6 +2657,13 @@ impl ZincWallet {
                 .map(|state| state.active_scripts().clone())
                 .unwrap_or_default(),
         }
+    }
+
+    /// Restrict initial full scans to child zero of each branch plus revealed
+    /// children. Only for profiles that never rotate addresses: Zinc-created
+    /// seeds and named single-address providers. Explicit rescans stay full.
+    pub fn set_primary_address_scope(&mut self, enabled: bool) {
+        self.primary_address_scope = enabled;
     }
 
     /// Request that the next `prepare_requests` performs a full gap-limit scan (it then reverts to
@@ -8482,6 +8497,22 @@ impl ZincWallet {
         wallet.start_full_scan_at(now).build()
     }
 
+    /// Full scan of a non-rotating profile: child zero of every branch plus any
+    /// revealed children. The finite lists end the scan without an unused-gap
+    /// walk; every listed script still gets the same fresh coverage reads.
+    fn primary_scope_full_scan_request(wallet: &Wallet, now: u64) -> FullScanRequest<KeychainKind> {
+        let mut request = wallet.start_full_scan_at(now);
+        let keychains: Vec<KeychainKind> = wallet.keychains().map(|(keychain, _)| keychain).collect();
+        for keychain in keychains {
+            let last = wallet.derivation_index(keychain).unwrap_or(0);
+            let spks: Vec<_> = (0..=last)
+                .map(|index| (index, wallet.peek_address(keychain, index).script_pubkey()))
+                .collect();
+            request = request.spks_for_keychain(keychain, spks);
+        }
+        request.build()
+    }
+
     /// Build an incremental sync request over the wallet's already-revealed spks. Much cheaper than a
     /// full scan (it doesn't walk the gap), so it's the default for routine syncs. Uses the explicit
     /// `start_time` variant to avoid the std-time panic on wasm32-unknown-unknown.
@@ -8914,6 +8945,7 @@ impl WalletBuilder {
             account_index: self.account_index,
             mode: self.mode,
             scan_policy: self.scan_policy,
+            primary_address_scope: false,
             inscribed_utxos: std::collections::HashSet::default(),
             rare_sat_outpoints: std::collections::HashMap::new(),
             inscriptions: Vec::new(),
@@ -9072,6 +9104,7 @@ impl WalletBuilder {
             account_index,
             mode: ProfileMode::Watch,
             scan_policy: self.scan_policy,
+            primary_address_scope: false,
             inscribed_utxos: std::collections::HashSet::default(),
             rare_sat_outpoints: std::collections::HashMap::new(),
             inscriptions: Vec::new(),
