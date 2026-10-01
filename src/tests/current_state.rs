@@ -602,7 +602,7 @@ fn stale_ord_response_is_rejected_and_unclassified_returning_coins_stay_protecte
 async fn full_rescan_covers_revealed_addresses_before_applying_stop_gap() {
     use crate::builder::{SyncRequestType, SyncSleeper};
     use serde_json::json;
-    for (last_revealed, expected_reads) in [(None, 5), (Some(12), 20)] {
+    for (last_revealed, expected_reads) in [(None, 5), (Some(12), 18)] {
         let wallet = wallet();
         let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
         let history = server
@@ -784,5 +784,55 @@ async fn unknown_script_negative_proof_requires_complete_fresh_statistics() {
             assert_eq!(result.active_scripts.len(), reads);
         }
         for mock in [tip, stats, utxos] { mock.assert_async().await; }
+    }
+}
+
+#[tokio::test]
+async fn full_scan_bounds_final_batch_but_preserves_activity_boundary_and_revealed_coverage() {
+    use crate::builder::{SyncRequestType, SyncSleeper};
+    use bitcoin::hashes::sha256;
+    use serde_json::json;
+    // Exact trailing gap, activity on the final required index, multiple resets,
+    // a gap smaller/nondivisible than concurrency, and a revealed inactive frontier.
+    for (stop_gap, concurrency, active, revealed, expected) in [
+        (20, 5, vec![0], None, 21),
+        (20, 5, vec![0, 20], None, 41),
+        (7, 5, vec![], None, 7),
+        (7, 5, vec![0, 7], None, 15),
+        (3, 8, vec![0, 3, 6], None, 10),
+        (5, 5, vec![], Some(12), 18),
+        (5, 5, vec![12], Some(12), 18),
+    ] {
+        let wallet = wallet();
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let tip = server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32))
+            .expect(2).create_async().await;
+        let mut mocks = vec![tip];
+        let scripts: Vec<_> = (0..60).map(|index| (index, wallet.peek_taproot_address(index).script_pubkey())).collect();
+        for (index, script) in &scripts {
+            let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
+            let positive = active.contains(index);
+            let zero = json!({"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,
+                "spent_txo_count":0,"spent_txo_sum":0});
+            let spent_only = json!({"tx_count":2,"funded_txo_count":1,"funded_txo_sum":1000,
+                "spent_txo_count":1,"spent_txo_sum":1000});
+            mocks.push(server.mock("GET", path.as_str()).with_body(json!({
+                "chain_stats": if positive { spent_only } else { zero.clone() },
+                "mempool_stats":zero
+            }).to_string()).expect(usize::from(*index < expected)).create_async().await);
+            mocks.push(server.mock("GET", format!("{path}/utxo").as_str()).with_body("[]")
+                .expect(usize::from(*index < expected && positive)).create_async().await);
+        }
+        let mut request = bdk_chain::spk_client::FullScanRequest::builder_at(1000)
+            .spks_for_keychain(KeychainKind::External, scripts);
+        if let Some(index) = revealed { request = request.last_revealed_for_keychain(KeychainKind::External, index); }
+        let client = esplora_client::Builder::new(&server.url()).max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>().unwrap();
+        let result = crate::current_state::fetch_esplora(&client,
+            SyncRequestType::Full(request.build()), stop_gap, concurrency).await.unwrap();
+        assert!(result.outputs.is_empty());
+        assert_eq!(result.active_scripts.len(), active.len());
+        assert_eq!(result.update.last_active_indices.get(&KeychainKind::External).copied(), active.last().copied());
+        for mock in mocks { mock.assert_async().await; }
     }
 }

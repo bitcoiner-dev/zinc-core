@@ -381,9 +381,13 @@ pub async fn fetch_esplora_with_known_activity(
                 let last_revealed = request.last_revealed(&keychain);
                 let mut gap = 0usize;
                 loop {
+                    // Bound speculation by the remaining mandatory trailing gap.
+                    // Revealed indices still reset the gap below, so none are skipped.
+                    // A positive read at the boundary resets the gap and continues.
+                    let remaining_gap = stop_gap - gap;
                     let batch: Vec<_> = request
                         .iter_spks(keychain)
-                        .take(parallel_requests)
+                        .take(parallel_requests.min(remaining_gap))
                         .collect();
                     if batch.is_empty() {
                         break;
