@@ -245,6 +245,17 @@ pub fn backend_request_delay(url: &str) -> u32 {
 /// only local queue entries, not wallets. Zero refuses a full queue; no bypass.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn backend_request_begin(url: &str) -> u32 {
+    begin_shell_request(url, Priority::Background)
+}
+
+/// Selected-screen reads share the same origin budget and cooldown. Fairness
+/// still gives a queued background reader a turn after three foreground grants.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn backend_request_begin_foreground(url: &str) -> u32 {
+    begin_shell_request(url, Priority::Foreground)
+}
+
+fn begin_shell_request(url: &str, priority: Priority) -> u32 {
     let origin = origin(url);
     origin.reap_shell();
     let mut shell = origin.shell.lock().unwrap_or_else(|e| e.into_inner());
@@ -258,7 +269,7 @@ pub fn backend_request_begin(url: &str) -> u32 {
     shell.waiting.insert(
         id,
         ShellWaiter {
-            ticket: origin.turn.register(Priority::Background),
+            ticket: origin.turn.register(priority),
             permit: None,
             expires: Instant::now() + SHELL_LEASE,
         },
@@ -345,6 +356,47 @@ async fn send_with_priority(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_foreground_passes_background_fifo_but_preserves_its_fourth_turn() {
+        let url = "https://shell-visible-balance-priority.invalid";
+        let origin = origin(url);
+        let background = backend_request_begin(url);
+        let background_second = backend_request_begin(url);
+        let foreground: Vec<_> = (0..4)
+            .map(|_| backend_request_begin_foreground(url))
+            .collect();
+        assert!(backend_request_poll(url, background) > 0);
+        assert!(backend_request_poll(url, foreground[1]) > 0);
+        for ticket in &foreground[..3] {
+            assert_eq!(backend_request_poll(url, *ticket), 0);
+        }
+        assert!(backend_request_poll(url, foreground[3]) > 0);
+        assert!(backend_request_poll(url, background_second) > 0);
+        assert_eq!(backend_request_poll(url, background), 0);
+        assert_eq!(
+            origin.schedule.lock().unwrap().startup_remaining,
+            STARTUP_REQUESTS - 4
+        );
+        backend_request_cancel(url, foreground[3]);
+        backend_request_cancel(url, background_second);
+        assert_eq!(
+            origin.schedule.lock().unwrap().startup_remaining,
+            STARTUP_REQUESTS - 4
+        );
+        assert!(origin.shell.lock().unwrap().waiting.is_empty());
+    }
+
+    #[test]
+    fn shell_foreground_cannot_bypass_shared_overload_cooldown() {
+        let url = "https://shell-visible-balance-cooldown.invalid";
+        after_response(url, 503, Some("12"));
+        let foreground = backend_request_begin_foreground(url);
+        assert!(backend_request_poll(url, foreground) > 0);
+        assert_eq!(origin(url).schedule.lock().unwrap().startup_remaining, 0);
+        backend_request_cancel(url, foreground);
+        assert!(origin(url).shell.lock().unwrap().waiting.is_empty());
+    }
 
     #[test]
     fn shell_fifo_cancellation_expiry_and_shared_credit() {
