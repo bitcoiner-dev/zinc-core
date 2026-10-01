@@ -3231,242 +3231,71 @@ impl ZincWasmWallet {
         let inner_rc = self.inner.clone();
         let sync_reads = self.sync_reads.clone();
         let network = self.state_snapshot().network;
-        let requested_generation = self.inner.try_borrow()
+        let requested_generation = self
+            .inner
+            .try_borrow()
             .map_err(|_| JsValue::from_str("Wallet busy preparing sync"))?
             .account_generation();
 
         Ok(wasm_bindgen_futures::future_to_promise(async move {
             zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals start");
-            // 1. Collect info needed for sync (Borrow Read)
-            let (outpoints, wallet_height, sync_generation, chain_generation) = {
-                match inner_rc.try_borrow_mut() {
-                    Ok(mut inner) => {
-                        if inner.account_generation() != requested_generation {
-                            return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
-                        }
-                        if !inner.try_begin_sync(js_sys::Date::now()) {
-                            zinc_log_debug!(target: LOG_TARGET_WASM, "Ord sync skipped: Wallet is busy syncing.");
-                            return Err(JsValue::from_str(
-                                "Wallet Busy: Operation already in progress",
-                            ));
-                        }
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collecting UTXO outpoints...");
-                        // Inscriptions/runes are UTXO-bound, so we bulk-query exactly our own outpoints
-                        // (POST /outputs) — one request instead of per-address + per-output round-trips.
-                        let ops = inner.collect_utxo_snapshots();
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: collected {} outpoints", ops.len());
-                        // A wallet with zero outpoints but a non-empty inscription list is almost
-                        // certainly not chain-synced yet (fresh instance, failed/foreign changeset
-                        // load, mid-rescan) — resolving an empty outpoint list would "verify" an
-                        // empty ordinals state and wipe real inscriptions. Fail unverified instead
-                        // and let a later sync (after BDK has UTXOs) settle it.
-                        if ops.is_empty() && !inner.inscriptions.is_empty() {
-                            inner.ordinals_verified = false;
-                            inner.is_syncing = false;
-                            zinc_log_info!(target: LOG_TARGET_WASM,
-                                "sync_ordinals: wallet has no outpoints but {} known inscriptions; refusing empty verify",
-                                inner.inscriptions.len()
-                            );
-                            return Err(JsValue::from_str(
-                                "Ordinals sync skipped: wallet has no UTXOs yet (not chain-synced?)",
-                            ));
-                        }
-                        let height = inner.vault_wallet.local_chain().tip().height();
-                        (
-                            ops,
-                            height,
-                            inner.account_generation(),
-                            inner.chain_state_generation(),
-                        )
-                    }
-                    Err(e) => {
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: FAILED TO BORROW INNER: {:?}", e);
-                        return Err(JsValue::from_str(&format!("Failed to borrow: {}", e)));
-                    }
+            // Capture trusted ownership once, without holding a borrow during IO.
+            let (context, sync_generation) = {
+                let mut inner = inner_rc
+                    .try_borrow_mut()
+                    .map_err(|_| JsValue::from_str("Wallet busy preparing Ord sync"))?;
+                if inner.account_generation() != requested_generation {
+                    return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                 }
+                if !inner.try_begin_sync(js_sys::Date::now()) {
+                    return Err(JsValue::from_str(
+                        "Wallet Busy: Operation already in progress",
+                    ));
+                }
+                (inner.ord_chain_context(), inner.account_generation())
             };
-
-            // 2. Perform Network IO (NO Borrow Held)
-            let client = crate::ordinals::OrdClient::new(ord_url.to_string());
-            // Explicit provider capability; absent means legacy-compatible GETs.
+            let client = crate::ordinals::OrdClient::new(ord_url.clone());
             let client = if bulk_inscriptions == Some(true) {
                 client.with_bulk_inscriptions()
             } else {
                 client
             };
-
-            // 2a. Check Lag
-            let ord_height = match sync_reads
-                .run(client.get_indexing_height())
-                .await
-                .map_err(|_| JsValue::from_str(ORD_SYNC_STALE_ERROR))?
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    zinc_log_debug!(target: LOG_TARGET_WASM, "Failed to get ord height: {:?}", e);
-                    ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
-                    if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
-                        &inner_rc,
-                        sync_generation,
-                        ORD_SYNC_STALE_ERROR,
-                    ) {
-                        return Err(stale);
-                    }
-                    return Err(ord_scan_failure_to_js(e, sync_generation));
-                }
-            };
-
-            if ord_height < wallet_height.saturating_sub(2) {
-                // We need to set verified=false safely
-                zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: Ord lagging, setting verified=false");
-                match inner_rc.try_borrow_mut() {
-                    Ok(mut inner) => {
-                        if inner.account_generation() != sync_generation {
-                            return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
-                        }
-                        inner.ordinals_verified = false;
-                        inner.is_syncing = false;
-                    }
-                    Err(e) => {
-                        zinc_log_debug!(target: LOG_TARGET_WASM,
-                            "sync_ordinals: Failed to borrow mut for lag update: {}",
-                            e
-                        );
-                        ZincWasmWallet::clear_syncing_if_generation_matches(
-                            &inner_rc,
-                            sync_generation,
-                        );
-                    }
-                }
-                return Err(backend_scan_failure_to_js(
-                    BackendFailureV1::new(
-                        BackendDependencyV1::Ord,
-                        BackendOperationV1::BlockHeight,
-                        BackendFailureCategoryV1::Unavailable,
-                    )
-                    .with_upstream_code("index_lag"),
-                    None,
-                    sync_generation,
-                    0,
-                    1,
-                ));
-            }
-
-            // 2b. Restrict the bulk query to outpoints ord is guaranteed to have indexed:
-            // confirmed at a height ≤ ord's indexed height. Ord 404s the WHOLE bulk request
-            // when any requested outpoint is unknown to it, and the wallet always holds
-            // unknowable outpoints right after a send/inscribe (unconfirmed change/postage) or
-            // during ord's allowed 1-block lag — querying those wedged every ordinals sync
-            // for the entire pending window and blanked the artifacts UI.
-            // Excluded outpoints match the pre-bulk (address-based) semantics: mempool outputs
-            // were invisible to ord there too, and they get classified on a later sync once
-            // confirmed and indexed.
-            let total_outpoints = outpoints.len();
-            let mut pending_protection = std::collections::HashSet::<bitcoin::OutPoint>::new();
-            let queryable_utxos: Vec<(String, u64)> = outpoints
-                .into_iter()
-                .filter_map(
-                    |(op, confirmation_height, value_sats)| match confirmation_height {
-                        Some(height) if height <= ord_height => Some((op, value_sats)),
-                        _ => {
-                            if let Ok(outpoint) = op.parse() {
-                                pending_protection.insert(outpoint);
-                            }
-                            None
-                        }
-                    },
-                )
-                .collect();
-            let classified_outpoints = queryable_utxos
-                .iter()
-                .filter_map(|(outpoint, _)| outpoint.parse().ok())
-                .collect();
-            if queryable_utxos.len() < total_outpoints {
-                zinc_log_debug!(target: LOG_TARGET_WASM,
-                    "sync_ordinals: skipping {} outpoint(s) not yet indexable by ord (unconfirmed or above ord height {})",
-                    total_outpoints - queryable_utxos.len(),
-                    ord_height
-                );
-            }
-
-            // 2c. Resolve inscriptions + runes + protected outpoints in ONE bulk pass: a single
-            // `POST /outputs` over our own UTXO outpoints (batched/concurrent) yields inscription ids +
-            // runes + protected status, then per-inscription details are fetched in parallel. This
-            // replaces the old per-address + per-output round-trip storm (the "ages to populate" cause).
-            // Fails closed: any error (incl. an outpoint missing from the bulk response) aborts without
-            // marking ordinals verified, so a missing protected UTXO can't slip past the send-safety set.
-            zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: resolving assets via bulk /outputs");
+            // One cancellation owner covers every dependent read and both metadata
+            // branches. A context switch drops the whole graph before publication.
             let resolved = match sync_reads
-                .run(client.resolve_assets_for_utxos(&queryable_utxos))
+                .run(client.reconcile_chain_holdings(context))
                 .await
                 .map_err(|_| JsValue::from_str(ORD_SYNC_STALE_ERROR))?
             {
-                Ok(r) => r,
-                Err(e) => {
-                    zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: asset resolution failed: {:?}", e);
-                    match inner_rc.try_borrow_mut() {
-                        Ok(mut inner) => {
-                            if inner.account_generation() != sync_generation {
-                                return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
-                            }
-                            inner.ordinals_verified = false;
-                            inner.is_syncing = false;
-                        }
-                        Err(_) => {
-                            ZincWasmWallet::clear_syncing_if_generation_matches(
-                                &inner_rc,
-                                sync_generation,
-                            );
-                        }
-                    }
-                    return Err(ord_scan_failure_to_js(e, sync_generation));
-                }
-            };
-            let all_inscriptions = resolved.inscriptions;
-            let mut protected_outpoints = resolved.protected_outpoints;
-            protected_outpoints.extend(pending_protection);
-            let rare_sat_outpoints = resolved.rare_sat_outpoints;
-            let rune_balances = resolved.rune_balances;
-            let outpoint_runes = resolved.outpoint_runes;
-            let rune_infos = resolved.rune_infos;
-            zinc_log_debug!(target: LOG_TARGET_WASM,
-                "sync_ordinals: resolved {} inscriptions, {} protected outpoints, {} rune outpoints",
-                all_inscriptions.len(), protected_outpoints.len(), outpoint_runes.len()
-            );
-
-            // 3. Apply Update (Borrow Mut)
-            zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: applying update (borrow mut)");
-            {
-                match inner_rc.try_borrow_mut() {
-                    Ok(mut inner) => {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Ok(mut inner) = inner_rc.try_borrow_mut() {
                         if inner.account_generation() != sync_generation {
                             return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
                         }
-                        let c = inner
-                            .apply_complete_verified_ordinals_update_with_rare_sats(
-                                all_inscriptions,
-                                protected_outpoints,
-                                rune_balances,
-                                rare_sat_outpoints,
-                                outpoint_runes,
-                                rune_infos,
-                                classified_outpoints,
-                                chain_generation,
-                            )
-                            .map_err(|error| JsValue::from_str(&error))?;
-                        inner.is_syncing = false; // FINISHED
-                        c
-                    }
-                    Err(e) => {
-                        zinc_log_debug!(target: LOG_TARGET_WASM, "sync_ordinals: FAILED TO BORROW MUT: {:?}", e);
+                        inner.mark_ordinals_unverified();
+                        inner.is_syncing = false;
+                    } else {
                         ZincWasmWallet::clear_syncing_if_generation_matches(
                             &inner_rc,
                             sync_generation,
                         );
-                        return Err(JsValue::from_str(&format!("Failed to borrow mut: {}", e)));
                     }
+                    return Err(ord_scan_failure_to_js(error, sync_generation));
                 }
             };
+            let ord_height = resolved.indexed_height();
+            {
+                let mut inner = inner_rc
+                    .try_borrow_mut()
+                    .map_err(|_| JsValue::from_str("Wallet busy applying Ord sync"))?;
+                if inner.account_generation() != sync_generation {
+                    return Err(JsValue::from_str(ORD_SYNC_STALE_ERROR));
+                }
+                let applied = inner.apply_reconciled_ord_holdings(resolved);
+                inner.is_syncing = false;
+                applied.map_err(|error| JsValue::from_str(&error))?;
+            }
 
             let receipt = BackendSyncReceiptV1::complete(
                 network,

@@ -6,6 +6,8 @@
 pub mod client;
 /// Error types used by ordinals integrations.
 pub mod error;
+/// Sealed current-chain classification reconciliation shared by all hosts.
+pub mod reconciliation;
 /// Runes protocol decoding and flow simulation.
 pub mod runes;
 /// Ordinal Shield analysis and audit helpers.
@@ -15,6 +17,7 @@ pub mod types;
 
 pub use client::*;
 pub use error::*;
+pub use reconciliation::*;
 pub use runes::*;
 pub use shield::*;
 pub use types::*;

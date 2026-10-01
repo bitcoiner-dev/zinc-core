@@ -975,7 +975,7 @@ impl OrdClient {
         &self,
         outpoints: &[String],
     ) -> Result<ResolvedAssets, OrdError> {
-        self.resolve_assets_for_outpoints_inner(outpoints, None)
+        self.resolve_assets_for_outpoints_inner(outpoints, None, None)
             .await
     }
 
@@ -997,8 +997,27 @@ impl OrdClient {
             }
         }
         let outpoints: Vec<String> = utxos.iter().map(|(outpoint, _)| outpoint.clone()).collect();
-        self.resolve_assets_for_outpoints_inner(&outpoints, Some(&expected))
+        self.resolve_assets_for_outpoints_inner(&outpoints, Some(&expected), None)
             .await
+    }
+
+    pub(super) async fn resolve_assets_for_owned_utxos(
+        &self,
+        utxos: &[(String, u64)],
+        scripts: &HashMap<String, bitcoin::ScriptBuf>,
+        network: bitcoin::Network,
+    ) -> Result<ResolvedAssets, OrdError> {
+        let expected: HashMap<String, u64> = utxos.iter().cloned().collect();
+        if expected.len() != utxos.len() || scripts.len() != expected.len() {
+            return Err(OrdError::InvalidRequest);
+        }
+        let outpoints: Vec<String> = utxos.iter().map(|(op, _)| op.clone()).collect();
+        self.resolve_assets_for_outpoints_inner(
+            &outpoints,
+            Some(&expected),
+            Some((scripts, network)),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)] // One cohesive bulk-resolution pass.
@@ -1006,6 +1025,7 @@ impl OrdClient {
         &self,
         outpoints: &[String],
         expected_values: Option<&HashMap<String, u64>>,
+        expected_scripts: Option<(&HashMap<String, bitcoin::ScriptBuf>, bitcoin::Network)>,
     ) -> Result<ResolvedAssets, OrdError> {
         if outpoints.is_empty() {
             return Ok(ResolvedAssets::default());
@@ -1078,6 +1098,21 @@ impl OrdClient {
                     return Err(OrdError::RareSatProtectionUnverified {
                         reason: "output-transaction-mismatch",
                     });
+                }
+                if let Some((scripts, network)) = expected_scripts {
+                    let script = scripts.get(outpoint).ok_or(OrdError::InvalidRequest)?;
+                    // Older compatible providers may omit address; validated chain tx bytes
+                    // still bind ownership. A provided address must match exactly.
+                    if let Some(address) = &entry.address {
+                        let actual = address
+                            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                            .map_err(|_| OrdError::invalid_response(BackendOperationV1::Outputs))?
+                            .require_network(network)
+                            .map_err(|_| OrdError::invalid_response(BackendOperationV1::Outputs))?;
+                        if actual.script_pubkey() != *script {
+                            return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
+                        }
+                    }
                 }
                 validate_sat_ranges(
                     outpoint,
@@ -1153,18 +1188,25 @@ impl OrdClient {
                 }
             }
         }
-        const RUNE_INFO_BATCH: usize = 8;
-        let mut rune_infos: std::collections::HashMap<String, RuneInfo> =
-            std::collections::HashMap::new();
-        let mut id_by_name: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for chunk in distinct_names.chunks(RUNE_INFO_BATCH) {
-            let info_futures = chunk.iter().map(|name| self.get_rune_info(name.as_str()));
-            for result in futures_util::future::join_all(info_futures).await {
-                let info = result?;
-                id_by_name.insert(info.spaced_rune.clone(), info.id.clone());
-                rune_infos.insert(info.id.clone(), info);
-            }
+        // Both metadata families depend on outputs, not on each other. Keep each
+        // bounded and share the existing origin admission/cooldown budget.
+        let rune_fetch = stream::iter(
+            distinct_names
+                .into_iter()
+                .map(|name| async move { self.get_rune_info(&name).await }),
+        )
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>();
+        let (infos, inscriptions) = futures_util::future::try_join(
+            rune_fetch,
+            self.get_inscriptions_bounded(&inscription_ids),
+        )
+        .await?;
+        let mut rune_infos = HashMap::new();
+        let mut id_by_name = HashMap::new();
+        for info in infos {
+            id_by_name.insert(info.spaced_rune.clone(), info.id.clone());
+            rune_infos.insert(info.id.clone(), info);
         }
         // Some ord deployments key /outputs runes by unspaced name; bridge by
         // comparing names with spacers stripped when the direct match misses.
@@ -1192,7 +1234,6 @@ impl OrdClient {
         }
 
         // Every detail must agree with the output snapshot used for protection.
-        let inscriptions = self.get_inscriptions_bounded(&inscription_ids).await?;
         let mut locations = HashMap::new();
         for entry in &entries {
             for id in &entry.inscriptions {
@@ -1605,6 +1646,125 @@ mod tests {
             .is_err());
         post.assert_async().await;
         get.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn owned_outputs_reconcile_provided_address_and_preserve_legacy_omission() {
+        use crate::{WalletBuilder, ZincMnemonic};
+        use bitcoin::{Address, Network};
+        let mnemonic = ZincMnemonic::parse("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        let wallet = WalletBuilder::from_mnemonic(Network::Regtest, &mnemonic)
+            .build()
+            .unwrap();
+        let address = wallet.peek_taproot_address(0);
+        let op = format!("{}:0", "22".repeat(32));
+        let scripts = [(op.clone(), address.script_pubkey())].into();
+        for case in [
+            "valid",
+            "absent",
+            "different",
+            "wrong-network",
+            "wrong-value",
+            "missing",
+            "duplicate",
+        ] {
+            let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+            let mut entry = serde_json::json!({"indexed":true,"outpoint":op,"transaction":"22".repeat(32),
+                "value":330,"sat_ranges":[[10,340]],"inscriptions":[],"runes":{},"address":address.to_string()});
+            if case == "absent" {
+                entry.as_object_mut().unwrap().remove("address");
+            }
+            if case == "different" {
+                entry["address"] = wallet.peek_taproot_address(1).to_string().into();
+            }
+            if case == "wrong-network" {
+                entry["address"] = Address::from_script(&address.script_pubkey(), Network::Bitcoin)
+                    .unwrap()
+                    .to_string()
+                    .into();
+            }
+            if case == "wrong-value" {
+                entry["value"] = 331.into();
+            }
+            let entries = match case {
+                "missing" => vec![],
+                "duplicate" => vec![entry.clone(), entry],
+                _ => vec![entry],
+            };
+            server
+                .mock("POST", "/outputs")
+                .with_body(serde_json::to_string(&entries).unwrap())
+                .create_async()
+                .await;
+            let result = OrdClient::new(server.url())
+                .resolve_assets_for_owned_utxos(&[(op.clone(), 330)], &scripts, Network::Regtest)
+                .await;
+            assert_eq!(result.is_ok(), matches!(case, "valid" | "absent"), "{case}");
+        }
+    }
+
+    // Real sockets prove both endpoint families dispatch before either completes.
+    // Each delayed handler fails if its sibling never arrives; no timing speedup is inferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_metadata_families_overlap_without_a_chunk_barrier() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{Arc, Condvar, Mutex},
+            time::{Duration, Instant},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let arrivals = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let shared = arrivals.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut handlers = Vec::new();
+            while handlers.len() < 3 && Instant::now() < deadline {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                let shared = shared.clone();
+                handlers.push(std::thread::spawn(move || {
+                    socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    let mut bytes = Vec::new(); let mut byte = [0u8;1];
+                    while !bytes.ends_with(b"\r\n\r\n") { socket.read_exact(&mut byte).unwrap(); bytes.push(byte[0]); }
+                    let request = String::from_utf8(bytes).unwrap();
+                    let body = if request.starts_with("POST /outputs ") {
+                        serde_json::json!([{"indexed":true,"outpoint":format!("{}:0","22".repeat(32)),
+                            "transaction":"22".repeat(32),"value":330,"sat_ranges":[[10,340]],
+                            "inscriptions":[bulk_id(0)],"runes":{"TEST":{"amount":1,"divisibility":0}}}]).to_string()
+                    } else {
+                        let (lock, wake) = &*shared;
+                        let mut count = lock.lock().unwrap(); *count += 1; wake.notify_all();
+                        let (count, _) = wake.wait_timeout_while(count, Duration::from_secs(2), |n| *n < 2).unwrap();
+                        if *count < 2 { socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(); return; }
+                        if request.starts_with("GET /rune/TEST ") { serde_json::json!({"id":"1:0","entry":{"spaced_rune":"TEST","divisibility":0}}).to_string() }
+                        else { assert!(request.starts_with(&format!("GET /inscription/{} ",bulk_id(0)))); bulk_detail(0).to_string() }
+                    };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let result = OrdClient::new(url)
+            .resolve_assets_for_utxos(&[(format!("{}:0", "22".repeat(32)), 330)])
+            .await;
+        server.join().unwrap();
+        assert_eq!(*arrivals.0.lock().unwrap(), 2);
+        let assets = result.unwrap();
+        assert_eq!(assets.inscriptions.len(), 1);
+        assert_eq!(
+            assets.outpoint_runes.values().next().unwrap()[0],
+            ("1:0".into(), 1)
+        );
     }
 
     async fn try_collect_bounded<I, F, Fut, T, E>(
