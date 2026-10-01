@@ -126,6 +126,7 @@ impl ZincWallet {
         vault: CurrentStateUpdate,
         payment: Option<CurrentStateUpdate>,
     ) -> Result<Vec<String>, String> {
+        let timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Apply);
         if self.payment_wallet.is_some() != payment.is_some() {
             return Err("Current-state update must cover both wallet roles".into());
         }
@@ -222,6 +223,7 @@ impl ZincWallet {
             return Err("Current outputs disagree with canonical wallet state".into());
         }
         self.mark_current_scripts_used();
+        timing.finish();
         Ok(events)
     }
 }
@@ -362,7 +364,9 @@ pub async fn fetch_esplora_with_known_activity(
         return Err(CurrentStateError::Invalid("zero scan bound"));
     }
     let parallel_requests = parallel_requests.min(8);
+    let initial_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::InitialTip);
     let initial_tip = client.get_tip_hash().await?;
+    initial_timing.finish();
     let (chain_tip, start_time) = match &request {
         SyncRequestType::Full(r) => (r.chain_tip(), r.start_time()),
         SyncRequestType::Incremental(r) => (r.chain_tip(), r.start_time()),
@@ -370,6 +374,7 @@ pub async fn fetch_esplora_with_known_activity(
     let mut reads = Vec::new();
     let mut monitored_txids = Vec::new();
     let mut last_active_indices = BTreeMap::<KeychainKind, u32>::new();
+    let coverage_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Coverage);
     match request {
         SyncRequestType::Full(mut request) => {
             for keychain in request.keychains() {
@@ -383,6 +388,7 @@ pub async fn fetch_esplora_with_known_activity(
                     if batch.is_empty() {
                         break;
                     }
+                    let batch_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::CoverageBatch);
                     let results: Vec<_> =
                         stream::iter(batch.into_iter().map(|(index, script)| async move {
                             let known_active = known_active_scripts.contains(&script);
@@ -393,6 +399,7 @@ pub async fn fetch_esplora_with_known_activity(
                         .buffered(parallel_requests)
                         .try_collect()
                         .await?;
+                    batch_timing.finish();
                     // Process the entire batch, including any active address
                     // after an empty run inside it, before deciding to stop.
                     for (index, read) in results {
@@ -425,6 +432,7 @@ pub async fn fetch_esplora_with_known_activity(
             .await?;
         }
     }
+    coverage_timing.finish();
     let mut outputs = BTreeMap::new();
     let mut active_scripts = BTreeSet::new();
     for read in reads {
@@ -457,10 +465,13 @@ pub async fn fetch_esplora_with_known_activity(
     if let Some(tip) = chain_tip {
         funding = funding.chain_tip(tip);
     }
+    let funding_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Funding);
     let response = client
         .sync(funding.build(), parallel_requests)
         .await
         .map_err(|error| CurrentStateError::Backend(*error))?;
+    funding_timing.finish();
+    let validation_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Validation);
     for (outpoint, expected) in &outputs {
         let tx = response
             .tx_update
@@ -479,9 +490,12 @@ pub async fn fetch_esplora_with_known_activity(
             return Err(CurrentStateError::Invalid("output spent during read"));
         }
     }
+    validation_timing.finish();
+    let final_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::FinalTip);
     if client.get_tip_hash().await? != initial_tip {
         return Err(CurrentStateError::Invalid("chain changed during read"));
     }
+    final_timing.finish();
     let mut update: bdk_wallet::Update = response.into();
     update.last_active_indices = last_active_indices;
     Ok(CurrentStateUpdate {

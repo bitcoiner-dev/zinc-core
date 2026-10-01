@@ -209,7 +209,9 @@ impl Origin {
 }
 
 pub(crate) async fn before_request(url: &str) {
+    let timing = crate::startup_diagnostics::Span::admission(url);
     origin(url).acquire(Priority::Foreground).await;
+    timing.finish();
 }
 
 pub fn after_response(url: &str, status: u16, retry_after: Option<&str>) {
@@ -340,7 +342,9 @@ async fn send_with_priority(
     let (client, request) = builder.build_split();
     let request = request?;
     let url = request.url().to_string();
+    let timing = crate::startup_diagnostics::Span::admission(&url);
     origin(&url).acquire(priority).await;
+    timing.finish();
     let response = client.execute(request).await?;
     after_response(
         &url,

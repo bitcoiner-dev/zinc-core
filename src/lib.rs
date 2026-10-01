@@ -50,6 +50,7 @@ mod discovery_activity_memo;
 pub mod crypto;
 /// Current UTXO synchronization, separate from paginated Activity history.
 pub mod current_state;
+mod startup_diagnostics;
 pub mod sync_pair;
 pub mod error;
 /// Vendor-neutral capability negotiation for hardware and other external signers.
