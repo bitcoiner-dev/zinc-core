@@ -158,8 +158,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bdk_chain"
-version = "0.23.3"
-source = "git+https://github.com/bitcoindevkit/bdk?rev=c211596ffb9ed21d47bb7c6a1511568f1038bb10#c211596ffb9ed21d47bb7c6a1511568f1038bb10"
+version = "0.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17dc15a280b922a2d52fb183ad25974859d241ec37ec46580ca602ad00ada52d"
 dependencies = [
  "bdk_core",
  "bitcoin",
@@ -169,8 +170,9 @@ dependencies = [
 
 [[package]]
 name = "bdk_core"
-version = "0.6.3"
-source = "git+https://github.com/bitcoindevkit/bdk?rev=c211596ffb9ed21d47bb7c6a1511568f1038bb10#c211596ffb9ed21d47bb7c6a1511568f1038bb10"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cbb1373ac1fafacd7adab91f58ab18d455dfb6434d47a647e75315613599cad"
 dependencies = [
  "bitcoin",
  "hashbrown 0.14.5",
@@ -179,9 +181,9 @@ dependencies = [
 
 [[package]]
 name = "bdk_esplora"
-version = "0.22.2"
+version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83986307ea92997c3d051e8c306af8115a05add601e22acb7c1903008e6b614e"
+checksum = "5ac04fdd76362dccf600ccf338ff6be7ad6a0d064def5969e4b33c171718e913"
 dependencies = [
  "async-trait",
  "bdk_core",
