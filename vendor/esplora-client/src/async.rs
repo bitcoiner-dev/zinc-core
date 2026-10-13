@@ -35,6 +35,8 @@ use crate::{
     Utxo, BASE_BACKOFF_MILLIS, RETRYABLE_ERROR_CODES,
 };
 
+type ReadSnapshot = (HashMap<Txid, Tx>, HashMap<(Txid, u64), OutputStatus>);
+
 /// An async client for interacting with an Esplora API server.
 #[derive(Debug, Clone)]
 pub struct AsyncClient<S = DefaultSleeper> {
@@ -45,7 +47,7 @@ pub struct AsyncClient<S = DefaultSleeper> {
     /// Number of times to retry a request
     max_retries: usize,
     // Read evidence is owned by one current-state operation, never a durable cache.
-    read_snapshot: Option<Arc<(HashMap<Txid, Tx>, HashMap<(Txid, u64), OutputStatus>)>>,
+    read_snapshot: Option<Arc<ReadSnapshot>>,
     /// Marker for the type of sleeper used
     marker: PhantomData<S>,
 }
@@ -277,7 +279,14 @@ impl<S: Sleeper> AsyncClient<S> {
 
         S::before_request(&url).await;
         let response = request.send().await?;
-        S::after_response(&url, response.status().as_u16(), response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
+        S::after_response(
+            &url,
+            response.status().as_u16(),
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+        );
 
         if !response.status().is_success() {
             return Err(Error::HttpResponse {
@@ -327,7 +336,9 @@ impl<S: Sleeper> AsyncClient<S> {
     /// Get transaction info given its [`Txid`].
     pub async fn get_tx_info(&self, txid: &Txid) -> Result<Option<Tx>, Error> {
         if let Some(snapshot) = &self.read_snapshot {
-            if let Some(tx) = snapshot.0.get(txid) { return Ok(Some(tx.clone())); }
+            if let Some(tx) = snapshot.0.get(txid) {
+                return Ok(Some(tx.clone()));
+            }
         }
         self.get_opt_response_json(&format!("/tx/{txid}")).await
     }
@@ -340,36 +351,70 @@ impl<S: Sleeper> AsyncClient<S> {
 
     /// Read a bounded public mempool/Electrs outspend batch. Call only for a
     /// deliberately selected capable provider; errors never fall back or replay.
-    pub async fn get_outspends_batch(&self, txids: &[Txid]) -> Result<Vec<Vec<OutputStatus>>, Error> {
+    pub async fn get_outspends_batch(
+        &self,
+        txids: &[Txid],
+    ) -> Result<Vec<Vec<OutputStatus>>, Error> {
         const LIMIT: usize = 1024 * 1024;
-        if txids.is_empty() || txids.len() > 8 || txids.iter().collect::<HashSet<_>>().len() != txids.len() {
+        if txids.is_empty()
+            || txids.len() > 8
+            || txids.iter().collect::<HashSet<_>>().len() != txids.len()
+        {
             return Err(Error::InvalidResponse);
         }
-        let ids = txids.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
-        let once = Self { url: self.url.clone(), client: self.client.clone(), max_retries: 0,
-            read_snapshot: None, marker: PhantomData };
-        let response = once.get_with_retry_policy(&format!("{}/txs/outspends?txids={ids}", self.url), true).await?;
+        let ids = txids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let once = Self {
+            url: self.url.clone(),
+            client: self.client.clone(),
+            max_retries: 0,
+            read_snapshot: None,
+            marker: PhantomData,
+        };
+        let response = once
+            .get_with_retry_policy(&format!("{}/txs/outspends?txids={ids}", self.url), true)
+            .await?;
         if !response.status().is_success() {
-            return Err(Error::HttpResponse { status: response.status().as_u16(), message: "outspend batch failed".into() });
+            return Err(Error::HttpResponse {
+                status: response.status().as_u16(),
+                message: "outspend batch failed".into(),
+            });
         }
-        if response.content_length().is_some_and(|n| n > LIMIT as u64) { return Err(Error::InvalidResponse); }
+        if response.content_length().is_some_and(|n| n > LIMIT as u64) {
+            return Err(Error::InvalidResponse);
+        }
         // Bound decoded/chunked bodies as well as Content-Length on native/WASM.
         use futures_util::StreamExt;
         let mut chunks = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk?;
-            if chunk.len() > LIMIT - bytes.len() { return Err(Error::InvalidResponse); }
+            if chunk.len() > LIMIT - bytes.len() {
+                return Err(Error::InvalidResponse);
+            }
             bytes.extend_from_slice(&chunk);
         }
-        let result: Vec<Vec<OutputStatus>> = serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)?;
-        if result.len() != txids.len() { return Err(Error::InvalidResponse); }
+        let result: Vec<Vec<OutputStatus>> =
+            serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)?;
+        if result.len() != txids.len() {
+            return Err(Error::InvalidResponse);
+        }
         Ok(result)
     }
 
     /// Supply fresh read evidence to BDK for this operation alone. This clone
     /// must not be persisted or reused by a later synchronization.
-    pub fn with_read_snapshot(&self, txs: HashMap<Txid, Tx>, statuses: HashMap<(Txid, u64), OutputStatus>) -> Self where S: Clone {
+    pub fn with_read_snapshot(
+        &self,
+        txs: HashMap<Txid, Tx>,
+        statuses: HashMap<(Txid, u64), OutputStatus>,
+    ) -> Self
+    where
+        S: Clone,
+    {
         let mut client = self.clone();
         client.read_snapshot = Some(Arc::new((txs, statuses)));
         client
@@ -415,7 +460,9 @@ impl<S: Sleeper> AsyncClient<S> {
         index: u64,
     ) -> Result<Option<OutputStatus>, Error> {
         if let Some(snapshot) = &self.read_snapshot {
-            if let Some(status) = snapshot.1.get(&(*txid, index)) { return Ok(Some(status.clone())); }
+            if let Some(status) = snapshot.1.get(&(*txid, index)) {
+                return Ok(Some(status.clone()));
+            }
         }
         self.get_opt_response_json(&format!("/tx/{txid}/outspend/{index}"))
             .await
@@ -505,7 +552,10 @@ impl<S: Sleeper> AsyncClient<S> {
 
     /// Get current script statistics without consulting or populating a transport cache.
     /// Suitable for negative current-state proofs; callers must validate both summaries.
-    pub async fn get_scripthash_stats_fresh(&self, script: &Script) -> Result<ScriptHashStats, Error> {
+    pub async fn get_scripthash_stats_fresh(
+        &self,
+        script: &Script,
+    ) -> Result<ScriptHashStats, Error> {
         let script_hash = sha256::Hash::hash(script.as_bytes());
         let url = format!("{}/scripthash/{script_hash}", self.url);
         let response = self.get_with_retry_policy(&url, true).await?;
@@ -515,7 +565,10 @@ impl<S: Sleeper> AsyncClient<S> {
                 message: response.text().await?,
             });
         }
-        response.json::<ScriptHashStats>().await.map_err(Error::Reqwest)
+        response
+            .json::<ScriptHashStats>()
+            .await
+            .map_err(Error::Reqwest)
     }
 
     /// Get transaction history for the specified address, sorted with newest first.
@@ -715,13 +768,26 @@ impl<S: Sleeper> AsyncClient<S> {
             let request = self.client.get(url);
             // Fetch cache mode avoids adding a custom CORS request header in browsers.
             #[cfg(target_arch = "wasm32")]
-            let request = if fresh { request.fetch_cache_no_store() } else { request };
+            let request = if fresh {
+                request.fetch_cache_no_store()
+            } else {
+                request
+            };
             #[cfg(not(target_arch = "wasm32"))]
             let request = if fresh {
                 request.header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
-            } else { request };
+            } else {
+                request
+            };
             let response = request.send().await?;
-            S::after_response(url, response.status().as_u16(), response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
+            S::after_response(
+                url,
+                response.status().as_u16(),
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok()),
+            );
             match response {
                 resp if attempts < self.max_retries && is_status_retryable(resp.status()) => {
                     S::sleep(delay).await;
@@ -748,7 +814,9 @@ pub trait Sleeper: 'static {
     /// Optional application-owned admission policy, applied to each HTTP attempt.
     /// The default preserves upstream behavior. Dropping this future must cancel
     /// admission; the hook does not retry or change the request.
-    fn before_request(_url: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn before_request(
+        _url: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
 

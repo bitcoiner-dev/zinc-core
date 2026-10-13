@@ -71,11 +71,7 @@ fn verify_signature(
         .derive_private_key_internal(
             purpose,
             wallet.active_derivation_account(),
-            if chain == KeychainKind::External {
-                0
-            } else {
-                1
-            },
+            u32::from(chain != KeychainKind::External),
             index,
         )
         .unwrap();

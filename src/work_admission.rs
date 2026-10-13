@@ -46,7 +46,10 @@ impl WorkAdmission {
         })
     }
     pub fn register(self: &Arc<Self>, priority: Priority) -> Ticket {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.next_id = state
             .next_id
             .checked_add(1)
@@ -77,7 +80,7 @@ impl WorkAdmission {
         let wake: Vec<_> = self
             .state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .waiting
             .iter()
             .filter_map(|entry| entry.waker.clone())
@@ -94,7 +97,11 @@ impl Ticket {
         if !self.queued {
             return None;
         }
-        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = state.waiting.iter_mut().find(|entry| entry.id == self.id) {
             entry.waker = waker.cloned();
         }
@@ -138,7 +145,7 @@ impl Drop for Ticket {
             self.gate
                 .state
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .waiting
                 .retain(|entry| entry.id != self.id);
             self.gate.wake();
@@ -150,7 +157,7 @@ impl Drop for Permit {
         self.gate
             .state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .available += 1;
         self.gate.wake();
     }
@@ -214,6 +221,7 @@ mod tests {
         drop(newest_selection.poll(None).unwrap());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn cancelled_async_waiter_is_removed_and_release_wakes_next() {
         let gate = WorkAdmission::new(1);

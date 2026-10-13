@@ -152,7 +152,9 @@ impl ZincWallet {
     ) -> Result<TransactionPage, String> {
         if self.current_state.is_some() && cursor.is_none() {
             let mut page = self.activity_first_page.clone().unwrap_or(TransactionPage {
-                items: Vec::new(), next_cursor: None, has_more: false,
+                items: Vec::new(),
+                next_cursor: None,
+                has_more: false,
             });
             page.items.truncate(limit.min(MAX_TRANSACTION_PAGE_SIZE));
             self.annotate_activity_page(&mut page);

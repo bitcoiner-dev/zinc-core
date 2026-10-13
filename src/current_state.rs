@@ -93,7 +93,7 @@ impl ZincWallet {
                 .spk_index()
                 .outpoints()
                 .iter()
-                .cloned()
+                .copied()
                 .filter(|(_, op)| {
                     self.current_state
                         .as_ref()
@@ -126,13 +126,22 @@ impl ZincWallet {
         vault: CurrentStateUpdate,
         payment: Option<CurrentStateUpdate>,
     ) -> Result<Vec<String>, String> {
-        let timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Apply);
+        let timing =
+            crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Apply);
         if self.payment_wallet.is_some() != payment.is_some() {
             return Err("Current-state update must cover both wallet roles".into());
         }
         if let Some(payment) = &payment {
-            if vault.update.chain.as_ref().map(|c| c.block_id())
-                != payment.update.chain.as_ref().map(|c| c.block_id())
+            if vault
+                .update
+                .chain
+                .as_ref()
+                .map(bdk_chain::CheckPoint::block_id)
+                != payment
+                    .update
+                    .chain
+                    .as_ref()
+                    .map(bdk_chain::CheckPoint::block_id)
             {
                 return Err("Wallet roles were read at different chain tips".into());
             }
@@ -202,7 +211,7 @@ impl ZincWallet {
         // partly verified spendable balance or keeping old Ord authority alive.
         let canonical: BTreeMap<_, _> = std::iter::once(&self.vault_wallet)
             .chain(self.payment_wallet.iter())
-            .flat_map(|w| w.list_unspent())
+            .flat_map(bdk_wallet::Wallet::list_unspent)
             .map(|u| (u.outpoint, u.txout))
             .collect();
         let valid = self
@@ -310,8 +319,10 @@ async fn read_script(
         let stats = client.get_scripthash_stats_fresh(&script).await?;
         let mut active = false;
         for summary in [stats.chain_stats, stats.mempool_stats] {
-            let has_outputs = summary.funded_txo_count != 0 || summary.funded_txo_sum != 0
-                || summary.spent_txo_count != 0 || summary.spent_txo_sum != 0;
+            let has_outputs = summary.funded_txo_count != 0
+                || summary.funded_txo_sum != 0
+                || summary.spent_txo_count != 0
+                || summary.spent_txo_sum != 0;
             if summary.tx_count == 0 && has_outputs {
                 return Err(CurrentStateError::Invalid("inconsistent script statistics"));
             }
@@ -344,7 +355,14 @@ struct ScanBranch {
 
 impl ScanBranch {
     fn new(keychain: KeychainKind, last_revealed: Option<u32>) -> Self {
-        Self { keychain, last_revealed, slots: Vec::new(), settled: 0, settled_gap: 0, exhausted: false }
+        Self {
+            keychain,
+            last_revealed,
+            slots: Vec::new(),
+            settled: 0,
+            settled_gap: 0,
+            exhausted: false,
+        }
     }
 
     /// Activity and every already-revealed index reset the trailing gap.
@@ -360,8 +378,14 @@ impl ScanBranch {
         }
         // Fold the completed in-order prefix once; it can never change again.
         while self.settled_gap < stop_gap {
-            let Some(&(index, Some(active))) = self.slots.get(self.settled) else { break };
-            self.settled_gap = if self.resets(index, Some(active)) { 0 } else { self.settled_gap + 1 };
+            let Some(&(index, Some(active))) = self.slots.get(self.settled) else {
+                break;
+            };
+            self.settled_gap = if self.resets(index, Some(active)) {
+                0
+            } else {
+                self.settled_gap + 1
+            };
             self.settled += 1;
         }
         let mut gap = self.settled_gap;
@@ -369,7 +393,11 @@ impl ScanBranch {
             return false;
         }
         for &(index, active) in &self.slots[self.settled..] {
-            gap = if self.resets(index, active) { 0 } else { gap + 1 };
+            gap = if self.resets(index, active) {
+                0
+            } else {
+                gap + 1
+            };
             if gap >= stop_gap {
                 return false;
             }
@@ -419,7 +447,15 @@ pub async fn fetch_esplora_with_known_activity(
     // Only this exact public service has been qualified. Unknown/custom and
     // other network providers remain legacy unless their trusted host opts in.
     let batches = client.url().trim_end_matches('/') == "https://esplora.zincwallet.app";
-    fetch_esplora_with_policy(client, request, known_active_scripts, stop_gap, parallel_requests, batches).await
+    fetch_esplora_with_policy(
+        client,
+        request,
+        known_active_scripts,
+        stop_gap,
+        parallel_requests,
+        batches,
+    )
+    .await
 }
 
 /// Current-state read policy for an explicitly qualified batch provider.
@@ -436,7 +472,8 @@ pub async fn fetch_esplora_with_policy(
         return Err(CurrentStateError::Invalid("zero scan bound"));
     }
     let parallel_requests = parallel_requests.min(8);
-    let initial_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::InitialTip);
+    let initial_timing =
+        crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::InitialTip);
     let initial_tip = client.get_tip_hash().await?;
     initial_timing.finish();
     let (chain_tip, start_time) = match &request {
@@ -446,7 +483,8 @@ pub async fn fetch_esplora_with_policy(
     let mut reads = Vec::new();
     let mut monitored_txids = Vec::new();
     let mut last_active_indices = BTreeMap::<KeychainKind, u32>::new();
-    let coverage_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Coverage);
+    let coverage_timing =
+        crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Coverage);
     match request {
         SyncRequestType::Full(mut request) => {
             // Replenish the role's bounded window as each read completes rather
@@ -536,7 +574,8 @@ pub async fn fetch_esplora_with_policy(
     if let Some(tip) = chain_tip {
         funding = funding.chain_tip(tip);
     }
-    let funding_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Funding);
+    let funding_timing =
+        crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Funding);
     let snapshot_client;
     // A strict, per-operation snapshot feeds the existing BDK graph/anchor
     // implementation. No mutable evidence survives this call. Large collections
@@ -545,21 +584,34 @@ pub async fn fetch_esplora_with_policy(
     let funding_client = if batch_outspends && !txids.is_empty() && txids.len() <= 64 {
         let mut txs = HashMap::new();
         let mut bytes = 0usize;
-        let results = stream::iter(txids.iter().copied()).map(|id| async move {
-            let tx = client.get_tx_info(&id).await?.ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
-            if tx.txid != id || tx.to_tx().compute_txid() != id {
-                return Err(CurrentStateError::Invalid("funding transaction identity mismatch"));
-            }
-            Ok::<_, CurrentStateError>((id, tx))
-        }).buffer_unordered(parallel_requests);
+        let results = stream::iter(txids.iter().copied())
+            .map(|id| async move {
+                let tx = client
+                    .get_tx_info(&id)
+                    .await?
+                    .ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
+                if tx.txid != id || tx.to_tx().compute_txid() != id {
+                    return Err(CurrentStateError::Invalid(
+                        "funding transaction identity mismatch",
+                    ));
+                }
+                Ok::<_, CurrentStateError>((id, tx))
+            })
+            .buffer_unordered(parallel_requests);
         futures_util::pin_mut!(results);
         while let Some((id, tx)) = results.try_next().await? {
-            bytes = bytes.checked_add(tx.to_tx().total_size()).ok_or(CurrentStateError::Invalid("funding snapshot too large"))?;
-            if bytes > 16 * 1024 * 1024 { return Err(CurrentStateError::Invalid("funding snapshot too large")); }
+            bytes = bytes
+                .checked_add(tx.to_tx().total_size())
+                .ok_or(CurrentStateError::Invalid("funding snapshot too large"))?;
+            if bytes > 16 * 1024 * 1024 {
+                return Err(CurrentStateError::Invalid("funding snapshot too large"));
+            }
             txs.insert(id, tx);
         }
         for (outpoint, expected) in &outputs {
-            let tx = txs.get(&outpoint.txid).ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
+            let tx = txs
+                .get(&outpoint.txid)
+                .ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
             if tx.to_tx().output.get(outpoint.vout as usize) != Some(expected) {
                 return Err(CurrentStateError::Invalid("funding output mismatch"));
             }
@@ -569,14 +621,17 @@ pub async fn fetch_esplora_with_policy(
         for ids in ids.chunks(8) {
             let batch = client.get_outspends_batch(ids).await?;
             for (id, statuses_for_tx) in ids.iter().zip(batch) {
-                let tx = txs.get(id).ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
+                let tx = txs
+                    .get(id)
+                    .ok_or(CurrentStateError::Invalid("missing funding transaction"))?;
                 if statuses_for_tx.len() != tx.vout.len() {
                     return Err(CurrentStateError::Invalid("incomplete outspend coverage"));
                 }
                 for (index, status) in statuses_for_tx.into_iter().enumerate() {
                     if status.spent != status.txid.is_some()
                         || status.spent != status.vin.is_some()
-                        || status.spent != status.status.is_some() {
+                        || status.spent != status.status.is_some()
+                    {
                         return Err(CurrentStateError::Invalid("inconsistent outspend status"));
                     }
                     statuses.insert((*id, index as u64), status);
@@ -585,13 +640,16 @@ pub async fn fetch_esplora_with_policy(
         }
         snapshot_client = client.with_read_snapshot(txs, statuses);
         &snapshot_client
-    } else { client };
+    } else {
+        client
+    };
     let response = funding_client
         .sync(funding.build(), parallel_requests)
         .await
         .map_err(|error| CurrentStateError::Backend(*error))?;
     funding_timing.finish();
-    let validation_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Validation);
+    let validation_timing =
+        crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::Validation);
     for (outpoint, expected) in &outputs {
         let tx = response
             .tx_update
@@ -611,7 +669,8 @@ pub async fn fetch_esplora_with_policy(
         }
     }
     validation_timing.finish();
-    let final_timing = crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::FinalTip);
+    let final_timing =
+        crate::startup_diagnostics::Span::phase(crate::startup_diagnostics::Phase::FinalTip);
     if client.get_tip_hash().await? != initial_tip {
         return Err(CurrentStateError::Invalid("chain changed during read"));
     }

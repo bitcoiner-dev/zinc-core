@@ -2633,7 +2633,8 @@ impl ZincWallet {
         let full = force_full || self.needs_full_scan();
         let policy = self.scan_policy;
         // Index-mode descriptors already have exactly one child per branch.
-        let primary_only = full && !force_full && self.primary_address_scope && self.fixed_index().is_none();
+        let primary_only =
+            full && !force_full && self.primary_address_scope && self.fixed_index().is_none();
 
         let build = |w: &Wallet| -> SyncRequestType {
             if primary_only {
@@ -8502,7 +8503,8 @@ impl ZincWallet {
     /// walk; every listed script still gets the same fresh coverage reads.
     fn primary_scope_full_scan_request(wallet: &Wallet, now: u64) -> FullScanRequest<KeychainKind> {
         let mut request = wallet.start_full_scan_at(now);
-        let keychains: Vec<KeychainKind> = wallet.keychains().map(|(keychain, _)| keychain).collect();
+        let keychains: Vec<KeychainKind> =
+            wallet.keychains().map(|(keychain, _)| keychain).collect();
         for keychain in keychains {
             let last = wallet.derivation_index(keychain).unwrap_or(0);
             let spks: Vec<_> = (0..=last)

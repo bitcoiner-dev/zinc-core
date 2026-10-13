@@ -1,0 +1,88 @@
+[package]
+edition = "2021"
+name = "zinc-bdk-esplora"
+version = "0.1.0"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Zinc-maintained BDK Esplora adapter for the Zinc Esplora client"
+homepage = "https://bitcoindevkit.org"
+documentation = "https://docs.rs/zinc-bdk-esplora"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitcoiner-dev/zinc-core"
+include = ["src/**", "README.md", "CHANGELOG.md", "ZINC-PATCH.md", "LICENSE-MIT", "LICENSE-APACHE"]
+rust-version = "1.88"
+
+[features]
+async = [
+    "async-trait",
+    "futures",
+    "esplora-client/async",
+]
+async-https = [
+    "async",
+    "esplora-client/async-https",
+]
+async-https-native = [
+    "async",
+    "esplora-client/async-https-native",
+]
+async-https-rustls = [
+    "async",
+    "esplora-client/async-https-rustls",
+]
+blocking = ["esplora-client/blocking"]
+blocking-https = [
+    "blocking",
+    "esplora-client/blocking-https",
+]
+blocking-https-native = [
+    "blocking",
+    "esplora-client/blocking-https-native",
+]
+blocking-https-rustls = [
+    "blocking",
+    "esplora-client/blocking-https-rustls",
+]
+default = [
+    "std",
+    "async-https",
+    "blocking-https",
+]
+std = ["bdk_core/std"]
+tokio = ["esplora-client/tokio"]
+
+[lib]
+name = "bdk_esplora"
+path = "src/lib.rs"
+
+[dependencies.async-trait]
+version = "0.1.66"
+optional = true
+
+[dependencies.bdk_core]
+version = "0.6.4"
+default-features = false
+
+[dependencies.esplora-client]
+package = "zinc-esplora-client"
+version = "=0.1.0"
+path = "../esplora-client"
+default-features = false
+
+[dependencies.futures]
+version = "0.3.26"
+optional = true
+
+[lints.clippy]
+print_stderr = "deny"
+print_stdout = "deny"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(coverage,coverage_nightly)"]

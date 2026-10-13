@@ -301,7 +301,7 @@ async fn malformed_activity_cannot_create_spend_authority() {
     let _empty = empty_change(&mut server, &wallet).await;
     let _pending = empty_external_pending(&mut server, &wallet).await;
     let mut row = tx(&wallet, 100, false);
-    row["vout"][0]["value"] = json!(999999);
+    row["vout"][0]["value"] = json!(999_999);
     let _bad = server
         .mock(
             "GET",

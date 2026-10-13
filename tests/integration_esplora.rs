@@ -1,7 +1,7 @@
 #[cfg(not(target_arch = "wasm32"))]
-use zinc_core::Network;
-#[cfg(not(target_arch = "wasm32"))]
 use zinc_core::builder::{Seed64, WalletBuilder};
+#[cfg(not(target_arch = "wasm32"))]
+use zinc_core::Network;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::test]

@@ -687,8 +687,8 @@ async fn high_activity_current_state_never_requests_history() {
         .create_async()
         .await;
     let stats = server.mock("GET", path.as_str()).with_body(json!({
-        "chain_stats":{"tx_count":100000,"funded_txo_count":200000,"funded_txo_sum":999999999,
-            "spent_txo_count":199999,"spent_txo_sum":999949999},
+        "chain_stats":{"tx_count":100_000,"funded_txo_count":200_000,"funded_txo_sum":999_999_999,
+            "spent_txo_count":199_999,"spent_txo_sum":999_949_999},
         "mempool_stats":{"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0}
     }).to_string()).expect(1).create_async().await;
     let utxos = server
@@ -704,7 +704,7 @@ async fn high_activity_current_state_never_requests_history() {
         .await;
     let funding = server.mock("GET", format!("/tx/{}",tx.compute_txid()).as_str()).with_body(json!({
         "txid":tx.compute_txid(),"version":2,"locktime":0,
-        "vin":[{"txid":tx.input[0].previous_output.txid,"vout":0,"prevout":{"scriptpubkey":"","value":951000},
+        "vin":[{"txid":tx.input[0].previous_output.txid,"vout":0,"prevout":{"scriptpubkey":"","value":951_000},
             "scriptsig":"","sequence":tx.input[0].sequence.to_consensus_u32(),"is_coinbase":false}],
         "vout":tx.output.iter().map(|out|json!({"scriptpubkey":out.script_pubkey.to_hex_string(),"value":out.value.to_sat()})).collect::<Vec<_>>(),
         "size":tx.total_size(),"weight":tx.weight().to_wu(),"fee":1000,"status":{"confirmed":false}
@@ -745,96 +745,140 @@ async fn bounded_outspend_batches_preserve_funding_and_reject_incomplete_evidenc
     use bitcoin::hashes::sha256;
     use serde_json::json;
     for (status_code, body, valid) in [
-        (200, json!([[{"spent":false},{"spent":false}]]).to_string(), true),
+        (
+            200,
+            json!([[{"spent":false},{"spent":false}]]).to_string(),
+            true,
+        ),
         (200, "[]".into(), false),
         (200, "[[]]".into(), false),
         (200, json!([[{"spent":false}]]).to_string(), false),
-        (200, json!([[{"spent":false},{"spent":false}],[{"spent":false},{"spent":false}]]).to_string(), false),
-        (200, json!([[{"spent":true},{"spent":false}]]).to_string(), false),
-        (200, json!([[{"spent":false,"txid":"03".repeat(32)},{"spent":false}]]).to_string(), false),
+        (
+            200,
+            json!([[{"spent":false},{"spent":false}],[{"spent":false},{"spent":false}]])
+                .to_string(),
+            false,
+        ),
+        (
+            200,
+            json!([[{"spent":true},{"spent":false}]]).to_string(),
+            false,
+        ),
+        (
+            200,
+            json!([[{"spent":false,"txid":"03".repeat(32)},{"spent":false}]]).to_string(),
+            false,
+        ),
         (200, "invalid json".into(), false),
-        (200, " ".repeat(1024*1024+1), false),
+        (200, " ".repeat(1024 * 1024 + 1), false),
         (403, "denied".into(), false),
         (429, "overloaded".into(), false),
         (503, "overloaded".into(), false),
     ] {
-    let mut wallet = wallet();
-    let tx = funding(&wallet);
-    let script = tx.output[0].script_pubkey.clone();
-    let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
-    let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
-    let history = server
-        .mock(
-            "GET",
-            mockito::Matcher::Regex("/scripthash/.*/txs.*".into()),
-        )
-        .expect(0)
-        .with_status(500)
-        .create_async()
-        .await;
-    let tip = server
-        .mock("GET", "/blocks/tip/hash")
-        .with_body("07".repeat(32))
-        .expect(if valid {2} else {1})
-        .create_async()
-        .await;
-    let stats = server.mock("GET", path.as_str()).with_body(json!({
-        "chain_stats":{"tx_count":100000,"funded_txo_count":200000,"funded_txo_sum":999999999,
-            "spent_txo_count":199999,"spent_txo_sum":999949999},
+        let mut wallet = wallet();
+        let tx = funding(&wallet);
+        let script = tx.output[0].script_pubkey.clone();
+        let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
+        let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
+        let history = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex("/scripthash/.*/txs.*".into()),
+            )
+            .expect(0)
+            .with_status(500)
+            .create_async()
+            .await;
+        let tip = server
+            .mock("GET", "/blocks/tip/hash")
+            .with_body("07".repeat(32))
+            .expect(if valid { 2 } else { 1 })
+            .create_async()
+            .await;
+        let stats = server.mock("GET", path.as_str()).with_body(json!({
+        "chain_stats":{"tx_count":100_000,"funded_txo_count":200_000,"funded_txo_sum":999_999_999,
+            "spent_txo_count":199_999,"spent_txo_sum":999_949_999},
         "mempool_stats":{"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0}
     }).to_string()).expect(1).create_async().await;
-    let utxos = server
-        .mock("GET", format!("{path}/utxo").as_str())
-        .with_body(
-            json!([{
-                "txid":tx.compute_txid(),"vout":0,"value":50000,"status":{"confirmed":false}
-            }])
-            .to_string(),
-        )
-        .expect(1)
-        .create_async()
-        .await;
-    let funding = server.mock("GET", format!("/tx/{}",tx.compute_txid()).as_str()).with_body(json!({
+        let utxos = server
+            .mock("GET", format!("{path}/utxo").as_str())
+            .with_body(
+                json!([{
+                    "txid":tx.compute_txid(),"vout":0,"value":50000,"status":{"confirmed":false}
+                }])
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let funding = server.mock("GET", format!("/tx/{}",tx.compute_txid()).as_str()).with_body(json!({
         "txid":tx.compute_txid(),"version":2,"locktime":0,
-        "vin":[{"txid":tx.input[0].previous_output.txid,"vout":0,"prevout":{"scriptpubkey":"","value":951000},
+        "vin":[{"txid":tx.input[0].previous_output.txid,"vout":0,"prevout":{"scriptpubkey":"","value":951_000},
             "scriptsig":"","sequence":tx.input[0].sequence.to_consensus_u32(),"is_coinbase":false}],
         "vout":tx.output.iter().map(|out|json!({"scriptpubkey":out.script_pubkey.to_hex_string(),"value":out.value.to_sat()})).collect::<Vec<_>>(),
         "size":tx.total_size(),"weight":tx.weight().to_wu(),"fee":1000,"status":{"confirmed":false}
     }).to_string()).expect(1).create_async().await;
-    let spend = server
-        .mock(
-            "GET",
-            format!("/tx/{}/outspend/0", tx.compute_txid()).as_str(),
-        )
-        .with_body(r#"{"spent":false}"#)
-        .expect(0)
-        .create_async()
-        .await;
-    let batch = server.mock("GET", "/txs/outspends")
-        .match_query(mockito::Matcher::UrlEncoded("txids".into(), tx.compute_txid().to_string()))
-        .with_status(status_code).with_body(body).expect(1).create_async().await;
-    let client = esplora_client::Builder::new(&server.url())
-        .max_retries(6)
-        .build_async_with_sleeper::<SyncSleeper>()
-        .unwrap();
-    let request = bdk_chain::spk_client::SyncRequest::<(KeychainKind, u32)>::builder_at(1000)
-        .spks_with_indexes([((KeychainKind::External, 0), script)])
-        .build();
-    let result =
-        crate::current_state::fetch_esplora_with_policy(&client, SyncRequestType::Incremental(request), &BTreeSet::new(), 5, 5, true)
+        let spend = server
+            .mock(
+                "GET",
+                format!("/tx/{}/outspend/0", tx.compute_txid()).as_str(),
+            )
+            .with_body(r#"{"spent":false}"#)
+            .expect(0)
+            .create_async()
             .await;
-    assert_eq!(result.is_ok(), valid, "HTTP {status_code}: {:?}", result.as_ref().err());
-    if let Ok(result) = result {
-        assert_eq!(result.outputs.len(), 1);
-        assert_eq!(result.outputs.values().next().unwrap().value.to_sat(), 50000);
-        assert!(result.update.tx_update.txs.iter().any(|read| read.compute_txid() == tx.compute_txid()));
-        wallet.apply_current_state(result, None).unwrap();
-        assert_eq!(wallet.get_raw_balance().total().to_sat(), 50000);
-        assert!(!wallet.asset_state_is_current());
-    }
-    for mock in [history, tip, stats, utxos, funding, spend, batch] {
-        mock.assert_async().await;
-    }
+        let batch = server
+            .mock("GET", "/txs/outspends")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "txids".into(),
+                tx.compute_txid().to_string(),
+            ))
+            .with_status(status_code)
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(6)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .unwrap();
+        let request = bdk_chain::spk_client::SyncRequest::<(KeychainKind, u32)>::builder_at(1000)
+            .spks_with_indexes([((KeychainKind::External, 0), script)])
+            .build();
+        let result = crate::current_state::fetch_esplora_with_policy(
+            &client,
+            SyncRequestType::Incremental(request),
+            &BTreeSet::new(),
+            5,
+            5,
+            true,
+        )
+        .await;
+        assert_eq!(
+            result.is_ok(),
+            valid,
+            "HTTP {status_code}: {:?}",
+            result.as_ref().err()
+        );
+        if let Ok(result) = result {
+            assert_eq!(result.outputs.len(), 1);
+            assert_eq!(
+                result.outputs.values().next().unwrap().value.to_sat(),
+                50000
+            );
+            assert!(result
+                .update
+                .tx_update
+                .txs
+                .iter()
+                .any(|read| read.compute_txid() == tx.compute_txid()));
+            wallet.apply_current_state(result, None).unwrap();
+            assert_eq!(wallet.get_raw_balance().total().to_sat(), 50000);
+            assert!(!wallet.asset_state_is_current());
+        }
+        for mock in [history, tip, stats, utxos, funding, spend, batch] {
+            mock.assert_async().await;
+        }
     }
 }
 
@@ -863,26 +907,49 @@ async fn unknown_script_negative_proof_requires_complete_fresh_statistics() {
         let script = wallet().peek_taproot_address(0).script_pubkey();
         let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
         let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
-        let tip = server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32))
-            .expect(if valid { 2 } else { 1 }).create_async().await;
-        let stats = server.mock("GET", path.as_str())
+        let tip = server
+            .mock("GET", "/blocks/tip/hash")
+            .with_body("07".repeat(32))
+            .expect(if valid { 2 } else { 1 })
+            .create_async()
+            .await;
+        let stats = server
+            .mock("GET", path.as_str())
             .match_header("cache-control", "no-cache, no-store")
-            .with_status(status).with_body(json!({"chain_stats":chain,"mempool_stats":mempool}).to_string())
-            .expect(1).create_async().await;
-        let utxos = server.mock("GET", format!("{path}/utxo").as_str())
-            .with_status(output_status).with_body("[]").expect(reads).create_async().await;
-        let client = esplora_client::Builder::new(&server.url()).max_retries(0)
-            .build_async_with_sleeper::<SyncSleeper>().unwrap();
+            .with_status(status)
+            .with_body(json!({"chain_stats":chain,"mempool_stats":mempool}).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let utxos = server
+            .mock("GET", format!("{path}/utxo").as_str())
+            .with_status(output_status)
+            .with_body("[]")
+            .expect(reads)
+            .create_async()
+            .await;
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .unwrap();
         let request = bdk_chain::spk_client::SyncRequest::builder_at(1000)
-            .spks_with_indexes([((KeychainKind::External, 0), script)]).build();
-        let result = crate::current_state::fetch_esplora(&client,
-            SyncRequestType::Incremental(request), 5, 1).await;
+            .spks_with_indexes([((KeychainKind::External, 0), script)])
+            .build();
+        let result = crate::current_state::fetch_esplora(
+            &client,
+            SyncRequestType::Incremental(request),
+            5,
+            1,
+        )
+        .await;
         assert_eq!(result.is_ok(), valid);
         if let Ok(result) = result {
             assert!(result.outputs.is_empty());
             assert_eq!(result.active_scripts.len(), reads);
         }
-        for mock in [tip, stats, utxos] { mock.assert_async().await; }
+        for mock in [tip, stats, utxos] {
+            mock.assert_async().await;
+        }
     }
 }
 
@@ -904,10 +971,16 @@ async fn full_scan_bounds_final_batch_but_preserves_activity_boundary_and_reveal
     ] {
         let wallet = wallet();
         let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
-        let tip = server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32))
-            .expect(2).create_async().await;
+        let tip = server
+            .mock("GET", "/blocks/tip/hash")
+            .with_body("07".repeat(32))
+            .expect(2)
+            .create_async()
+            .await;
         let mut mocks = vec![tip];
-        let scripts: Vec<_> = (0..60).map(|index| (index, wallet.peek_taproot_address(index).script_pubkey())).collect();
+        let scripts: Vec<_> = (0..60)
+            .map(|index| (index, wallet.peek_taproot_address(index).script_pubkey()))
+            .collect();
         for (index, script) in &scripts {
             let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
             let positive = active.contains(index);
@@ -915,24 +988,59 @@ async fn full_scan_bounds_final_batch_but_preserves_activity_boundary_and_reveal
                 "spent_txo_count":0,"spent_txo_sum":0});
             let spent_only = json!({"tx_count":2,"funded_txo_count":1,"funded_txo_sum":1000,
                 "spent_txo_count":1,"spent_txo_sum":1000});
-            mocks.push(server.mock("GET", path.as_str()).with_body(json!({
-                "chain_stats": if positive { spent_only } else { zero.clone() },
-                "mempool_stats":zero
-            }).to_string()).expect(usize::from(*index < expected)).create_async().await);
-            mocks.push(server.mock("GET", format!("{path}/utxo").as_str()).with_body("[]")
-                .expect(usize::from(*index < expected && positive)).create_async().await);
+            mocks.push(
+                server
+                    .mock("GET", path.as_str())
+                    .with_body(
+                        json!({
+                            "chain_stats": if positive { spent_only } else { zero.clone() },
+                            "mempool_stats":zero
+                        })
+                        .to_string(),
+                    )
+                    .expect(usize::from(*index < expected))
+                    .create_async()
+                    .await,
+            );
+            mocks.push(
+                server
+                    .mock("GET", format!("{path}/utxo").as_str())
+                    .with_body("[]")
+                    .expect(usize::from(*index < expected && positive))
+                    .create_async()
+                    .await,
+            );
         }
         let mut request = bdk_chain::spk_client::FullScanRequest::builder_at(1000)
             .spks_for_keychain(KeychainKind::External, scripts);
-        if let Some(index) = revealed { request = request.last_revealed_for_keychain(KeychainKind::External, index); }
-        let client = esplora_client::Builder::new(&server.url()).max_retries(0)
-            .build_async_with_sleeper::<SyncSleeper>().unwrap();
-        let result = crate::current_state::fetch_esplora(&client,
-            SyncRequestType::Full(request.build()), stop_gap, concurrency).await.unwrap();
+        if let Some(index) = revealed {
+            request = request.last_revealed_for_keychain(KeychainKind::External, index);
+        }
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .unwrap();
+        let result = crate::current_state::fetch_esplora(
+            &client,
+            SyncRequestType::Full(request.build()),
+            stop_gap,
+            concurrency,
+        )
+        .await
+        .unwrap();
         assert!(result.outputs.is_empty());
         assert_eq!(result.active_scripts.len(), active.len());
-        assert_eq!(result.update.last_active_indices.get(&KeychainKind::External).copied(), active.last().copied());
-        for mock in mocks { mock.assert_async().await; }
+        assert_eq!(
+            result
+                .update
+                .last_active_indices
+                .get(&KeychainKind::External)
+                .copied(),
+            active.last().copied()
+        );
+        for mock in mocks {
+            mock.assert_async().await;
+        }
     }
 }
 
@@ -942,11 +1050,13 @@ async fn outspend_batches_bound_chunks_and_do_not_reuse_mutable_evidence_across_
     use bitcoin::hashes::sha256;
     use serde_json::json;
     let mut wallet = wallet();
-    let mut transactions = (0..9).map(|index| {
-        let mut tx = funding(&wallet);
-        tx.input[0].previous_output.txid = bitcoin::Txid::from_byte_array([index + 1; 32]);
-        tx
-    }).collect::<Vec<_>>();
+    let mut transactions = (0..9)
+        .map(|index| {
+            let mut tx = funding(&wallet);
+            tx.input[0].previous_output.txid = bitcoin::Txid::from_byte_array([index + 1; 32]);
+            tx
+        })
+        .collect::<Vec<_>>();
     transactions.sort_by_key(Transaction::compute_txid);
     let script = transactions[0].output[0].script_pubkey.clone();
     let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
@@ -954,7 +1064,7 @@ async fn outspend_batches_bound_chunks_and_do_not_reuse_mutable_evidence_across_
     let mut mocks = vec![
         server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32)).expect(4).create_async().await,
         server.mock("GET", path.as_str()).with_body(json!({
-            "chain_stats":{"tx_count":9,"funded_txo_count":18,"funded_txo_sum":8550000,"spent_txo_count":9,"spent_txo_sum":8100000},
+            "chain_stats":{"tx_count":9,"funded_txo_count":18,"funded_txo_sum":8_550_000,"spent_txo_count":9,"spent_txo_sum":8_100_000},
             "mempool_stats":{"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0}
         }).to_string()).expect(2).create_async().await,
         server.mock("GET", format!("{path}/utxo").as_str()).with_body(json!(transactions.iter().map(|tx|
@@ -965,33 +1075,61 @@ async fn outspend_batches_bound_chunks_and_do_not_reuse_mutable_evidence_across_
     for tx in &transactions {
         mocks.push(server.mock("GET", format!("/tx/{}", tx.compute_txid()).as_str()).with_body(json!({
             "txid":tx.compute_txid(),"version":2,"locktime":0,
-            "vin":[{"txid":tx.input[0].previous_output.txid,"vout":0,"prevout":{"scriptpubkey":"","value":951000},
+            "vin":[{"txid":tx.input[0].previous_output.txid,"vout":0,"prevout":{"scriptpubkey":"","value":951_000},
                 "scriptsig":"","sequence":tx.input[0].sequence.to_consensus_u32(),"is_coinbase":false}],
             "vout":tx.output.iter().map(|out|json!({"scriptpubkey":out.script_pubkey.to_hex_string(),"value":out.value.to_sat()})).collect::<Vec<_>>(),
             "size":tx.total_size(),"weight":tx.weight().to_wu(),"fee":1000,"status":{"confirmed":false}
         }).to_string()).expect(2).create_async().await);
     }
     for group in transactions.chunks(8) {
-        let ids = group.iter().map(|tx| tx.compute_txid().to_string()).collect::<Vec<_>>().join(",");
-        mocks.push(server.mock("GET", "/txs/outspends")
-            .match_query(mockito::Matcher::UrlEncoded("txids".into(), ids))
-            .match_header("cache-control", "no-cache, no-store")
-            .with_body(json!(group.iter().map(|_| json!([{"spent":false},{"spent":false}])).collect::<Vec<_>>()).to_string())
-            .expect(2).create_async().await);
+        let ids = group
+            .iter()
+            .map(|tx| tx.compute_txid().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        mocks.push(
+            server
+                .mock("GET", "/txs/outspends")
+                .match_query(mockito::Matcher::UrlEncoded("txids".into(), ids))
+                .match_header("cache-control", "no-cache, no-store")
+                .with_body(
+                    json!(group
+                        .iter()
+                        .map(|_| json!([{"spent":false},{"spent":false}]))
+                        .collect::<Vec<_>>())
+                    .to_string(),
+                )
+                .expect(2)
+                .create_async()
+                .await,
+        );
     }
-    let client = esplora_client::Builder::new(&server.url()).max_retries(6)
-        .build_async_with_sleeper::<SyncSleeper>().unwrap();
+    let client = esplora_client::Builder::new(&server.url())
+        .max_retries(6)
+        .build_async_with_sleeper::<SyncSleeper>()
+        .unwrap();
     for _ in 0..2 {
         let request = bdk_chain::spk_client::SyncRequest::builder_at(1000)
-            .spks_with_indexes([((KeychainKind::External, 0), script.clone())]).build();
-        let result = crate::current_state::fetch_esplora_with_policy(&client,
-            SyncRequestType::Incremental(request), &BTreeSet::new(), 5, 5, true).await.unwrap();
+            .spks_with_indexes([((KeychainKind::External, 0), script.clone())])
+            .build();
+        let result = crate::current_state::fetch_esplora_with_policy(
+            &client,
+            SyncRequestType::Incremental(request),
+            &BTreeSet::new(),
+            5,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outputs.len(), 9);
         wallet.apply_current_state(result, None).unwrap();
-        assert_eq!(wallet.get_raw_balance().total().to_sat(), 450000);
+        assert_eq!(wallet.get_raw_balance().total().to_sat(), 450_000);
         assert!(!wallet.asset_state_is_current());
     }
-    for mock in mocks { mock.assert_async().await; }
+    for mock in mocks {
+        mock.assert_async().await;
+    }
     // Invalid requests make no network dispatch, even with the generic client's
     // default retry allowance. No malformed "capability probe" is sent.
     let id = transactions[0].compute_txid();
@@ -1007,22 +1145,51 @@ async fn full_scan_shares_window_across_keychains_with_exact_coverage() {
     use serde_json::json;
     // Receive and change share one bounded window; each keeps its own exact
     // trailing gap, activity resets and revealed frontier. No surplus reads.
-    for (stop_gap, concurrency, external_active, internal_active, internal_revealed, external_expected, internal_expected) in [
+    for (
+        stop_gap,
+        concurrency,
+        external_active,
+        internal_active,
+        internal_revealed,
+        external_expected,
+        internal_expected,
+    ) in [
         (20, 5, vec![0u32], vec![], None, 21u32, 20u32),
         (5, 5, vec![0, 5], vec![2], Some(9), 11, 15),
         (3, 8, vec![], vec![0, 3, 6], None, 3, 10),
     ] {
         let wallet = wallet();
         let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
-        let tip = server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32))
-            .expect(2).create_async().await;
+        let tip = server
+            .mock("GET", "/blocks/tip/hash")
+            .with_body("07".repeat(32))
+            .expect(2)
+            .create_async()
+            .await;
         let mut mocks = vec![tip];
         let mut request = bdk_chain::spk_client::FullScanRequest::builder_at(1000);
         for (keychain, offset, active, expected) in [
-            (KeychainKind::External, 0u32, &external_active, external_expected),
-            (KeychainKind::Internal, 100, &internal_active, internal_expected),
+            (
+                KeychainKind::External,
+                0u32,
+                &external_active,
+                external_expected,
+            ),
+            (
+                KeychainKind::Internal,
+                100,
+                &internal_active,
+                internal_expected,
+            ),
         ] {
-            let scripts: Vec<_> = (0..40u32).map(|index| (index, wallet.peek_taproot_address(offset + index).script_pubkey())).collect();
+            let scripts: Vec<_> = (0..40u32)
+                .map(|index| {
+                    (
+                        index,
+                        wallet.peek_taproot_address(offset + index).script_pubkey(),
+                    )
+                })
+                .collect();
             for (index, script) in &scripts {
                 let path = format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()));
                 let positive = active.contains(index);
@@ -1030,28 +1197,63 @@ async fn full_scan_shares_window_across_keychains_with_exact_coverage() {
                     "spent_txo_count":0,"spent_txo_sum":0});
                 let spent_only = json!({"tx_count":2,"funded_txo_count":1,"funded_txo_sum":1000,
                     "spent_txo_count":1,"spent_txo_sum":1000});
-                mocks.push(server.mock("GET", path.as_str()).with_body(json!({
-                    "chain_stats": if positive { spent_only } else { zero.clone() },
-                    "mempool_stats":zero
-                }).to_string()).expect(usize::from(*index < expected)).create_async().await);
-                mocks.push(server.mock("GET", format!("{path}/utxo").as_str()).with_body("[]")
-                    .expect(usize::from(*index < expected && positive)).create_async().await);
+                mocks.push(
+                    server
+                        .mock("GET", path.as_str())
+                        .with_body(
+                            json!({
+                                "chain_stats": if positive { spent_only } else { zero.clone() },
+                                "mempool_stats":zero
+                            })
+                            .to_string(),
+                        )
+                        .expect(usize::from(*index < expected))
+                        .create_async()
+                        .await,
+                );
+                mocks.push(
+                    server
+                        .mock("GET", format!("{path}/utxo").as_str())
+                        .with_body("[]")
+                        .expect(usize::from(*index < expected && positive))
+                        .create_async()
+                        .await,
+                );
             }
             request = request.spks_for_keychain(keychain, scripts);
         }
         if let Some(index) = internal_revealed {
             request = request.last_revealed_for_keychain(KeychainKind::Internal, index);
         }
-        let client = esplora_client::Builder::new(&server.url()).max_retries(0)
-            .build_async_with_sleeper::<SyncSleeper>().unwrap();
-        let result = crate::current_state::fetch_esplora(&client,
-            SyncRequestType::Full(request.build()), stop_gap, concurrency).await.unwrap();
+        let client = esplora_client::Builder::new(&server.url())
+            .max_retries(0)
+            .build_async_with_sleeper::<SyncSleeper>()
+            .unwrap();
+        let result = crate::current_state::fetch_esplora(
+            &client,
+            SyncRequestType::Full(request.build()),
+            stop_gap,
+            concurrency,
+        )
+        .await
+        .unwrap();
         assert!(result.outputs.is_empty());
-        assert_eq!(result.active_scripts.len(), external_active.len() + internal_active.len());
+        assert_eq!(
+            result.active_scripts.len(),
+            external_active.len() + internal_active.len()
+        );
         let last = &result.update.last_active_indices;
-        assert_eq!(last.get(&KeychainKind::External).copied(), external_active.last().copied());
-        assert_eq!(last.get(&KeychainKind::Internal).copied(), internal_active.last().copied());
-        for mock in mocks { mock.assert_async().await; }
+        assert_eq!(
+            last.get(&KeychainKind::External).copied(),
+            external_active.last().copied()
+        );
+        assert_eq!(
+            last.get(&KeychainKind::Internal).copied(),
+            internal_active.last().copied()
+        );
+        for mock in mocks {
+            mock.assert_async().await;
+        }
     }
 }
 
@@ -1067,27 +1269,35 @@ async fn full_scan_replenishes_window_without_waiting_for_a_slow_read() {
         time::{Duration, Instant},
     };
     let wallet = wallet();
-    let scripts: Vec<_> = (0..40u32).map(|index| (index, wallet.peek_taproot_address(index).script_pubkey())).collect();
-    let paths: HashMap<String, u32> = scripts.iter()
-        .map(|(index, script)| (format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes())), *index))
+    let scripts: Vec<_> = (0..40u32)
+        .map(|index| (index, wallet.peek_taproot_address(index).script_pubkey()))
+        .collect();
+    let paths: HashMap<String, u32> = scripts
+        .iter()
+        .map(|(index, script)| {
+            (
+                format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes())),
+                *index,
+            )
+        })
         .collect();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     // (requested indices, reads currently held by the server, peak held)
-    let state = Arc::new((Mutex::new((Vec::<u32>::new(), 0usize, 0usize)), Condvar::new()));
+    let state = Arc::new((
+        Mutex::new((Vec::<u32>::new(), 0usize, 0usize)),
+        Condvar::new(),
+    ));
     let shared = state.clone();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut handlers = Vec::new();
         // Two tip reads plus exactly the 20 required script reads.
         while handlers.len() < 22 && Instant::now() < deadline {
-            let (mut socket, _) = match listener.accept() {
-                Ok(value) => value,
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
+            let Ok((mut socket, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
             };
             socket.set_nonblocking(false).unwrap();
             let shared = shared.clone();
@@ -1130,10 +1340,14 @@ async fn full_scan_replenishes_window_without_waiting_for_a_slow_read() {
         }
     });
     let request = bdk_chain::spk_client::FullScanRequest::builder_at(1000)
-        .spks_for_keychain(KeychainKind::External, scripts).build();
-    let client = esplora_client::Builder::new(&url).max_retries(0)
-        .build_async_with_sleeper::<SyncSleeper>().unwrap();
-    let result = crate::current_state::fetch_esplora(&client, SyncRequestType::Full(request), 20, 5).await;
+        .spks_for_keychain(KeychainKind::External, scripts)
+        .build();
+    let client = esplora_client::Builder::new(&url)
+        .max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>()
+        .unwrap();
+    let result =
+        crate::current_state::fetch_esplora(&client, SyncRequestType::Full(request), 20, 5).await;
     server.join().unwrap();
     let result = result.unwrap();
     assert!(result.active_scripts.is_empty());
@@ -1165,32 +1379,47 @@ fn primary_address_scope_limits_initial_full_scans_to_child_zero_and_revealed() 
     let gap = vec![(KeychainKind::External, 50), (KeychainKind::Internal, 50)];
     let primary = vec![(KeychainKind::External, 1), (KeychainKind::Internal, 1)];
     // Default remains the unbounded gap walk.
-    assert_eq!(full_scan_lengths(wallet.prepare_requests(false).taproot), gap);
+    assert_eq!(
+        full_scan_lengths(wallet.prepare_requests(false).taproot),
+        gap
+    );
 
     wallet.set_primary_address_scope(true);
     let request = wallet.prepare_requests(false);
     assert_eq!(full_scan_lengths(request.taproot), primary);
-    assert_eq!(full_scan_lengths(request.payment.expect("dual payment role")), primary);
+    assert_eq!(
+        full_scan_lengths(request.payment.expect("dual payment role")),
+        primary
+    );
     // An explicit rescan still walks the full unused gap.
-    assert_eq!(full_scan_lengths(wallet.prepare_requests(true).taproot), gap);
+    assert_eq!(
+        full_scan_lengths(wallet.prepare_requests(true).taproot),
+        gap
+    );
     // Children this wallet revealed are always covered.
     for _ in 0..3 {
         wallet.next_taproot_address().unwrap();
     }
     // Index zero is revealed at build, so three more reveal children 0..=3.
-    assert_eq!(full_scan_lengths(wallet.prepare_requests(false).taproot),
-        vec![(KeychainKind::External, 4), (KeychainKind::Internal, 1)]);
+    assert_eq!(
+        full_scan_lengths(wallet.prepare_requests(false).taproot),
+        vec![(KeychainKind::External, 4), (KeychainKind::Internal, 1)]
+    );
 
     // Index-mode descriptors already have one child; the scope does not alter them.
-    let indexed = || WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([37; 64]))
-        .with_derivation_mode(DerivationMode::Index)
-        .with_account_index(2)
-        .build()
-        .unwrap();
+    let indexed = || {
+        WalletBuilder::from_seed(Network::Regtest, Seed64::from_array([37; 64]))
+            .with_derivation_mode(DerivationMode::Index)
+            .with_account_index(2)
+            .build()
+            .unwrap()
+    };
     let mut scoped = indexed();
     scoped.set_primary_address_scope(true);
-    assert_eq!(full_scan_lengths(scoped.prepare_requests(false).taproot),
-        full_scan_lengths(indexed().prepare_requests(false).taproot));
+    assert_eq!(
+        full_scan_lengths(scoped.prepare_requests(false).taproot),
+        full_scan_lengths(indexed().prepare_requests(false).taproot)
+    );
 }
 
 #[tokio::test]
@@ -1207,29 +1436,50 @@ async fn primary_address_scope_scan_reads_only_child_zero_of_each_branch() {
     let mut server = mockito::Server::new_with_opts_async(Default::default()).await;
     let zero = json!({"tx_count":0,"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0});
     let mut mocks = vec![
-        server.mock("GET", "/blocks/tip/hash").with_body("07".repeat(32)).expect(4).create_async().await,
+        server
+            .mock("GET", "/blocks/tip/hash")
+            .with_body("07".repeat(32))
+            .expect(4)
+            .create_async()
+            .await,
     ];
-    let client = esplora_client::Builder::new(&server.url()).max_retries(0)
-        .build_async_with_sleeper::<SyncSleeper>().unwrap();
+    let client = esplora_client::Builder::new(&server.url())
+        .max_retries(0)
+        .build_async_with_sleeper::<SyncSleeper>()
+        .unwrap();
     let mut reads = 0;
     for role in [Some(request.taproot), request.payment] {
-        let Some(SyncRequestType::Full(mut role)) = role else { panic!("expected a full scan") };
+        let Some(SyncRequestType::Full(mut role)) = role else {
+            panic!("expected a full scan")
+        };
         // The same finite lists, without the chain-tip block reads of BDK's funding sync.
         let mut scan = bdk_chain::spk_client::FullScanRequest::builder_at(1000);
         for keychain in role.keychains() {
             let spks: Vec<_> = role.iter_spks(keychain).collect();
             for (_, script) in &spks {
                 reads += 1;
-                mocks.push(server.mock("GET", format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes())).as_str())
-                    .with_body(json!({"chain_stats": zero, "mempool_stats": zero}).to_string())
-                    .expect(1).create_async().await);
+                mocks.push(
+                    server
+                        .mock(
+                            "GET",
+                            format!("/scripthash/{}", sha256::Hash::hash(script.as_bytes()))
+                                .as_str(),
+                        )
+                        .with_body(json!({"chain_stats": zero, "mempool_stats": zero}).to_string())
+                        .expect(1)
+                        .create_async()
+                        .await,
+                );
             }
             scan = scan.spks_for_keychain(keychain, spks);
         }
         // Even with a 20-address gap configured, the finite lists end the scan.
         crate::current_state::fetch_esplora(&client, SyncRequestType::Full(scan.build()), 20, 5)
-            .await.unwrap();
+            .await
+            .unwrap();
     }
     assert_eq!(reads, 4);
-    for mock in mocks { mock.assert_async().await; }
+    for mock in mocks {
+        mock.assert_async().await;
+    }
 }

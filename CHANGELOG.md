@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.13.0] - Unreleased candidate
+
+### Packaging
+- Replace workspace-only Esplora overrides with explicit `zinc-esplora-client`
+  and `zinc-bdk-esplora` packages, both initially version 0.1.0. Consumers no
+  longer need to reproduce hidden `[patch]` entries. These are Zinc-maintained
+  forks with upstream notices retained, not official upstream releases.
+- Use published BDK Chain 0.23.4 and Core 0.6.4 for the reorg-eviction and full
+  revealed-range scan fixes. The adapter derives from BDK Esplora 0.22.3.
+- The dependency packages must be published before Core 0.13.0. No packages or
+  source tags have been published as part of preparing this candidate.
+
+### Build checks
+- Restore clean formatting and strict Clippy checks; keep native Tokio/mock-server
+  test helpers out of the WASM test build. Wallet policy remains unchanged.
+
+### Compatibility
+- Direct consumers of Core's Esplora-typed APIs must use `zinc-esplora-client`
+  instead of the upstream `esplora-client` package; their Rust types differ.
+  Ordinary consumers of Core's wallet API need only the Core dependency.
+
 ### Added
 - Add `BackendFailureV1`, a versioned data-only schema for Esplora and Ord
   dependency, operation, category, status/code, and bounded retry-delay data.

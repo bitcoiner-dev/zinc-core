@@ -43,15 +43,11 @@ pub mod backend_pacing;
 pub mod backend_receipt;
 pub mod builder;
 pub mod cancellation;
-#[cfg(any(target_arch = "wasm32", test))]
-mod sync_read_cancellation;
-#[cfg(any(target_arch = "wasm32", test))]
-mod discovery_activity_memo;
 pub mod crypto;
 /// Current UTXO synchronization, separate from paginated Activity history.
 pub mod current_state;
-mod startup_diagnostics;
-pub mod sync_pair;
+#[cfg(any(target_arch = "wasm32", test))]
+mod discovery_activity_memo;
 pub mod error;
 /// Vendor-neutral capability negotiation for hardware and other external signers.
 pub mod external_signing;
@@ -82,6 +78,10 @@ pub mod offer_relay;
 pub mod ordinals;
 /// Signed pairing + sign-intent protocol primitives.
 pub mod sign_intent;
+mod startup_diagnostics;
+pub mod sync_pair;
+#[cfg(any(target_arch = "wasm32", test))]
+mod sync_read_cancellation;
 pub mod work_admission;
 
 // Re-exports for convenience
@@ -1406,9 +1406,15 @@ pub struct ZincWasmImportProbeScope {
 #[wasm_bindgen]
 impl ZincWasmImportProbeScope {
     /// Fork a handle for one consuming async discovery call.
-    pub fn fork(&self) -> ZincWasmImportProbeScope { Self { memo: self.memo.clone() } }
+    pub fn fork(&self) -> ZincWasmImportProbeScope {
+        Self {
+            memo: self.memo.clone(),
+        }
+    }
     /// Retire every fork on cancellation, context transition or job completion.
-    pub fn retire(&self) { self.memo.borrow_mut().retire(); }
+    pub fn retire(&self) {
+        self.memo.borrow_mut().retire();
+    }
 }
 
 #[wasm_bindgen]
@@ -2591,15 +2597,23 @@ impl ZincWasmWallet {
 
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = sync)]
-    pub fn sync(&self, esplora_url: String, batch_outspends: Option<bool>) -> Result<js_sys::Promise, JsValue> {
+    pub fn sync(
+        &self,
+        esplora_url: String,
+        batch_outspends: Option<bool>,
+    ) -> Result<js_sys::Promise, JsValue> {
         self.check_vitality()?;
         use crate::builder::configured_esplora_client;
 
-        let batch_outspends = batch_outspends.unwrap_or_else(|| esplora_url.trim_end_matches('/') == "https://esplora.zincwallet.app");
+        let batch_outspends = batch_outspends.unwrap_or_else(|| {
+            esplora_url.trim_end_matches('/') == "https://esplora.zincwallet.app"
+        });
         let inner_rc = self.inner.clone();
         let sync_reads = self.sync_reads.clone();
         let network = self.state_snapshot().network;
-        let requested_generation = self.inner.try_borrow()
+        let requested_generation = self
+            .inner
+            .try_borrow()
             .map_err(|_| JsValue::from_str("Wallet busy preparing sync"))?
             .account_generation();
 
@@ -2675,25 +2689,45 @@ impl ZincWasmWallet {
             // the joined pair; neither update is published before both succeed.
             let payment = sync_req.payment.map(|request| {
                 crate::current_state::fetch_esplora_with_policy(
-                    &client, request, &sync_req.active_scripts, 20, 5, batch_outspends,
+                    &client,
+                    request,
+                    &sync_req.active_scripts,
+                    20,
+                    5,
+                    batch_outspends,
                 )
             });
-            let pair = sync_reads.run(crate::sync_pair::fetch(
-                crate::current_state::fetch_esplora_with_policy(
-                    &client, sync_req.taproot, &sync_req.active_scripts, 20, 5, batch_outspends,
-                ),
-                payment,
-            )).await.map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?;
+            let pair = sync_reads
+                .run(crate::sync_pair::fetch(
+                    crate::current_state::fetch_esplora_with_policy(
+                        &client,
+                        sync_req.taproot,
+                        &sync_req.active_scripts,
+                        20,
+                        5,
+                        batch_outspends,
+                    ),
+                    payment,
+                ))
+                .await
+                .map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?;
             let (vault_update, payment_update) = match pair {
                 Ok(updates) => updates,
                 Err((error, completed)) => {
                     ZincWasmWallet::clear_syncing_if_generation_matches(&inner_rc, sync_generation);
                     if let Some(stale) = ZincWasmWallet::generation_mismatch_error(
-                        &inner_rc, sync_generation, SYNC_STALE_ERROR,
-                    ) { return Err(stale); }
+                        &inner_rc,
+                        sync_generation,
+                        SYNC_STALE_ERROR,
+                    ) {
+                        return Err(stale);
+                    }
                     return Err(backend_scan_failure_to_js(
-                        error.backend_failure(), last_complete_tip, sync_generation,
-                        completed, total_keychains,
+                        error.backend_failure(),
+                        last_complete_tip,
+                        sync_generation,
+                        completed,
+                        total_keychains,
                     ));
                 }
             };
@@ -2941,12 +2975,23 @@ impl ZincWasmWallet {
 
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = createImportProbeScope)]
-    pub fn create_import_probe_scope(&self, esplora_url: String) -> Result<ZincWasmImportProbeScope, JsValue> {
+    pub fn create_import_probe_scope(
+        &self,
+        esplora_url: String,
+    ) -> Result<ZincWasmImportProbeScope, JsValue> {
         self.check_vitality()?;
-        let wallet = self.inner.try_borrow().map_err(|_| JsValue::from_str("Recovery wallet busy"))?;
-        Ok(ZincWasmImportProbeScope { memo: Rc::new(RefCell::new(
-            discovery_activity_memo::DiscoveryActivityMemo::new(
-                discovery_activity_memo::context(&wallet), esplora_url))) })
+        let wallet = self
+            .inner
+            .try_borrow()
+            .map_err(|_| JsValue::from_str("Recovery wallet busy"))?;
+        Ok(ZincWasmImportProbeScope {
+            memo: Rc::new(RefCell::new(
+                discovery_activity_memo::DiscoveryActivityMemo::new(
+                    discovery_activity_memo::context(&wallet),
+                    esplora_url,
+                ),
+            )),
+        })
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -2996,7 +3041,8 @@ impl ZincWasmWallet {
         let context = discovery_activity_memo::context(&inner.borrow());
         let memo = probe_scope.map(|scope| scope.memo);
         if let Some(memo) = &memo {
-            memo.borrow().validate(&context, &esplora_url, web_time::Instant::now())
+            memo.borrow()
+                .validate(&context, &esplora_url, web_time::Instant::now())
                 .map_err(|_| JsValue::from_str(SYNC_STALE_ERROR))?;
         }
 
@@ -3084,19 +3130,38 @@ impl ZincWasmWallet {
                     let backend = esplora_url.clone();
                     let inner = inner.clone();
                     async move {
-                        let current = || inner.try_borrow().ok()
-                            .is_some_and(|wallet| wallet.account_generation() == generation);
-                        if !current() { return Err(AccountDiscoveryProbeError::RetiredScope); }
+                        let current = || {
+                            inner
+                                .try_borrow()
+                                .ok()
+                                .is_some_and(|wallet| wallet.account_generation() == generation)
+                        };
+                        if !current() {
+                            return Err(AccountDiscoveryProbeError::RetiredScope);
+                        }
                         if let Some(memo) = &memo {
-                            if let Some(activity) = memo.borrow().lookup(&context, &backend, &addr_str, web_time::Instant::now())
-                                .map_err(|_| AccountDiscoveryProbeError::RetiredScope)? {
+                            if let Some(activity) = memo
+                                .borrow()
+                                .lookup(&context, &backend, &addr_str, web_time::Instant::now())
+                                .map_err(|_| AccountDiscoveryProbeError::RetiredScope)?
+                            {
                                 return Ok(activity);
                             }
                         }
-                        let activity = probe_esplora_address_activity(&client, url, deadline_ms).await?;
-                        if !current() { return Err(AccountDiscoveryProbeError::RetiredScope); }
+                        let activity =
+                            probe_esplora_address_activity(&client, url, deadline_ms).await?;
+                        if !current() {
+                            return Err(AccountDiscoveryProbeError::RetiredScope);
+                        }
                         if let Some(memo) = &memo {
-                            memo.borrow_mut().record(&context, &backend, addr_str, activity, web_time::Instant::now())
+                            memo.borrow_mut()
+                                .record(
+                                    &context,
+                                    &backend,
+                                    addr_str,
+                                    activity,
+                                    web_time::Instant::now(),
+                                )
                                 .map_err(|_| AccountDiscoveryProbeError::RetiredScope)?;
                         }
                         Ok(activity)

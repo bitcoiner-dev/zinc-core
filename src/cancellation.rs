@@ -18,7 +18,7 @@ pub(crate) struct CancellationTargetCache {
     chain_generation: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod targeted_tests {
     use super::*;
     use crate::builder::{Seed64, SyncSleeper, WalletBuilder};
@@ -159,7 +159,7 @@ impl CancellationTargetRead {
             if input.is_coinbase || inputs.iter().any(|(previous, _)| *previous == op) {
                 return Err("Invalid cancellation input".into());
             }
-            if !parents.contains_key(&op.txid) {
+            if let std::collections::btree_map::Entry::Vacant(e) = parents.entry(op.txid) {
                 let parent = client
                     .get_tx(&op.txid)
                     .await
@@ -168,7 +168,7 @@ impl CancellationTargetRead {
                 if parent.compute_txid() != op.txid {
                     return Err("Cancellation funding transaction mismatch".into());
                 }
-                parents.insert(op.txid, parent);
+                e.insert(parent);
             }
             let output = parents[&op.txid]
                 .output

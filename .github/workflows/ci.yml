@@ -43,7 +43,7 @@ jobs:
           - cargo test
           - cargo check --no-default-features
           - cargo check --features debug
-          - cargo package --allow-dirty
+          - cargo package --workspace --locked
 
     steps:
       - name: Checkout

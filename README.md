@@ -20,10 +20,17 @@ Key capabilities:
 
 ## Installation
 
+Version 0.13.0 is an unreleased candidate. Until publication, build this workspace
+from source; the registry dependency below describes the intended release.
+
 ```toml
 [dependencies]
-zinc-core = "0.12.0"
+zinc-core = "0.13.0"
 ```
+
+Core uses published BDK crates plus the explicitly named `zinc-esplora-client`
+and `zinc-bdk-esplora` helpers. Consumers do not need a `[patch.crates-io]` table.
+See [release preparation](RELEASING.md) for offline package validation.
 
 ## What You Get
 

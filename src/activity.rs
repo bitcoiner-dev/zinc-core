@@ -77,7 +77,7 @@ impl ZincWallet {
                 return Err("Activity cursor does not match the current wallet page".into());
             }
             let mut pager = pager.clone();
-            pager.request_cursor = cursor.to_owned();
+            cursor.clone_into(&mut pager.request_cursor);
             pager.cached_page = self.activity_pages.get(cursor).cloned();
             return Ok(pager);
         }
@@ -167,13 +167,13 @@ impl ActivityPager {
                 // rows (or with pending rows and no confirmed history). Read
                 // each bounded stream explicitly, once for mempool and then
                 // one confirmed page at a time.
-                let mut txs = if !source.started {
+                let mut txs = if source.started {
+                    Vec::new()
+                } else {
                     client
                         .get_mempool_scripthash_txs(&source.script)
                         .await
                         .map_err(|_| "Activity provider unavailable; try again later".to_string())?
-                } else {
-                    Vec::new()
                 };
                 if txs.len() > 50 || txs.iter().any(|tx| tx.status.confirmed) {
                     return Err("Invalid pending Activity page".to_string());

@@ -724,11 +724,13 @@ impl OrdClient {
     /// Opt in only after the caller has established this provider supports
     /// Ord's bounded POST /inscriptions API. Unknown/older providers retain
     /// individual reads; errors never change the selected transport or retry.
+    #[must_use]
     pub fn with_bulk_inscriptions(mut self) -> Self {
         self.bulk_inscriptions = true;
         self
     }
 
+    #[cfg(test)]
     async fn get_inscriptions_bounded(&self, ids: &[String]) -> Result<Vec<Inscription>, OrdError> {
         self.get_inscriptions_bounded_with_concurrency(ids, 8).await
     }
@@ -963,7 +965,7 @@ impl OrdClient {
                     .ok_or_else(|| OrdError::invalid_response(BackendOperationV1::Outputs))?;
                 if inscriptions
                     .iter()
-                    .any(|id| !id.as_str().is_some_and(|id| !id.is_empty()))
+                    .any(|id| id.as_str().is_none_or(str::is_empty))
                 {
                     return Err(OrdError::invalid_response(BackendOperationV1::Outputs));
                 }
@@ -1743,12 +1745,9 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut handlers = Vec::new();
             while handlers.len() < 3 && Instant::now() < deadline {
-                let (mut socket, _) = match listener.accept() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
                 };
                 let shared = shared.clone();
                 handlers.push(std::thread::spawn(move || {
@@ -1807,12 +1806,9 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut handlers = Vec::new();
             while handlers.len() < 5 && Instant::now() < deadline {
-                let (mut socket, _) = match listener.accept() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
                 };
                 let shared = shared.clone();
                 handlers.push(std::thread::spawn(move || {
@@ -1822,15 +1818,15 @@ mod tests {
                     let request = String::from_utf8(bytes).unwrap();
                     let n: u32 = request.split_whitespace().nth(1).unwrap().rsplit_once('i').unwrap().1.parse().unwrap();
                     let (lock,wake) = &*shared;
-                    let mut stats = lock.lock().unwrap(); stats.0 += 1; stats.1 = stats.1.max(stats.0);
-                    if n==4 { stats.2=true; wake.notify_all(); }
+                    let mut counters = lock.lock().unwrap(); counters.0 += 1; counters.1 = counters.1.max(counters.0);
+                    if n==4 { counters.2=true; wake.notify_all(); }
                     if n==0 {
-                        let (next,_) = wake.wait_timeout_while(stats,Duration::from_secs(2),|s| !s.2).unwrap();stats=next;
-                        if !stats.2 { stats.0-=1; socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(); return; }
+                        let (next,_) = wake.wait_timeout_while(counters,Duration::from_secs(2),|s| !s.2).unwrap();counters=next;
+                        if !counters.2 { counters.0-=1; socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(); return; }
                     }
                     let body = bulk_detail(n).to_string();
                     socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).unwrap();
-                    stats.0-=1;
+                    counters.0-=1;
                 }));
             }
             for handler in handlers {

@@ -1,6 +1,6 @@
 //! Cancels the owned read future, not merely publication of its result.
 //! Dropping an aborted future releases queued admission and reqwest's WASM
-//! AbortGuard. Already dispatched requests cannot be recalled from a server.
+//! `AbortGuard`. Already dispatched requests cannot be recalled from a server.
 use futures_util::future::{AbortHandle, Abortable, Aborted};
 use std::{cell::RefCell, future::Future, rc::Rc};
 
@@ -54,14 +54,24 @@ mod tests {
         struct Pending(Rc<Cell<bool>>);
         impl Future for Pending {
             type Output = Result<u8, ()>;
-            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Self::Output> {
                 Poll::Pending
             }
         }
-        impl Drop for Pending { fn drop(&mut self) { self.0.set(true); } }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
         let (left, right) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
         let owner = SyncReadCancellation::default();
-        let pair = owner.run(crate::sync_pair::fetch(Pending(left.clone()), Some(Pending(right.clone()))));
+        let pair = owner.run(crate::sync_pair::fetch(
+            Pending(left.clone()),
+            Some(Pending(right.clone())),
+        ));
         futures_util::pin_mut!(pair);
         let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
         assert!(pair.as_mut().poll(&mut cx).is_pending());

@@ -167,7 +167,7 @@ fn origin(url: &str) -> Arc<Origin> {
     REGISTRY
         .get_or_init(Mutex::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(url)
 }
 
@@ -176,7 +176,7 @@ impl Origin {
         let now = Instant::now();
         self.shell
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .waiting
             .retain(|_, waiter| waiter.expires > now);
     }
@@ -196,7 +196,10 @@ impl Origin {
         };
         loop {
             let wait = {
-                let mut state = self.schedule.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self
+                    .schedule
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let now = Instant::now();
                 state.admit(now)
             };
@@ -220,7 +223,7 @@ pub fn after_response(url: &str, status: u16, retry_after: Option<&str>) {
     origin(url)
         .schedule
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .observe(Instant::now(), status, retry_after);
 }
 
@@ -235,7 +238,10 @@ pub fn backend_request_delay(url: &str) -> u32 {
     let Some(_permit) = ticket.poll(None) else {
         return 100;
     };
-    let mut state = origin.schedule.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = origin
+        .schedule
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
     let wait = state.admit(now);
     if wait.is_zero() {
@@ -262,7 +268,10 @@ pub fn backend_request_begin_foreground(url: &str) -> u32 {
 fn begin_shell_request(url: &str, priority: Priority) -> u32 {
     let origin = origin(url);
     origin.reap_shell();
-    let mut shell = origin.shell.lock().unwrap_or_else(|e| e.into_inner());
+    let mut shell = origin
+        .shell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if shell.waiting.len() >= MAX_SHELL_WAITERS {
         return 0;
     }
@@ -280,13 +289,16 @@ fn begin_shell_request(url: &str, priority: Priority) -> u32 {
     );
     id
 }
-/// u32::MAX means expired/unknown: callers fail the attempt, never requeue or
+/// `u32::MAX` means expired/unknown: callers fail the attempt, never requeue or
 /// replay it automatically. Positive delay keeps the same FIFO position.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn backend_request_poll(url: &str, id: u32) -> u32 {
     let origin = origin(url);
     origin.reap_shell();
-    let mut shell = origin.shell.lock().unwrap_or_else(|e| e.into_inner());
+    let mut shell = origin
+        .shell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(waiter) = shell.waiting.get_mut(&id) else {
         return u32::MAX;
     };
@@ -300,7 +312,7 @@ pub fn backend_request_poll(url: &str, id: u32) -> u32 {
     let wait = origin
         .schedule
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .admit(Instant::now());
     if wait.is_zero() {
         shell.waiting.remove(&id);
@@ -314,7 +326,7 @@ pub fn backend_request_cancel(url: &str, id: u32) {
     origin(url)
         .shell
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .waiting
         .remove(&id);
 }
@@ -325,7 +337,7 @@ pub fn backend_response_observed(url: &str, status: u16, retry_after: Option<Str
 }
 
 /// Dispatch exactly once through Core's shared pacing policy. Use for raw
-/// discovery/Ord/fee HTTP calls; Esplora (including BDK) uses SyncSleeper hooks.
+/// discovery/Ord/fee HTTP calls; Esplora (including BDK) uses `SyncSleeper` hooks.
 /// No retries, redirects beyond reqwest's policy, or provider changes are added.
 pub async fn send(builder: reqwest::RequestBuilder) -> Result<reqwest::Response, reqwest::Error> {
     send_with_priority(builder, Priority::Foreground).await
@@ -454,6 +466,7 @@ mod tests {
         assert!(origin.shell.lock().unwrap().waiting.is_empty());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn mixed_priority_waiters_share_startup_and_cancel_without_rate_debt() {
         let origin = Origin::default();
@@ -491,10 +504,7 @@ mod tests {
             &a,
             &registry.get("https://example.com:444/tx/b")
         ));
-        assert_eq!(
-            registry.origins.keys().next().unwrap().contains("secret"),
-            false
-        );
+        assert!(!registry.origins.keys().next().unwrap().contains("secret"));
     }
 
     #[test]
@@ -531,6 +541,7 @@ mod tests {
         assert_eq!(s.wait(now), Duration::from_secs(300));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn concurrent_clients_share_admission_and_cancellation_leaves_no_debt() {
         let origin = Origin::default();
@@ -562,7 +573,7 @@ mod tests {
             STARTUP_REQUESTS - u16::from(IMMEDIATE_REQUESTS)
         );
         let mut time = now;
-        for _ in IMMEDIATE_REQUESTS as u16..STARTUP_REQUESTS {
+        for _ in u16::from(IMMEDIATE_REQUESTS)..STARTUP_REQUESTS {
             time += STARTUP_SPACING;
             assert!(s.admit(time).is_zero());
         }
@@ -573,7 +584,7 @@ mod tests {
         assert!(s.admit(time).is_zero());
         assert_eq!(s.startup_remaining, 0);
         // A normal gap/account transition cannot refill startup credit.
-        time += IDLE_RESET - Duration::from_millis(1);
+        time += IDLE_RESET.checked_sub(Duration::from_millis(1)).unwrap();
         assert!(s.admit(time).is_zero());
         assert_eq!(s.startup_remaining, 0);
         time += IDLE_RESET;
@@ -632,10 +643,14 @@ mod tests {
                 }
                 assert_eq!(s.startup_remaining, 0);
             }
-            assert!(lowest >= headroom, "startup leaves {lowest:.1} of {capacity} burst tokens");
+            assert!(
+                lowest >= headroom,
+                "startup leaves {lowest:.1} of {capacity} burst tokens"
+            );
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn raw_and_bdk_clients_share_budget_and_errors_are_not_replayed() {
         let mut server = mockito::Server::new_with_opts_async(Default::default()).await;

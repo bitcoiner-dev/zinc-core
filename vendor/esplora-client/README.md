@@ -1,3 +1,19 @@
+# Zinc Esplora client
+
+This is the Zinc-maintained `zinc-esplora-client` package, version 0.1.0 (unreleased
+candidate). Upstream documentation is retained below for API context. Install
+this package explicitly to use it with Zinc Core 0.13.0:
+
+```toml
+esplora-client = { package = "zinc-esplora-client", version = "=0.1.0" }
+```
+
+See [Zinc changes](ZINC-PATCH.md) for provenance, differences and test setup.
+The upstream installation and release instructions below refer to upstream,
+not to this candidate.
+
+---
+
 # rust-esplora-client
 
 Bitcoin Esplora API client library. Supports plaintext, TLS and Onion servers. Blocking or async.

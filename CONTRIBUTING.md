@@ -4,8 +4,9 @@ Thanks for helping improve `zinc-core`.
 
 ## Development Setup
 
-1. Install stable Rust.
-2. From the workspace root (`wallet/zinc-core`), run:
+1. Install stable Rust (Cargo 1.92 or newer for workspace package staging).
+   The library MSRV is Rust 1.88.
+2. From the workspace root , run:
 
 ```bash
 cargo fmt --all -- --check
@@ -14,7 +15,7 @@ cargo check --no-default-features
 cargo check --features debug
 cargo clippy -p zinc-core --all-targets --all-features -- -D warnings
 cargo doc -p zinc-core --no-deps
-cargo package --allow-dirty
+cargo package --workspace --locked
 ```
 
 WASM changes also require a wasm-capable clang and:
