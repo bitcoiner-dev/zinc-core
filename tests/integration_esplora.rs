@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-use bdk_wallet::bitcoin::Network;
+use zinc_core::Network;
 #[cfg(not(target_arch = "wasm32"))]
 use zinc_core::builder::{Seed64, WalletBuilder};
 
