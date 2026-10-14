@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ## [0.13.0] - Unreleased candidate
 
+### Dependency security
+- Resolve patched Rustls, Quinn Proto and Faster-Hex versions without advisory
+  suppression. The helper blocking TLS backend no longer uses Rustls 0.21 or
+  WebPKI 0.101.
+- Enforce their minimum safe versions in dependency manifests as well as the
+  repository lockfile, so downstream consumers cannot retain affected versions
+  in their own lockfiles. The Quinn floor does not enable HTTP/3.
+- Add the named `zinc-minreq` helper for a TLS-only compatibility backport. Its
+  client-local crypto provider preserves the host's process-wide selection;
+  Minreq 2 HTTP/status/header/proxy behavior is retained. Upstream ISC notices
+  are preserved. The package remains unpublished with the other helpers.
+- Keep the sanitized backend-error envelope compatible when consumers also
+  enable the helper's blocking features.
+
 ### Packaging
 - Replace workspace-only Esplora overrides with explicit `zinc-esplora-client`
   and `zinc-bdk-esplora` packages, both initially version 0.1.0. Consumers no

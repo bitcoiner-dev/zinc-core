@@ -101,7 +101,9 @@ package = "hex-conservative"
 version = "^0.4"
 
 [dependencies.minreq]
-version = "2.11.0"
+package = "zinc-minreq"
+version = "=0.1.0"
+path = "../minreq"
 features = ["json-using-serde"]
 optional = true
 

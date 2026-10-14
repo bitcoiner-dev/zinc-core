@@ -28,3 +28,9 @@ with `BITCOIND_EXE` and `ELECTRS_EXE` supplied by the caller. It is excluded fro
 automatic workspace library tests, and binary-download dependency features are
 disabled. Core's mock-server contracts exercise Zinc's extensions without those
 daemons. No production implementation was changed to introduce the new package.
+
+The blocking HTTP client now uses the explicitly named `zinc-minreq` package
+under its existing `minreq` dependency alias. Its Rustls backend is updated to
+patched releases with a client-local crypto provider. Minreq 2 request/status/
+proxy behavior is retained; the named package has a distinct Rust type identity.
+See ../minreq/ZINC-PATCH.md for exact source provenance and the TLS-only patch.

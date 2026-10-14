@@ -190,7 +190,11 @@ impl BackendFailureV1 {
                 operation,
                 BackendFailureCategoryV1::ProtocolRejected,
             ),
-            Error::InvalidHttpHeaderName(_) | Error::InvalidHttpHeaderValue(_) => Self::new(
+            // A consumer can enable blocking-only Esplora error variants through
+            // Cargo feature unification. Keep their prose and invalid-header
+            // details out of the public failure envelope, including URLs and
+            // proxy credentials.
+            _ => Self::new(
                 BackendDependencyV1::Esplora,
                 operation,
                 BackendFailureCategoryV1::Unknown,
